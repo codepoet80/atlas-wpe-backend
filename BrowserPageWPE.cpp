@@ -103,8 +103,9 @@ static std::set<BrowserPageWPE*> g_livePages;
  *   finalDeliveredY≈0 means the buffer caught back up to the top after the sweep (no stuck/white). */
 struct ScrollTestState { bool active; int cy, dir, step, maxCy, steps, renders, uncovered; long maxStallMs; guint tick; };
 static ScrollTestState g_st = {false,0,1,120,0,0,0,0,0,0};
-static BrowserPageWPE* g_testablePage = nullptr;   // last page to attach buffers = the SIGUSR1 target
+static BrowserPageWPE* g_testablePage = nullptr;   // last page to attach buffers = the scroll-test target
 static gboolean on_sigusr1(gpointer);              // fwd
+static gboolean scrolltest_poll(gpointer);         // fwd — file trigger (app-spawned BS masks SIGUSR1)
 
 BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     : m_server(server), m_proxy(proxy), m_identifier(0)
@@ -349,6 +350,16 @@ void BrowserPageWPE::ensureWebView()
     g_object_unref(ctx);       // the WebView holds its own refs now
     g_object_unref(session);
 
+    /* This page has a live WebView -> it's the scroll-test target (NOT a startPage/tab that only
+     * attached buffers with screenH=0). Install the trigger once (poll works despite masked SIGUSR1). */
+    g_testablePage = this;
+    static bool s_testInstalled = false;
+    if (!s_testInstalled) {
+        s_testInstalled = true;
+        g_unix_signal_add(SIGUSR1, on_sigusr1, nullptr);
+        g_timeout_add(700, scrolltest_poll, nullptr);
+    }
+
     /* Viewport scale-to-fit: device-scale-factor sets CSS layout width = backend_width / DSF. DSF<1
      * lays the page out WIDER than the screen and renders it scaled down (the legacy "overview" so
      * desktop sites fit on load). Tunable via BPWPE_DSF (default 1.0 = 1:1 at 1024) to dial in live. */
@@ -402,11 +413,6 @@ bool BrowserPageWPE::attachToBuffer(uint32_t vWidth, uint32_t vHeight,
     if (key1 && size > 0) { m_offscreen0 = BrowserOffscreenQt::attach(key1, size); m_ownOffscreen0 = (m_offscreen0 != 0); }
     if (key2 && size > 0) { m_offscreen1 = BrowserOffscreenQt::attach(key2, size); m_ownOffscreen1 = (m_offscreen1 != 0); }
     if (!m_offscreen0 || !m_offscreen1) { WLOG("attach failed"); return false; }
-
-    /* Autonomous scroll test: this (foreground) page becomes the SIGUSR1 target; install the handler once. */
-    g_testablePage = this;
-    static bool s_sigInstalled = false;
-    if (!s_sigInstalled) { s_sigInstalled = true; g_unix_signal_add(SIGUSR1, on_sigusr1, nullptr); }
 
     /* Do NOT create the WebView here — defer it to the first content load (openUrl/setHTML). That
      * lets the private-browsing marker on the first openUrl decide the session type (ephemeral)
@@ -739,6 +745,19 @@ static gboolean on_sigusr1(gpointer)
         WLOG("SIGUSR1: no testable page (or a test is already running)");
     return G_SOURCE_CONTINUE;   /* keep the handler for repeated runs */
 }
+/* File trigger: the host `touch`es /tmp/isis_scrolltest; polled on the glib loop (which is clearly
+ * dispatching — frames render), so it works even though the app-spawned BS has SIGUSR1 masked. */
+static gboolean scrolltest_poll(gpointer)
+{
+    if (access("/tmp/isis_scrolltest", F_OK) == 0) {
+        unlink("/tmp/isis_scrolltest");
+        if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end() && !g_st.active)
+            g_testablePage->startScrollTest();
+        else
+            WLOG("scrolltest trigger: no testable page (or a test is already running)");
+    }
+    return G_SOURCE_CONTINUE;
+}
 void BrowserPageWPE::startScrollTest()
 {
     int pageH = m_pageHeight > 0 ? m_pageHeight : m_virtualWindowHeight;
@@ -755,6 +774,10 @@ void BrowserPageWPE::startScrollTest()
     g_st.steps = g_st.renders = g_st.uncovered = 0; g_st.maxStallMs = 0;
     WLOG("SCROLLTEST START maxCy=%d step=%d ms=%d pageH=%d screenH=%d renderH=%d deliveredY=%d",
          maxCy, g_st.step, ms, pageH, m_screenHeight, m_renderHeight, m_deliveredY);
+    /* Unconditional result file (WLOG needs BPWPE_DEBUG, which the app-spawned BS lacks). */
+    FILE* rf = fopen("/tmp/isis_scrolltest.result", "w");
+    if (rf) { fprintf(rf, "START maxCy=%d step=%d ms=%d pageH=%d screenH=%d renderH=%d bgra?\n",
+                      maxCy, g_st.step, ms, pageH, m_screenHeight, m_renderHeight); fclose(rf); }
     g_st.tick = g_timeout_add(ms, scrolltest_tick, nullptr);
 }
 bool BrowserPageWPE::scrollTestStep()
@@ -777,6 +800,9 @@ void BrowserPageWPE::reportScrollTest()
     int uncoveredPct = g_st.steps ? (g_st.uncovered * 100 / g_st.steps) : 0;
     WLOG("SCROLLTEST DONE steps=%d renders=%d uncovered=%d(%d%%) maxStall=%ldms finalRenderedY=%d finalDeliveredY=%d maxCy=%d",
          g_st.steps, g_st.renders, g_st.uncovered, uncoveredPct, g_st.maxStallMs, m_renderedY, m_deliveredY, g_st.maxCy);
+    FILE* rf = fopen("/tmp/isis_scrolltest.result", "a");
+    if (rf) { fprintf(rf, "DONE steps=%d renders=%d uncovered=%d(%d%%) maxStall=%ldms finalRenderedY=%d finalDeliveredY=%d maxCy=%d\n",
+                      g_st.steps, g_st.renders, g_st.uncovered, uncoveredPct, g_st.maxStallMs, m_renderedY, m_deliveredY, g_st.maxCy); fclose(rf); }
 }
 void BrowserPageWPE::setZoomAndScroll(double zoom, int, int)
 {
