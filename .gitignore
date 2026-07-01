@@ -1,0 +1,7 @@
+*.o
+*.a
+eglprobe
+eglprobe-glibc
+frame-dump
+libWPEBackend-isis.so
+gctest/*.o
