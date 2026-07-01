@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 #include <sys/time.h>
+#include <glib-unix.h>   // g_unix_signal_add — SIGUSR1 kicks the autonomous scroll test
 
 /* Log to a file (webOS syslog goes to PmLog, hard to read on-device). Timestamped (ms) so we can
  * measure load phases. */
@@ -93,16 +94,28 @@ static void isis_im_context_init(IsisIMContext*) {}
  * Everything (ctor/dtor/onFrame) runs on the glib main loop, so no locking is needed. */
 static std::set<BrowserPageWPE*> g_livePages;
 
+/* ===== autonomous scroll test ===== kick with `kill -USR1 <bs-pid>`. Drives setScrollPosition in a
+ * timed top->bottom->top sweep (exactly the adapter's scroll stream) and logs a SCROLLTEST summary:
+ *   steps     = scroll events sent
+ *   renders   = pan re-renders issued (readbacks)
+ *   uncovered = steps where the viewport wasn't fully inside the DELIVERED buffer (== white/partial on screen)
+ *   maxStall  = worst re-render latency (ms) — the readback wall
+ *   finalDeliveredY≈0 means the buffer caught back up to the top after the sweep (no stuck/white). */
+struct ScrollTestState { bool active; int cy, dir, step, maxCy, steps, renders, uncovered; long maxStallMs; guint tick; };
+static ScrollTestState g_st = {false,0,1,120,0,0,0,0,0,0};
+static BrowserPageWPE* g_testablePage = nullptr;   // last page to attach buffers = the SIGUSR1 target
+static gboolean on_sigusr1(gpointer);              // fwd
+
 BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     : m_server(server), m_proxy(proxy), m_identifier(0)
     , m_offscreen0(0), m_offscreen1(0), m_ownOffscreen0(false), m_ownOffscreen1(false)
     , m_bufferLock(0), m_bufferLockName(0)
     , m_windowWidth(1024), m_windowHeight(768)
     , m_virtualWindowWidth(0), m_virtualWindowHeight(0)
-    , m_screenWidth(0), m_screenHeight(0), m_renderedY(0)
+    , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0), m_pageHeight(0)
-    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false)
+    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -390,6 +403,11 @@ bool BrowserPageWPE::attachToBuffer(uint32_t vWidth, uint32_t vHeight,
     if (key2 && size > 0) { m_offscreen1 = BrowserOffscreenQt::attach(key2, size); m_ownOffscreen1 = (m_offscreen1 != 0); }
     if (!m_offscreen0 || !m_offscreen1) { WLOG("attach failed"); return false; }
 
+    /* Autonomous scroll test: this (foreground) page becomes the SIGUSR1 target; install the handler once. */
+    g_testablePage = this;
+    static bool s_sigInstalled = false;
+    if (!s_sigInstalled) { s_sigInstalled = true; g_unix_signal_add(SIGUSR1, on_sigusr1, nullptr); }
+
     /* Do NOT create the WebView here — defer it to the first content load (openUrl/setHTML). That
      * lets the private-browsing marker on the first openUrl decide the session type (ephemeral)
      * BEFORE the session is created. The buffers are attached; the WebView is built on first nav.
@@ -415,6 +433,10 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
      * the pointer value only — safe even if self is dangling (it never dereferences self). */
     if (g_livePages.find(self) == g_livePages.end()) return;
     self->m_renderPending = false;   /* this re-render's frame arrived -> allow the next pan re-render */
+    if (g_st.active && self->m_renderPendingMs) {   /* scroll-test: record the re-render latency (the readback wall) */
+        long st = _wlog_ms() - self->m_renderPendingMs; if (st < 0) st += 10000000;
+        if (st > g_st.maxStallMs) g_st.maxStallMs = st;
+    }
     int buf = self->m_ownOffscreen0 ? 0 : (self->m_ownOffscreen1 ? 1 : -1);
     static unsigned s_fc = 0;                             // gate per-frame logging (file I/O per paint = slow)
     if ((s_fc++ % 120) == 0)
@@ -472,6 +494,14 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
             self->updateContentsSize();
         }
     }
+
+    self->m_deliveredY = self->m_renderedY;   /* the adapter now shows the buffer at this top (test coverage) */
+
+    /* P2 catch-up: the scroll may have moved outside the buffer while this frame was in flight (those
+     * setScrollPosition calls got gated by m_renderPending). Now that we've delivered and cleared the
+     * flag, follow the latest scroll so the buffer doesn't freeze behind the scroll (the "renderedY
+     * stuck at N -> white everywhere else" bug). No-op when the scroll is already inside the buffer. */
+    self->recenterForScroll(self->m_scrollX, self->m_scrollY);
 }
 
 /* hands the offscreen to the adapter; non-blocking (no sem_wait — would deadlock the glib loop) */
@@ -587,28 +617,51 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
         }
         return;
     }
+    /* Windowed pan: the re-center / catch-up decision lives in one place, shared with onFrame. */
+    WLOG("setScrollPosition %d,%d renderedY=%d", cx, cy, m_renderedY);
+    recenterForScroll(cx, cy);
+}
+
+/* Windowed pan re-center + catch-up. cx,cy are DOCUMENT-space scroll. Within the tall buffer -> false
+ * (adapter pans, no readback). Near/past the edge -> kick a strip-hinted re-render centred on it.
+ * ALSO called from onFrame: the scroll that SETTLED while a render was in flight was gated by
+ * m_renderPending, so when that frame lands we must re-check the latest scroll and follow it —
+ * otherwise the buffer freezes wherever the last render left it and everything else shows white. */
+bool BrowserPageWPE::recenterForScroll(int cx, int cy)
+{
+    if (!m_webView || m_screenHeight <= 0) return false;
+    if (m_pageHeight <= 0 || m_pageHeight <= m_renderHeight) return false;   /* full-page-once owns this */
     int screenH = m_screenHeight;
-    int slack   = m_renderHeight - screenH;                 /* pannable travel inside the buffer */
-    if (slack < 0) slack = 0;
-    int guard   = screenH / 3;                              /* re-render within ~1/3 screen of an edge */
+    int slack   = m_renderHeight - screenH; if (slack < 0) slack = 0;
+    int guard   = screenH / 3;
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
-    WLOG("setScrollPosition %d,%d renderedY=%d slack=%d inBuffer=%d", cx, cy, m_renderedY, slack, inBuffer);
-    if (inBuffer) return;                                   /* adapter pans — no re-render, no readback */
-    if (m_renderPending) return;                            /* one re-render in flight; the ~1s readback is
-                                                               the wall — queuing more races m_renderedY ahead
-                                                               of the delivered buffer (offset/white/stops). */
-    int newTop = cy - slack / 2;
-    if (newTop < 0) newTop = 0;
-    /* Clamp to the DOM's real scroll range: the tall WebView can't scroll past m_pageHeight-m_renderHeight,
-     * so an un-clamped newTop makes window.scrollTo silently clamp while m_renderedY keeps the wrong value —
-     * desyncing the header from the buffer (adapter pans wrong -> "stops" forward, white backward). */
+    if (inBuffer) return false;                             /* adapter pans — no re-render, no readback */
+    if (m_renderPending) {
+        long age = _wlog_ms() - m_renderPendingMs; if (age < 0) age += 10000000;
+        if (age < 1800) return false;                      /* a re-render is plausibly still in flight */
+        WLOG("renderPending STALE %ldms -> force re-render", age);   /* frame lost -> never deadlock */
+    }
+    int newTop = cy - slack / 2; if (newTop < 0) newTop = 0;
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
+    if (newTop == m_renderedY) return false;               /* already centred here (clamp) — nothing to do */
+    /* P2 strip readback: at 1:1, read back ONLY the newly-exposed strip + memmove the overlap. delta
+     * from the OLD renderedY; skip the hint if it exceeds the buffer (no overlap -> full readback). */
+    int delta = newTop - m_renderedY;
+    if (contentZoom() == 1.0 && (delta > 0 ? delta : -delta) < m_renderHeight) {
+        int y0, sh;
+        if (delta > 0) { y0 = m_renderHeight - delta; sh = delta; }   /* scrolled down: strip at bottom */
+        else           { y0 = 0;                       sh = -delta; } /* scrolled up:   strip at top    */
+        wpe_isis_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
+    }
     m_renderedY = newTop;
-    m_renderPending = true;   /* cleared when the frame for this re-render is delivered (onFrame) */
+    m_renderPending = true; m_renderPendingMs = _wlog_ms();
     char js[96];
     snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    WLOG("recenter cx=%d cy=%d -> renderedY=%d delta=%d", cx, cy, newTop, delta);
+    if (g_st.active) g_st.renders++;
+    return true;
 }
 
 /* async JS: report the real page height so the adapter knows the scroll range */
@@ -670,6 +723,60 @@ void BrowserPageWPE::updateContentsSize()
     webkit_web_view_evaluate_javascript(m_webView,
         "Math.max(document.documentElement.scrollHeight, document.body?document.body.scrollHeight:0)",
         -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onContentHeight, this);
+}
+
+/* ===================== autonomous scroll test (SIGUSR1) ===================== */
+static gboolean scrolltest_tick(gpointer)
+{
+    if (!g_testablePage || g_livePages.find(g_testablePage) == g_livePages.end()) { g_st.active = false; return G_SOURCE_REMOVE; }
+    return g_testablePage->scrollTestStep() ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
+}
+static gboolean on_sigusr1(gpointer)
+{
+    if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end() && !g_st.active)
+        g_testablePage->startScrollTest();
+    else
+        WLOG("SIGUSR1: no testable page (or a test is already running)");
+    return G_SOURCE_CONTINUE;   /* keep the handler for repeated runs */
+}
+void BrowserPageWPE::startScrollTest()
+{
+    int pageH = m_pageHeight > 0 ? m_pageHeight : m_virtualWindowHeight;
+    int maxCy = pageH - (m_screenHeight > 0 ? m_screenHeight : 768);
+    if (maxCy < 1) { WLOG("SCROLLTEST abort: page too short (pageH=%d screenH=%d)", pageH, m_screenHeight); return; }
+    const char* es = getenv("BPWPE_TEST_STEP"); const char* em = getenv("BPWPE_TEST_MS");
+    g_st.step = es ? atoi(es) : 120; if (g_st.step < 1) g_st.step = 120;
+    int ms    = em ? atoi(em) : 50;  if (ms < 5) ms = 50;
+    /* /tmp/isis_test.cfg ("<stepPx> <intervalMs>") overrides env, so the host can vary scroll speed
+     * per run (slow drag vs fast flick) without relaunching the BS. */
+    FILE* cf = fopen("/tmp/isis_test.cfg", "r");
+    if (cf) { int s = 0, m = 0; if (fscanf(cf, "%d %d", &s, &m) == 2) { if (s > 0) g_st.step = s; if (m >= 5) ms = m; } fclose(cf); }
+    g_st.active = true; g_st.cy = 0; g_st.dir = 1; g_st.maxCy = maxCy;
+    g_st.steps = g_st.renders = g_st.uncovered = 0; g_st.maxStallMs = 0;
+    WLOG("SCROLLTEST START maxCy=%d step=%d ms=%d pageH=%d screenH=%d renderH=%d deliveredY=%d",
+         maxCy, g_st.step, ms, pageH, m_screenHeight, m_renderHeight, m_deliveredY);
+    g_st.tick = g_timeout_add(ms, scrolltest_tick, nullptr);
+}
+bool BrowserPageWPE::scrollTestStep()
+{
+    if (!g_st.active) return false;
+    setScrollPosition(0, g_st.cy, 0, 0);         /* drive one scroll exactly like the adapter */
+    g_st.steps++;
+    /* coverage: is the viewport [cy, cy+screenH] fully inside the buffer the adapter is SHOWING
+     * ([m_deliveredY, +m_renderHeight])? If not, the user sees white/partial at this instant. */
+    if (m_screenHeight > 0 &&
+        !(g_st.cy >= m_deliveredY && g_st.cy + m_screenHeight <= m_deliveredY + m_renderHeight))
+        g_st.uncovered++;
+    g_st.cy += g_st.dir * g_st.step;
+    if (g_st.cy >= g_st.maxCy) { g_st.cy = g_st.maxCy; g_st.dir = -1; }
+    else if (g_st.cy <= 0 && g_st.dir < 0) { g_st.cy = 0; setScrollPosition(0, 0, 0, 0); reportScrollTest(); g_st.active = false; return false; }
+    return true;
+}
+void BrowserPageWPE::reportScrollTest()
+{
+    int uncoveredPct = g_st.steps ? (g_st.uncovered * 100 / g_st.steps) : 0;
+    WLOG("SCROLLTEST DONE steps=%d renders=%d uncovered=%d(%d%%) maxStall=%ldms finalRenderedY=%d finalDeliveredY=%d maxCy=%d",
+         g_st.steps, g_st.renders, g_st.uncovered, uncoveredPct, g_st.maxStallMs, m_renderedY, m_deliveredY, g_st.maxCy);
 }
 void BrowserPageWPE::setZoomAndScroll(double zoom, int, int)
 {

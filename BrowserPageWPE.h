@@ -64,7 +64,13 @@ public:
     void getWindowSize(int& width, int& height);
     void getVirtualWindowSize(int& width, int& height);
     void setScrollPosition(int cx, int cy, int cw, int ch);
+    bool recenterForScroll(int cx, int cy);   // P2: windowed pan re-center; also the onFrame catch-up. Returns true if a re-render was issued.
     void setZoomAndScroll(double zoom, int cx, int cy);
+
+    // ---- autonomous scroll test (kicked with SIGUSR1; drives setScrollPosition like the adapter) ----
+    void startScrollTest();      // begin a top->bottom->top sweep on this page
+    bool scrollTestStep();       // one timed step; returns false when the sweep finishes
+    void reportScrollTest();     // log the SCROLLTEST summary line
 
     // ---- input ----
     void mouseEvent(int type, int contentX, int contentY, int detail);
@@ -198,6 +204,7 @@ private:
     int                 m_screenWidth;          // real fb width; layout may be wider (fit-to-screen via contentZoom)
     int                 m_screenHeight;         // real fb height (visible rows) — the pannable window height
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
+    int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
     int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
@@ -206,6 +213,7 @@ private:
     bool                m_private;     // ephemeral session (private browsing) — set by the openUrl marker
     bool                m_prewarmBlank; // BPWPE_PRESPAWN: WebView pre-warmed with about:blank (non-private)
     bool                m_renderPending; // pan re-render in flight; don't queue another (m_renderedY would race ahead of the delivered buffer)
+    long                m_renderPendingMs; // _wlog_ms() when m_renderPending was set — staleness timeout so a lost frame can't deadlock the pan
     uint32_t            m_priority;
 
     // ---- WPE members (replace m_graphicsView/m_scene/m_webView/m_webPage) ----

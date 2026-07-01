@@ -58,6 +58,16 @@ WPE_ISIS_EXPORT
 void wpe_isis_view_backend_set_visible(struct wpe_view_backend*, bool visible);
 
 /*
+ * P2 strip readback: publish the next pan re-render's exposed strip + delta before window.scrollTo.
+ *   y0,stripH : the newly-exposed rows in the tall buffer the WebProcess must read back (device px, 1:1).
+ *   delta     : newTop - oldTop (>0 scrolled down, <0 up); the WebProcess memmove's the overlap by it.
+ * The whole buffer is NOT re-read — only [y0,y0+stripH]; the rest is the shifted previous frame. No-op
+ * if |delta|>=bufferHeight (no overlap → don't call it; let the normal full readback happen).
+ */
+WPE_ISIS_EXPORT
+void wpe_isis_view_backend_scroll_hint(struct wpe_view_backend*, int y0, int stripH, int delta);
+
+/*
  * Input is dispatched with the stock libwpe entry points directly on the returned
  * wpe_view_backend, e.g. wpe_view_backend_dispatch_pointer_event(...). No wrappers needed —
  * the BrowserServer translates Yap adapter events into wpe_input_* structs and calls them.

@@ -58,6 +58,17 @@ struct isis_msg {
 #define SLOTS 2
 static size_t slot_bytes(uint32_t w, uint32_t h) { return (size_t)w * h * 4; }
 
+/* P2 strip readback: a small control block placed AFTER the SLOTS frame slots in the SAME shm.
+ * BrowserPageWPE::setScrollPosition bumps `seq` with the exposed strip (y0,stripH) + the pan delta
+ * before window.scrollTo; the WebProcess reads it in target_frame_rendered and reads back ONLY that
+ * strip (glReadPixels sub-rect, ~50-100ms) after memmove'ing the overlap in its master buffer —
+ * instead of the whole tall buffer (~1.2s). Coherent SysV shm + a seq handshake, no extra socket. */
+struct isis_ctrl { volatile uint32_t seq; int32_t y0; int32_t stripH; int32_t delta; };
+static size_t shm_total_bytes(uint32_t w, uint32_t h) { return (size_t)SLOTS * slot_bytes(w, h) + 4096; }
+static struct isis_ctrl* shm_ctrl(uint8_t* shm, uint32_t w, uint32_t h) {
+    return (struct isis_ctrl*)(shm + (size_t)SLOTS * slot_bytes(w, h));
+}
+
 /* =========================================================================================== *
  *  UIProcess side: view backend (+ the frame receiver)                                        *
  * =========================================================================================== */
@@ -69,9 +80,12 @@ struct isis_view {
     uint32_t                 swidth, sheight;    /* fit-to-screen output size (0 = 1:1, no downscale) */
 
     int   shmid;
-    uint8_t* shm;      /* attached SLOTS*slot_bytes region, or NULL until initialize() */
+    uint8_t* shm;      /* attached SLOTS*slot_bytes + ctrl region, or NULL until initialize() */
     bool     visible;
+    struct isis_view* next;   /* P2: registry so wpe_isis_view_backend_scroll_hint can map wpe -> view */
 };
+
+static struct isis_view* g_isis_views = NULL;   /* P2 wpe->view registry (few live views; linear walk) */
 
 /* One dedicated channel PER WebProcess. WebKit spawns/swaps/prewarms processes (PSON); each must
  * get its own socketpair + SETUP so messages from different processes never collide on one channel
@@ -86,7 +100,7 @@ static gboolean isis_view_on_readable(gint fd, GIOCondition cond, gpointer data)
 
 static bool isis_view_alloc_shm(struct isis_view* v)
 {
-    size_t total = (size_t)SLOTS * slot_bytes(v->width, v->height);
+    size_t total = shm_total_bytes(v->width, v->height);   /* P2: SLOTS slots + the ctrl page */
     v->shmid = shmget(IPC_PRIVATE, total, IPC_CREAT | 0600);
     if (v->shmid < 0) { ISIS_LOG("shmget(%zu) failed: %s", total, strerror(errno)); return false; }
     v->shm = (uint8_t*)shmat(v->shmid, NULL, 0);
@@ -107,6 +121,8 @@ static void view_destroy(void* data)
 {
     struct isis_view* v = (struct isis_view*)data;
     if (!v) return;
+    struct isis_view** pp = &g_isis_views;              /* P2: unlink from the registry */
+    while (*pp) { if (*pp == v) { *pp = v->next; break; } pp = &(*pp)->next; }
     if (v->shm && v->shm != (void*)-1) shmdt(v->shm);
     if (v->shmid >= 0) shmctl(v->shmid, IPC_RMID, NULL);   /* drop when last detaches */
     free(v);
@@ -222,7 +238,10 @@ struct wpe_view_backend* wpe_isis_view_backend_create(uint32_t width, uint32_t h
     v->shmid = -1;
     v->visible = true;
     /* create the wpe_view_backend with OUR interface + the isis_view as interface data */
-    return wpe_view_backend_create_with_backend_interface(&s_view_iface, v);
+    struct wpe_view_backend* b = wpe_view_backend_create_with_backend_interface(&s_view_iface, v);
+    v->wpe = b;                          /* also set in view_create; set here so the registry is usable immediately */
+    v->next = g_isis_views; g_isis_views = v;   /* P2 registry */
+    return b;
 }
 
 void wpe_isis_view_backend_resize(struct wpe_view_backend* wpe, uint32_t width, uint32_t height)
@@ -236,6 +255,21 @@ void wpe_isis_view_backend_set_visible(struct wpe_view_backend* wpe, bool visibl
 {
     if (visible) wpe_view_backend_add_activity_state(wpe, wpe_view_activity_state_visible);
     else         wpe_view_backend_remove_activity_state(wpe, wpe_view_activity_state_visible);
+}
+
+/* P2: publish the next pan re-render's exposed strip + delta into the shm control block. The BS calls
+ * this BEFORE window.scrollTo; the WebProcess consumes the bumped seq in target_frame_rendered and
+ * reads back ONLY [y0, y0+stripH] (rest of the tall buffer comes from the memmove'd overlap). */
+void wpe_isis_view_backend_scroll_hint(struct wpe_view_backend* wpe, int y0, int stripH, int delta)
+{
+    struct isis_view* v = g_isis_views;
+    while (v && v->wpe != wpe) v = v->next;
+    if (!v || !v->shm || v->shm == (void*)-1) return;
+    struct isis_ctrl* c = shm_ctrl(v->shm, v->width, v->height);
+    c->y0 = y0; c->stripH = stripH; c->delta = delta;
+    __sync_synchronize();               /* fields visible before the seq bump the WebProcess polls on */
+    c->seq = c->seq + 1;
+    __sync_synchronize();
 }
 
 /* =========================================================================================== *
@@ -294,6 +328,8 @@ struct isis_target {
     uint32_t width, height;
     uint32_t cur_slot;
     uint8_t* scratch;       /* width*height*4 readback scratch (RGBA, pre-swizzle) */
+    uint8_t* master;        /* P2: persistent BGRA copy of the whole tall buffer (1:1 only); strip readback + overlap memmove happen here */
+    uint32_t last_seq;      /* P2: last consumed isis_ctrl.seq (0 = none yet) */
     GLuint   fbo, tex, depth;   /* offscreen render target WebKit composites into (surfaceless ctx) */
     uint32_t fbo_w, fbo_h;
     /* ---- fit-to-screen downscale (see wpe_isis_view_backend_create) ---- */
@@ -590,6 +626,44 @@ static void target_frame_rendered(void* d)
             }
         }
 
+        /* ---- P2 strip readback (1:1, both BGRA-direct and RGBA+swizzle paths): if the BS bumped the
+         * scroll-hint seq, read back ONLY the newly-exposed strip into the persistent master buffer and
+         * memmove the overlap within it, then publish master -> slot. Turns the full-buffer readback
+         * (~1.4s at 3072 rows on this Adreno) into ~stripH/bufH of that. Any invalid/oversized hint
+         * (or a reflow beating the scroll frame) consumes the seq and falls through to the full read. */
+        if (!wantScale && s_bgra_readback >= 0) {   /* need the readback format probed first */
+            if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));
+            struct isis_ctrl* ctrl = shm_ctrl(t->shm, t->width, t->height);
+            uint32_t seq = ctrl->seq;
+            if (seq != t->last_seq) {
+                t->last_seq = seq;                       /* consume, even if we fall back to full */
+                __sync_synchronize();
+                int y0 = ctrl->y0, sh = ctrl->stripH, delta = ctrl->delta;
+                size_t stride = (size_t)rw * 4;
+                int ad = delta > 0 ? delta : -delta;
+                if (t->master && sh > 0 && y0 >= 0 &&
+                    (uint32_t)(y0 + sh) <= rh && ad > 0 && (uint32_t)ad < rh) {
+                    struct timeval _a, _b; gettimeofday(&_a, NULL);
+                    if (delta > 0)      /* scrolled down: keep old rows [delta,rh) at [0,rh-delta) */
+                        memmove(t->master, t->master + (size_t)delta * stride, (size_t)(rh - delta) * stride);
+                    else                /* scrolled up:   keep old rows [0,rh-ad) at [ad,rh) */
+                        memmove(t->master + (size_t)ad * stride, t->master, (size_t)(rh - ad) * stride);
+                    if (s_bgra_readback == 1) {
+                        glReadPixels(0, y0, (GLsizei)rw, (GLsizei)sh, 0x80E1 /*GL_BGRA_EXT*/, GL_UNSIGNED_BYTE,
+                                     t->master + (size_t)y0 * stride);
+                    } else {            /* swizzle path: read the strip RGBA, swizzle into master at y0 */
+                        glReadPixels(0, y0, (GLsizei)rw, (GLsizei)sh, GL_RGBA, GL_UNSIGNED_BYTE, t->scratch);
+                        swizzle_flip(t->scratch, t->master + (size_t)y0 * stride, rw, (uint32_t)sh);
+                    }
+                    memcpy(slot, t->master, (size_t)rh * stride);
+                    gettimeofday(&_b, NULL);
+                    { static int _sn = 0; if (_sn++ % 8 == 0) ISIS_LOG("STRIP y0=%d h=%d delta=%d %ldus (%ux%u bgra=%d)",
+                        y0, sh, delta, (_b.tv_sec-_a.tv_sec)*1000000L+(_b.tv_usec-_a.tv_usec), rw, rh, s_bgra_readback); }
+                    goto sent;
+                }
+            }
+        }
+
         /* Readback from the currently-bound FBO (ds_fbo if we GPU-scaled, else the layout fbo) at rw x rh.
          * PERF: glReadPixels blocks until the render completes, so no glFinish() is needed; and when the
          * driver can readback BGRA we read straight into the slot's native byte order, skipping swizzle. */
@@ -627,6 +701,11 @@ static void target_frame_rendered(void* d)
                     (_sd.tv_sec-_sc.tv_sec)*1000000L+(_sd.tv_usec-_sc.tv_usec), rw, rh);
               _sn++; }
         }
+
+        /* P2: a full 1:1 readback just refreshed the slot — mirror it into the master buffer so the
+         * NEXT pan re-center can strip-update from a correct base (covers loads/reflows/resizes too).
+         * The strip path above did goto sent, skipping this; wantScale never uses master. */
+        if (!wantScale && t->master) memcpy(t->master, slot, (size_t)rw * rh * 4);
 
     sent:;
         gettimeofday(&_pt1, NULL);
