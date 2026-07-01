@@ -449,6 +449,18 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
     }
 
     self->flushBuffer(buf);
+
+    /* Keep the scroll range fresh while a long page loads: re-query the page height (throttled) so the
+     * adapter's scroll clamp grows to the real bottom BEFORE LOAD_FINISHED (slow on heavy sites). */
+    {
+        static struct timeval s_lastCH = {0, 0};
+        struct timeval now; gettimeofday(&now, NULL);
+        long dtms = (now.tv_sec - s_lastCH.tv_sec) * 1000 + (now.tv_usec - s_lastCH.tv_usec) / 1000;
+        if (dtms > 800 && self->m_webView && webkit_web_view_is_loading(self->m_webView)) {
+            s_lastCH = now;
+            self->updateContentsSize();
+        }
+    }
 }
 
 /* hands the offscreen to the adapter; non-blocking (no sem_wait — would deadlock the glib loop) */
