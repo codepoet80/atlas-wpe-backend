@@ -567,7 +567,10 @@ void BrowserPageWPE::onContentHeight(GObject* obj, GAsyncResult* res, gpointer u
     int h = (int)jsc_value_to_double(v);
     g_object_unref(v);   /* 2.0: _finish returns an owned JSCValue (replaces WebKitJavascriptResult) */
     WLOG("content height = %d (virt %d)", h, self->m_virtualWindowHeight);
-    if (h > 0)
+    /* Ignore the exact-viewport-height artifact: document.scrollHeight transiently returns the WebView
+     * viewport height (== m_virtualWindowHeight) during reflow / subframe loads. Reporting it clobbers the
+     * real page height and clamps the adapter's scroll to one buffer. Real heights are never exactly it. */
+    if (h > 0 && h != self->m_virtualWindowHeight)
         self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, h);
 }
 /* On-demand: extract the article from the CURRENT DOM (works mid-load — the article text is present
