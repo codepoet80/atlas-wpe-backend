@@ -102,7 +102,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0)
-    , m_focused(true), m_frozen(false), m_private(false)
+    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -382,7 +382,14 @@ bool BrowserPageWPE::attachToBuffer(uint32_t vWidth, uint32_t vHeight,
 
     /* Do NOT create the WebView here — defer it to the first content load (openUrl/setHTML). That
      * lets the private-browsing marker on the first openUrl decide the session type (ephemeral)
-     * BEFORE the session is created. The buffers are attached; the WebView is built on first nav. */
+     * BEFORE the session is created. The buffers are attached; the WebView is built on first nav.
+     * EXCEPTION (BPWPE_PRESPAWN): pre-warm a non-private WebView with about:blank now so the ~900ms
+     * WebProcess spawn is hidden before the user's URL. openUrl tears it down if the card is private. */
+    if (getenv("BPWPE_PRESPAWN") && !m_webView && m_virtualWindowHeight > 0) {
+        WLOG("pre-spawn: warming WebProcess with about:blank");
+        ensureWebView();
+        if (m_webView) { webkit_web_view_load_uri(m_webView, "about:blank"); m_prewarmBlank = true; }
+    }
     return true;
 }
 
@@ -478,6 +485,12 @@ void BrowserPageWPE::openUrl(const char* url)
             if (u.empty() || u == "about:blank") u = "about:blank";
             WLOG("private marker -> ephemeral session; target='%s'", u.c_str());
         }
+    }
+    /* A pre-warmed (about:blank, non-private) WebView can't serve a private card — tear it down so
+     * ensureWebView() rebuilds it ephemeral. Non-private navigations reuse the warm WebProcess. */
+    if (m_prewarmBlank) {
+        m_prewarmBlank = false;
+        if (m_private && m_webView) { g_object_unref(m_webView); m_webView = nullptr; }
     }
     ensureWebView();
     /* WebKit needs a scheme or it returns WebKitPolicyError 101 "URL can't be shown".
