@@ -19,6 +19,7 @@
 
 #include <wpe/wpe-egl.h>
 #include <EGL/egl.h>
+#include <EGL/eglext.h>   /* C: EGL_KHR_lock_surface (fast readback) */
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>   /* GL_BGRA_EXT */
 
@@ -339,6 +340,11 @@ struct isis_target {
     GLint    ds_uSampler;
     uint32_t ds_w, ds_h;        /* current ds_fbo/ds_tex size */
     uint8_t* ds_scratch;        /* layout-size RGBA readback scratch for the CPU fallback */
+    /* ---- C: EGL_KHR_lock_surface fast readback (map GPU pixels to CPU, skip glReadPixels) ---- */
+    EGLSurface lock_surf;       /* lockable pbuffer we blit the FBO into */
+    EGLContext lock_ctx;        /* shares WebKit's context so it can sample t->tex */
+    uint32_t   lock_w, lock_h;  /* current pbuffer size */
+    int        lock_state;      /* -1 untried, 1 ready, 0 unavailable -> fall back to glReadPixels */
 };
 
 static bool target_read_setup(struct isis_target* t)
@@ -363,6 +369,7 @@ static void* target_create(struct wpe_renderer_backend_egl_target* wpe, int host
 {
     struct isis_target* t = (struct isis_target*)calloc(1, sizeof(*t));
     t->wpe = wpe; t->host_fd = host_fd; t->shmid = -1;
+    t->lock_state = -1;   /* -1 = untried (calloc's 0 would mean "unavailable" and skip the probe) */
     ISIS_LOG("target_create (host_fd=%d)", host_fd);
     return t;
 }
@@ -606,6 +613,112 @@ static void cpu_bilinear(const uint8_t* src, uint32_t sw0, uint32_t sh0,
     }
 }
 
+/* C: fast readback via EGL_KHR_lock_surface. Blit the FBO colour (t->tex) into a lockable pbuffer,
+ * map its pixels to a CPU pointer, and swizzle-copy into the slot — skipping glReadPixels' GPU->CPU
+ * de-tile/convert (the ~1s wall). A context sharing WebKit's lets us sample t->tex; we restore
+ * WebKit's current surface/context before returning. Gated by /tmp/isis_locksurf (or BPWPE_LOCKSURF).
+ * Returns false (and leaves lock_state=0) on any failure so the caller falls back to glReadPixels. */
+static bool lock_readback(struct isis_target* t, uint8_t* slot, uint32_t rw, uint32_t rh, long* out_us)
+{
+    static PFNEGLLOCKSURFACEKHRPROC   p_lock   = NULL;
+    static PFNEGLUNLOCKSURFACEKHRPROC p_unlock = NULL;
+    static int s_proc = 0;
+    if (!s_proc) { s_proc = 1;
+        p_lock   = (PFNEGLLOCKSURFACEKHRPROC)  eglGetProcAddress("eglLockSurfaceKHR");
+        p_unlock = (PFNEGLUNLOCKSURFACEKHRPROC)eglGetProcAddress("eglUnlockSurfaceKHR");
+    }
+    if (t->lock_state == 0 || !p_lock || !p_unlock) { if (t->lock_state < 0) { ISIS_LOG("locksurf: no eglLockSurfaceKHR"); t->lock_state = 0; } return false; }
+
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLContext webctx = eglGetCurrentContext();
+    EGLSurface pDraw = eglGetCurrentSurface(EGL_DRAW), pRead = eglGetCurrentSurface(EGL_READ);
+    if (dpy == EGL_NO_DISPLAY || webctx == EGL_NO_CONTEXT) return false;
+
+    if (t->ds_state < 0) ds_init_gpu(t);                 /* need the blit program (shared via lock_ctx) */
+    if (!t->ds_prog) { ISIS_LOG("locksurf: no blit program"); t->lock_state = 0; return false; }
+
+    if (t->lock_state < 0 || t->lock_w != rw || t->lock_h != rh) {
+        if (t->lock_surf) { eglDestroySurface(dpy, t->lock_surf); t->lock_surf = 0; }
+        /* Enumerate what the driver actually offers (once) — pbuffer+lock+exact-RGBA didn't match. */
+        { EGLint qa[] = { EGL_SURFACE_TYPE, EGL_LOCK_SURFACE_BIT_KHR, EGL_NONE };
+          EGLConfig cs[32]; EGLint nc = 0; eglChooseConfig(dpy, qa, cs, 32, &nc);
+          ISIS_LOG("locksurf: %d configs w/ LOCK_SURFACE_BIT", nc);
+          for (int i = 0; i < nc && i < 6; i++) { EGLint st=0,r=0,g=0,b=0,a=0,mf=0;
+            eglGetConfigAttrib(dpy,cs[i],EGL_SURFACE_TYPE,&st); eglGetConfigAttrib(dpy,cs[i],EGL_RED_SIZE,&r);
+            eglGetConfigAttrib(dpy,cs[i],EGL_GREEN_SIZE,&g); eglGetConfigAttrib(dpy,cs[i],EGL_BLUE_SIZE,&b);
+            eglGetConfigAttrib(dpy,cs[i],EGL_ALPHA_SIZE,&a); eglGetConfigAttrib(dpy,cs[i],EGL_MATCH_FORMAT_KHR,&mf);
+            ISIS_LOG("  lockcfg[%d] surftype=0x%x rgba=%d/%d/%d/%d matchfmt=0x%x", i, st, r,g,b,a, mf); } }
+        /* Try progressively looser attribs; use whichever yields a pbuffer-capable lockable config. */
+        EGLConfig cfg; EGLint n = 0;
+        EGLint a1[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_LOCK_SURFACE_BIT_KHR, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                        EGL_MATCH_FORMAT_KHR, EGL_FORMAT_RGBA_8888_EXACT_KHR, EGL_NONE };
+        EGLint a2[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_LOCK_SURFACE_BIT_KHR, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                        EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8, EGL_NONE };
+        EGLint a3[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_LOCK_SURFACE_BIT_KHR, EGL_NONE };
+        if      (eglChooseConfig(dpy, a1, &cfg, 1, &n) && n>=1) ISIS_LOG("locksurf: cfg via exact-RGBA match");
+        else if (eglChooseConfig(dpy, a2, &cfg, 1, &n) && n>=1) ISIS_LOG("locksurf: cfg via rgba8 sizes");
+        else if (eglChooseConfig(dpy, a3, &cfg, 1, &n) && n>=1) ISIS_LOG("locksurf: cfg via pbuffer+lock only");
+        else { ISIS_LOG("locksurf: no pbuffer-lockable config"); t->lock_state = 0; return false; }
+        EGLint sa[] = { EGL_WIDTH, (EGLint)rw, EGL_HEIGHT, (EGLint)rh, EGL_NONE };
+        t->lock_surf = eglCreatePbufferSurface(dpy, cfg, sa);
+        if (t->lock_surf == EGL_NO_SURFACE) { ISIS_LOG("locksurf: pbuffer fail 0x%x", eglGetError()); t->lock_state = 0; return false; }
+        if (!t->lock_ctx) {
+            EGLint xa[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+            t->lock_ctx = eglCreateContext(dpy, cfg, webctx, xa);   /* share WebKit's ctx -> sample t->tex */
+            if (t->lock_ctx == EGL_NO_CONTEXT) { ISIS_LOG("locksurf: ctx fail 0x%x", eglGetError()); t->lock_state = 0; return false; }
+        }
+        t->lock_w = rw; t->lock_h = rh; t->lock_state = 1;
+        ISIS_LOG("locksurf: ready %ux%u", rw, rh);
+    }
+
+    struct timeval a, b; gettimeofday(&a, NULL);
+    if (!eglMakeCurrent(dpy, t->lock_surf, t->lock_surf, t->lock_ctx)) {
+        ISIS_LOG("locksurf: makeCurrent fail 0x%x", eglGetError());
+        eglMakeCurrent(dpy, pDraw, pRead, webctx); return false;
+    }
+    /* blit t->tex -> pbuffer default framebuffer (same quad/orientation as ds_gpu_pass) */
+    static const GLfloat quad[] = { -1.f,-1.f,0.f,0.f,  1.f,-1.f,1.f,0.f,  -1.f,1.f,0.f,1.f,  1.f,1.f,1.f,1.f };
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, (GLsizei)rw, (GLsizei)rh);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    glUseProgram(t->ds_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    glUniform1i(t->ds_uSampler, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), quad);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), quad + 2);
+    glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+
+    EGLint la[] = { EGL_MAP_PRESERVE_PIXELS_KHR, EGL_TRUE, EGL_LOCK_USAGE_HINT_KHR, EGL_READ_SURFACE_BIT_KHR, EGL_NONE };
+    if (!p_lock(dpy, t->lock_surf, la)) {
+        ISIS_LOG("locksurf: lock fail 0x%x", eglGetError());
+        eglMakeCurrent(dpy, pDraw, pRead, webctx); return false;
+    }
+    EGLint ptr_i = 0, pitch = 0, origin = EGL_LOWER_LEFT_KHR;
+    eglQuerySurface(dpy, t->lock_surf, EGL_BITMAP_POINTER_KHR, &ptr_i);
+    eglQuerySurface(dpy, t->lock_surf, EGL_BITMAP_PITCH_KHR, &pitch);
+    eglQuerySurface(dpy, t->lock_surf, EGL_BITMAP_ORIGIN_KHR, &origin);
+    uint8_t* ptr = (uint8_t*)(uintptr_t)ptr_i;
+    bool ok = false;
+    if (ptr && pitch > 0) {
+        /* pbuffer is RGBA, content-top at GL bottom (same as the FBO). LOWER_LEFT map row0 = content top
+         * (no flip); UPPER_LEFT map row0 = content bottom (flip). Swizzle RGBA->BGRA into the slot. */
+        for (uint32_t y = 0; y < rh; y++) {
+            uint32_t sy = (origin == EGL_UPPER_LEFT_KHR) ? (rh - 1 - y) : y;
+            swizzle_flip(ptr + (size_t)sy * pitch, slot + (size_t)y * rw * 4, rw, 1);
+        }
+        ok = true;
+    }
+    p_unlock(dpy, t->lock_surf);
+    eglMakeCurrent(dpy, pDraw, pRead, webctx);
+    gettimeofday(&b, NULL);
+    if (out_us) *out_us = (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_usec - a.tv_usec);
+    return ok;
+}
+
 static void target_frame_rendered(void* d)
 {
     struct isis_target* t = (struct isis_target*)d;
@@ -673,6 +786,19 @@ static void target_frame_rendered(void* d)
                         y0, sh, delta, (_b.tv_sec-_a.tv_sec)*1000000L+(_b.tv_usec-_a.tv_usec), rw, rh, s_bgra_readback); }
                     goto sent;
                 }
+            }
+        }
+
+        /* C: lock_surface fast readback (full 1:1 frame). Gated by /tmp/isis_locksurf. On success it
+         * bypasses glReadPixels entirely; on any failure it disables itself and falls through below. */
+        static int s_locksurf = -1;
+        if (s_locksurf < 0) s_locksurf = (access("/tmp/isis_locksurf", F_OK) == 0 || getenv("BPWPE_LOCKSURF")) ? 1 : 0;
+        if (s_locksurf && !wantScale) {
+            long us = 0;
+            if (lock_readback(t, slot, rw, rh, &us)) {
+                { static int _ln = 0; if (_ln++ % 12 == 0) ISIS_LOG("LOCKSURF readback %ldus (%ux%u) [glReadPixels was ~1.3s]", us, rw, rh); }
+                if (t->master) memcpy(t->master, slot, (size_t)rw * rh * 4);
+                goto sent;
             }
         }
 

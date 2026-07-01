@@ -245,12 +245,22 @@ void BrowserPageWPE::ensureWebView()
      * isolated, MEMORY-ONLY cookie jar that re-triggered nu.nl/DPG's consent every session — but cookies
      * were never persisted for the default context either, so the real bug is missing cookie persistence.
      * We add it below, so we get the tuned pressure AND cookies that finally survive across BS restarts. */
+    /* The WPEWebProcess was SIGBUS-crashing mid-scroll (core: memcpy fails to commit a page in
+     * IPC/StringImpl across threads) = SYSTEM memory exhaustion. Only ~180MB is free, so a 480MB
+     * WebKit budget lets it grow past what the system can commit and it dies BEFORE WebKit ever
+     * purges. Fix: set the budget near the real free memory so WebKit purges/GCs early enough.
+     * Tunable to sweep the safe max: `echo 256 > /tmp/isis_memlimit` (or BPWPE_MEM_LIMIT). */
+    int memLimit = 256;
+    { FILE* mf = fopen("/tmp/isis_memlimit", "r");
+      if (mf) { int m = 0; if (fscanf(mf, "%d", &m) == 1 && m >= 64 && m <= 600) memLimit = m; fclose(mf); }
+      else { const char* me = getenv("BPWPE_MEM_LIMIT"); if (me) { int m = atoi(me); if (m >= 64 && m <= 600) memLimit = m; } } }
     WebKitMemoryPressureSettings* webMem = webkit_memory_pressure_settings_new();
-    webkit_memory_pressure_settings_set_memory_limit(webMem, 480);             /* MB budget / web process */
-    webkit_memory_pressure_settings_set_conservative_threshold(webMem, 0.40);  /* purge discardable @ ~192MB */
-    webkit_memory_pressure_settings_set_strict_threshold(webMem, 0.60);        /* aggressive purge + GC @ ~288MB */
-    webkit_memory_pressure_settings_set_kill_threshold(webMem, 0.95);          /* force-kill runaway @ ~456MB */
-    webkit_memory_pressure_settings_set_poll_interval(webMem, 2.0);            /* seconds */
+    webkit_memory_pressure_settings_set_memory_limit(webMem, memLimit);        /* MB budget / web process */
+    webkit_memory_pressure_settings_set_conservative_threshold(webMem, 0.30);  /* purge discardable early */
+    webkit_memory_pressure_settings_set_strict_threshold(webMem, 0.50);        /* aggressive purge + GC */
+    webkit_memory_pressure_settings_set_kill_threshold(webMem, 0.85);          /* clean self-kill+respawn beats a SIGBUS */
+    webkit_memory_pressure_settings_set_poll_interval(webMem, 1.0);            /* seconds — react fast during scroll */
+    WLOG("memory budget: %d MB (conservative 0.30 / strict 0.50 / kill 0.85)", memLimit);
     WebKitWebContext* ctx = WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", webMem, NULL));
     webkit_memory_pressure_settings_free(webMem);
@@ -313,7 +323,7 @@ void BrowserPageWPE::ensureWebView()
          * (the tall viewport composites N screens of layers) -> the WPEWebProcess OOM-kills during
          * scroll ("white after 1/3"). Tunable to find the safe max: `echo 3 > /tmp/isis_bufscreens`
          * (or BPWPE_BUF_SCREENS), default 4. Read per-load so the harness can sweep it. */
-        int mult = 4;
+        int mult = 2;   /* default 2 screens: 4 OOM-crashes the WebProcess on heavy pages (~180MB free) */
         FILE* bf = fopen("/tmp/isis_bufscreens", "r");
         if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
         else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
