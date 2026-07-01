@@ -102,7 +102,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0), m_pageHeight(0)
-    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false)
+    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -414,6 +414,7 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
      * WebView wasn't finalized synchronously, so view_destroy never ran). The set lookup compares
      * the pointer value only — safe even if self is dangling (it never dereferences self). */
     if (g_livePages.find(self) == g_livePages.end()) return;
+    self->m_renderPending = false;   /* this re-render's frame arrived -> allow the next pan re-render */
     int buf = self->m_ownOffscreen0 ? 0 : (self->m_ownOffscreen1 ? 1 : -1);
     static unsigned s_fc = 0;                             // gate per-frame logging (file I/O per paint = slow)
     if ((s_fc++ % 120) == 0)
@@ -593,6 +594,9 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
     WLOG("setScrollPosition %d,%d renderedY=%d slack=%d inBuffer=%d", cx, cy, m_renderedY, slack, inBuffer);
     if (inBuffer) return;                                   /* adapter pans — no re-render, no readback */
+    if (m_renderPending) return;                            /* one re-render in flight; the ~1s readback is
+                                                               the wall — queuing more races m_renderedY ahead
+                                                               of the delivered buffer (offset/white/stops). */
     int newTop = cy - slack / 2;
     if (newTop < 0) newTop = 0;
     /* Clamp to the DOM's real scroll range: the tall WebView can't scroll past m_pageHeight-m_renderHeight,
@@ -601,6 +605,7 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
     m_renderedY = newTop;
+    m_renderPending = true;   /* cleared when the frame for this re-render is delivered (onFrame) */
     char js[96];
     snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);

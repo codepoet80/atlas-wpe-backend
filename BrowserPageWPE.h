@@ -205,6 +205,7 @@ private:
     bool                m_frozen;
     bool                m_private;     // ephemeral session (private browsing) — set by the openUrl marker
     bool                m_prewarmBlank; // BPWPE_PRESPAWN: WebView pre-warmed with about:blank (non-private)
+    bool                m_renderPending; // pan re-render in flight; don't queue another (m_renderedY would race ahead of the delivered buffer)
     uint32_t            m_priority;
 
     // ---- WPE members (replace m_graphicsView/m_scene/m_webView/m_webPage) ----
