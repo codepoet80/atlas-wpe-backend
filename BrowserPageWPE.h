@@ -200,6 +200,7 @@ private:
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
+    int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits the buffer -> never re-render
     bool                m_focused;
     bool                m_frozen;
     bool                m_private;     // ephemeral session (private browsing) — set by the openUrl marker
