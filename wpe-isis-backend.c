@@ -378,6 +378,17 @@ static void target_frame_will_render(void* d)
         if (t->fbo)   glDeleteFramebuffers(1, &t->fbo);
         if (t->tex)   glDeleteTextures(1, &t->tex);
         if (t->depth) glDeleteRenderbuffers(1, &t->depth);
+        {   /* P0: GL caps — the Adreno 220 GLES2 texture/renderbuffer cap gates the tall scroll buffer */
+            static int s_caps = 0;
+            if (!s_caps) { s_caps = 1;
+                GLint mt = 0, mr = 0, mv[2] = {0, 0};
+                glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mt);
+                glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &mr);
+                glGetIntegerv(GL_MAX_VIEWPORT_DIMS, mv);
+                ISIS_LOG("GLCAPS max_texture=%d max_renderbuffer=%d max_viewport=%dx%d renderer='%s'",
+                         mt, mr, mv[0], mv[1], (const char*)glGetString(GL_RENDERER));
+            }
+        }
         glGenTextures(1, &t->tex);
         glBindTexture(GL_TEXTURE_2D, t->tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)t->width, (GLsizei)t->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Cross-compile the Isis WPE backend to libWPEBackend-isis.so (musl/ARM softfp).
 set -e
-WPE=/home/herrie/webos/wpe; . "${WPE_ENV:-$WPE/env.sh}"
+WPE=/home/herrie/webos/wpe; . "${WPE_ENV:-$WPE/env-glibc-gcc125.sh}"
 cd "$WPE/backend-isis"
 PKGS="wpe-1.0 glib-2.0 egl glesv2"
 CF=$(pkg-config --cflags $PKGS)
