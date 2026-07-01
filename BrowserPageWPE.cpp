@@ -595,6 +595,11 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     if (inBuffer) return;                                   /* adapter pans — no re-render, no readback */
     int newTop = cy - slack / 2;
     if (newTop < 0) newTop = 0;
+    /* Clamp to the DOM's real scroll range: the tall WebView can't scroll past m_pageHeight-m_renderHeight,
+     * so an un-clamped newTop makes window.scrollTo silently clamp while m_renderedY keeps the wrong value —
+     * desyncing the header from the buffer (adapter pans wrong -> "stops" forward, white backward). */
+    int maxTop = m_pageHeight - m_renderHeight;
+    if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
     m_renderedY = newTop;
     char js[96];
     snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
