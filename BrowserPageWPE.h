@@ -200,10 +200,12 @@ private:
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
+    int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
     bool                m_focused;
     bool                m_frozen;
     bool                m_private;     // ephemeral session (private browsing) — set by the openUrl marker
     bool                m_prewarmBlank; // BPWPE_PRESPAWN: WebView pre-warmed with about:blank (non-private)
+    bool                m_renderPending; // pan re-render in flight; don't queue another (m_renderedY would race ahead of the delivered buffer)
     uint32_t            m_priority;
 
     // ---- WPE members (replace m_graphicsView/m_scene/m_webView/m_webPage) ----

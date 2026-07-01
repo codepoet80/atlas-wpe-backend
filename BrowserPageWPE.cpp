@@ -101,8 +101,8 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_virtualWindowWidth(0), m_virtualWindowHeight(0)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0)
     , m_renderWidth(0), m_renderHeight(0)
-    , m_scrollX(0), m_scrollY(0)
-    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false)
+    , m_scrollX(0), m_scrollY(0), m_pageHeight(0)
+    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -290,6 +290,16 @@ void BrowserPageWPE::ensureWebView()
     if (screenW < renderW) screenW = renderW;   /* never narrower than the adapter's layout width */
     m_screenWidth  = screenW;
     m_screenHeight = screenH;                    /* 0 if unknown → setScrollPosition uses the safe path */
+    /* P1: fill the offscreen to the legacy ~4-screen budget height so scrolling pans a tall pre-rendered
+     * window and the ~500ms full-buffer glReadPixels re-renders become rare (or never, for pages that fit).
+     * The adapter already allocates this budget (screenW*screenH*4 * 4.0 = 12.58MB). Cap at the measured
+     * GL_MAX_TEXTURE_SIZE (4096 on the Adreno 220). Was m_virtualWindowHeight (~1400 ≈ 1.8 screens). */
+    if (screenH > 0) {
+        renderH = screenH * 4;
+        if (renderH > 4096) renderH = 4096;
+        if (renderH < m_virtualWindowHeight) renderH = m_virtualWindowHeight;
+        m_virtualWindowHeight = renderH;
+    }
     /* Fit-to-screen ("overview" on load) — the PROPER webOS path matching the legacy
      * BrowserOffscreenInfo contract: lay the page out at a WIDER layout width W so desktop sites use
      * the desktop layout, then DOWNSCALE each rendered frame to the SCREEN width so the offscreen
@@ -404,6 +414,7 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
      * WebView wasn't finalized synchronously, so view_destroy never ran). The set lookup compares
      * the pointer value only — safe even if self is dangling (it never dereferences self). */
     if (g_livePages.find(self) == g_livePages.end()) return;
+    self->m_renderPending = false;   /* this re-render's frame arrived -> allow the next pan re-render */
     int buf = self->m_ownOffscreen0 ? 0 : (self->m_ownOffscreen1 ? 1 : -1);
     static unsigned s_fc = 0;                             // gate per-frame logging (file I/O per paint = slow)
     if ((s_fc++ % 120) == 0)
@@ -567,6 +578,15 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
         webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
         return;
     }
+    /* P1 full-page-once: the whole (scaled) page fits the tall buffer -> it's all rendered at renderedY=0,
+     * so the adapter pans the ENTIRE page with ZERO re-render (legacy-smooth end to end). */
+    if (m_pageHeight > 0 && m_pageHeight <= m_renderHeight) {
+        if (m_renderedY != 0) {
+            m_renderedY = 0;
+            webkit_web_view_evaluate_javascript(m_webView, "window.scrollTo(0,0)", -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+        }
+        return;
+    }
     int screenH = m_screenHeight;
     int slack   = m_renderHeight - screenH;                 /* pannable travel inside the buffer */
     if (slack < 0) slack = 0;
@@ -574,9 +594,18 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
     WLOG("setScrollPosition %d,%d renderedY=%d slack=%d inBuffer=%d", cx, cy, m_renderedY, slack, inBuffer);
     if (inBuffer) return;                                   /* adapter pans — no re-render, no readback */
+    if (m_renderPending) return;                            /* one re-render in flight; the ~1s readback is
+                                                               the wall — queuing more races m_renderedY ahead
+                                                               of the delivered buffer (offset/white/stops). */
     int newTop = cy - slack / 2;
     if (newTop < 0) newTop = 0;
+    /* Clamp to the DOM's real scroll range: the tall WebView can't scroll past m_pageHeight-m_renderHeight,
+     * so an un-clamped newTop makes window.scrollTo silently clamp while m_renderedY keeps the wrong value —
+     * desyncing the header from the buffer (adapter pans wrong -> "stops" forward, white backward). */
+    int maxTop = m_pageHeight - m_renderHeight;
+    if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
     m_renderedY = newTop;
+    m_renderPending = true;   /* cleared when the frame for this re-render is delivered (onFrame) */
     char js[96];
     snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -595,8 +624,10 @@ void BrowserPageWPE::onContentHeight(GObject* obj, GAsyncResult* res, gpointer u
     /* Ignore the exact-viewport-height artifact: document.scrollHeight transiently returns the WebView
      * viewport height (== m_virtualWindowHeight) during reflow / subframe loads. Reporting it clobbers the
      * real page height and clamps the adapter's scroll to one buffer. Real heights are never exactly it. */
-    if (h > 0 && h != self->m_virtualWindowHeight)
+    if (h > 0 && h != self->m_virtualWindowHeight) {
+        self->m_pageHeight = h;   /* P1: full-page-fits check in setScrollPosition */
         self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, h);
+    }
 }
 /* On-demand: extract the article from the CURRENT DOM (works mid-load — the article text is present
  * long before the page "finishes" loading ads/trackers). Compact (<16KB yap limit). */
