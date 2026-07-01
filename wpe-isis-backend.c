@@ -423,6 +423,16 @@ static void target_frame_will_render(void* d)
                 glGetIntegerv(GL_MAX_VIEWPORT_DIMS, mv);
                 ISIS_LOG("GLCAPS max_texture=%d max_renderbuffer=%d max_viewport=%dx%d renderer='%s'",
                          mt, mr, mv[0], mv[1], (const char*)glGetString(GL_RENDERER));
+                /* C-investigation: which zero-copy / fast-readback paths exist? Look for
+                 * OES_EGL_image, EXT_texture_format_BGRA8888, OES_mapbuffer, *pixel_buffer*, and on the
+                 * EGL side KHR_image / ANDROID_image_native_buffer (gralloc/dmabuf-like map). */
+                const char* ge = (const char*)glGetString(GL_EXTENSIONS);
+                ISIS_LOG("GLEXT: %.1200s", ge ? ge : "(null)");
+                EGLDisplay ed = eglGetCurrentDisplay();
+                if (ed != EGL_NO_DISPLAY) {
+                    const char* ee = eglQueryString(ed, EGL_EXTENSIONS);
+                    ISIS_LOG("EGLEXT: %.1000s", ee ? ee : "(null)");
+                }
             }
         }
         glGenTextures(1, &t->tex);
@@ -631,7 +641,9 @@ static void target_frame_rendered(void* d)
          * memmove the overlap within it, then publish master -> slot. Turns the full-buffer readback
          * (~1.4s at 3072 rows on this Adreno) into ~stripH/bufH of that. Any invalid/oversized hint
          * (or a reflow beating the scroll frame) consumes the seq and falls through to the full read. */
-        if (!wantScale && s_bgra_readback >= 0) {   /* need the readback format probed first */
+        static int s_noStrip = -1;   /* isolate crashes: `touch /tmp/isis_no_strip` disables the strip path */
+        if (s_noStrip < 0) s_noStrip = (access("/tmp/isis_no_strip", F_OK) == 0 || getenv("BPWPE_NO_STRIP")) ? 1 : 0;
+        if (!wantScale && s_bgra_readback >= 0 && !s_noStrip) {   /* need the readback format probed first */
             if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));
             struct isis_ctrl* ctrl = shm_ctrl(t->shm, t->width, t->height);
             uint32_t seq = ctrl->seq;

@@ -309,10 +309,19 @@ void BrowserPageWPE::ensureWebView()
      * The adapter already allocates this budget (screenW*screenH*4 * 4.0 = 12.58MB). Cap at the measured
      * GL_MAX_TEXTURE_SIZE (4096 on the Adreno 220). Was m_virtualWindowHeight (~1400 ≈ 1.8 screens). */
     if (screenH > 0) {
-        renderH = screenH * 4;
+        /* Buffer height = N screens. Taller = fewer re-renders but more WebKit compositor memory
+         * (the tall viewport composites N screens of layers) -> the WPEWebProcess OOM-kills during
+         * scroll ("white after 1/3"). Tunable to find the safe max: `echo 3 > /tmp/isis_bufscreens`
+         * (or BPWPE_BUF_SCREENS), default 4. Read per-load so the harness can sweep it. */
+        int mult = 4;
+        FILE* bf = fopen("/tmp/isis_bufscreens", "r");
+        if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
+        else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
+        renderH = screenH * mult;
         if (renderH > 4096) renderH = 4096;
         if (renderH < m_virtualWindowHeight) renderH = m_virtualWindowHeight;
         m_virtualWindowHeight = renderH;
+        WLOG("buffer height: %d screens -> renderH=%d", mult, renderH);
     }
     /* Fit-to-screen ("overview" on load) — the PROPER webOS path matching the legacy
      * BrowserOffscreenInfo contract: lay the page out at a WIDER layout width W so desktop sites use
