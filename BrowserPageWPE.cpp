@@ -524,7 +524,9 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     m_scrollX = cx; m_scrollY = cy;
     static int s_noPan = -1;
     if (s_noPan < 0) s_noPan = getenv("BPWPE_NO_PAN") ? 1 : 0;
-    if (s_noPan) {   /* instant revert to the old re-render-every-step path (safety net) */
+    if (s_noPan) {   /* re-render-every-step path (safety net). renderedY = scroll so the adapter's pan
+                        offset (mScrollPos.y - renderedY) cancels to the identity blit — behavior unchanged. */
+        m_renderedY = cy;
         char js[96]; snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, cy);
         webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
         return;
@@ -535,6 +537,7 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
      * EVERY step — the whole slowness. So only re-render when the scroll nears the buffer edge; otherwise
      * let the adapter pan the buffer we already sent. Re-render is centred so panning works both ways. */
     if (m_screenHeight <= 0) {   /* resolution unknown → safe re-render path, never a hardcoded size */
+        m_renderedY = cy;        /* keep renderedY == scroll so the adapter's pan offset cancels */
         char js[96]; snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, cy);
         webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
         return;
