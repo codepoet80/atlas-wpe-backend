@@ -193,7 +193,43 @@ int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decisio
             return TRUE;
         }
     }
+    else if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
+        WebKitNavigationPolicyDecision* nd = WEBKIT_NAVIGATION_POLICY_DECISION(decision);
+        WebKitNavigationAction* act = webkit_navigation_policy_decision_get_navigation_action(nd);
+        if (act && webkit_navigation_action_get_navigation_type(act) == WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED) {
+            BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+            /* Save-login: the submitting document is still live at decide-policy time. Snapshot any
+             * filled password form's username+password (proven evaluate_javascript path — script message
+             * handlers crash this BS build) and offer it to the app to save. We do NOT block the submit. */
+            if (self && self->m_webView) {
+                static const char* kCapJs =
+                    "(function(){var ps=document.querySelectorAll('input[type=password]');"
+                    "for(var i=0;i<ps.length;i++){var p=ps[i];if(!p.value)continue;"
+                    "var u='',f=p.form;if(f){var ins=f.querySelectorAll('input');"
+                    "for(var j=0;j<ins.length;j++){var t=(ins[j].type||'text').toLowerCase();"
+                    "if((t==='text'||t==='email'||t==='tel')&&ins[j].value)u=ins[j].value;}}"
+                    "return JSON.stringify({u:u,p:p.value,host:location.host});}"
+                    "return '';})()";
+                webkit_web_view_evaluate_javascript(self->m_webView, kCapJs, -1, nullptr, nullptr, nullptr,
+                                                    &BrowserPageWPE::onLoginCapture, self);
+            }
+        }
+    }
     return FALSE;   /* default policy for navigation / new-window / displayable responses */
+}
+
+/* Save-login: result of the form-submit snapshot → msgActionData("saveLogin", json) → app offers to save. */
+void BrowserPageWPE::onLoginCapture(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (!v) { if (err) g_error_free(err); return; }
+    char* s = jsc_value_to_string(v);
+    if (s && s[0] == '{' && self->m_server)
+        self->m_server->msgActionData(self->m_proxy, "saveLogin", s);
+    if (s) g_free(s);
+    g_object_unref(v);
 }
 
 /* ---- ad/tracker content blocker (WKContentRuleList) ---------------------------------------- *
@@ -1445,11 +1481,19 @@ void BrowserPageWPE::smartZoomCalculate(uint32_t pointX, uint32_t pointY)
      * model), NOT the adapter pan (m_scrollY) — same fix as dispatchPointer. Using m_scrollY hit-tested the
      * wrong spot whenever the page was panned within the buffer, so double-tap zoom fired only intermittently. */
     int vx = (int)pointX - m_scrollX, vy = (int)pointY - m_renderedY;
-    char js[512];
+    char js[640];
     snprintf(js, sizeof(js),
-        "(function(){var e=document.elementFromPoint(%d,%d);if(!e)return '0,0,0,0';"
+        "(function(){var e=document.elementFromPoint(%d,%d);"
+        "if(!e||e.tagName==='HTML'||e.tagName==='BODY')return '0,0,0,0';"
+        /* walk up out of inline boxes to the containing block */
         "while(e.parentElement&&getComputedStyle(e).display==='inline')e=e.parentElement;"
-        "var r=e.getBoundingClientRect(),sx=window.scrollX,sy=window.scrollY;"
+        /* climb tiny/degenerate wrappers to a meaningfully-sized block, but stop at BODY/HTML */
+        "while(e.parentElement&&e.parentElement.tagName!=='BODY'&&e.parentElement.tagName!=='HTML'){"
+        "var pr=e.parentElement.getBoundingClientRect();if(pr.width>=8&&pr.height>=8&&pr.width<=e.getBoundingClientRect().width*1.05)break;"
+        "if(e.getBoundingClientRect().width>=8&&e.getBoundingClientRect().height>=8)break;e=e.parentElement;}"
+        "if(e.tagName==='HTML'||e.tagName==='BODY')return '0,0,0,0';"
+        "var r=e.getBoundingClientRect();if(r.width<8||r.height<8)return '0,0,0,0';"
+        "var sx=window.scrollX,sy=window.scrollY;"
         "return Math.round(r.left+sx)+','+Math.round(r.top+sy)+','+Math.round(r.right+sx)+','+Math.round(r.bottom+sy);})()",
         vx, vy);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr,
@@ -1467,6 +1511,112 @@ void BrowserPageWPE::onSmartZoomResult(GObject* obj, GAsyncResult* res, gpointer
     g_free(s); g_object_unref(v);
     if (self->m_server)
         self->m_server->msgSmartZoomCalculateResponseSimple(self->m_proxy, self->m_smartZoomX, self->m_smartZoomY, l, t, r, b, 0);
+}
+
+/* ---- Feature 9: context-menu hit-test + save-image (async; WPE has no sync hit-test) ---------------- */
+void BrowserPageWPE::hitTestAsync(int32_t queryNum, int32_t cx, int32_t cy)
+{
+    m_hitTestQuery = queryNum;
+    if (!m_webView) { if (m_server) m_server->msgHitTestResponse(m_proxy, queryNum, "{\"isNull\":true}"); return; }
+    int vx = cx - m_scrollX, vy = cy - m_renderedY;   /* document -> viewport (WebKit's real scroll = m_renderedY) */
+    char js[2400];
+    snprintf(js, sizeof js,
+        "(function(x,y){"
+        /* stacked elements at the point so we see images/links UNDER overlays and link wrappers */
+        "var st=(document.elementsFromPoint?document.elementsFromPoint(x,y):[document.elementFromPoint(x,y)]).filter(Boolean);"
+        "if(!st.length)return JSON.stringify({isNull:true});var e=st[0];"
+        /* link: nearest ancestor A[href] of anything in the stack */
+        "var lk=null;for(var i=0;i<st.length&&!lk;i++){var p=st[i];while(p){if(p.tagName==='A'&&p.getAttribute('href')){lk=p;break;}p=p.parentElement;}}"
+        /* image: an IMG in the stack (or a descendant), else the first CSS background-image up the tree */
+        "var im=null,bg='';for(var j=0;j<st.length&&!im;j++){var s=st[j];if(s.tagName==='IMG'){im=s;break;}var qq=s.querySelector&&s.querySelector('img');if(qq){im=qq;break;}}"
+        "if(!im){for(var k=0;k<st.length&&!bg;k++){var d=st[k];while(d&&d.nodeType===1){var cs=getComputedStyle(d);var bi=cs&&cs.backgroundImage;if(bi&&bi.indexOf('url(')>-1){var m=bi.match(/url\\((\"|')?([^\"')]+)/);if(m){bg=m[2];break;}}d=d.parentElement;}}}"
+        "var ed=false,c=e;while(c){var t=c.tagName;if(t==='INPUT'||t==='TEXTAREA'||c.isContentEditable){ed=true;break;}c=c.parentElement;}"
+        "var r={isNull:false,isLink:!!lk,isImage:!!(im||bg),element:(e.tagName||'').toUpperCase(),editable:ed};"
+        "if(lk){r.linkUrl=lk.href;r.linkText=(lk.textContent||'').replace(/\\s+/g,' ').trim().slice(0,200);r.linkTitle=lk.getAttribute('title')||'';}"
+        "if(im){r.imageUrl=im.currentSrc||im.src;r.altText=im.getAttribute('alt')||'';}else if(bg){r.imageUrl=bg;r.altText='';}"
+        "var bt=(im||e),b=bt.getBoundingClientRect();r.bounds={left:Math.round(b.left),top:Math.round(b.top),right:Math.round(b.right),bottom:Math.round(b.bottom)};"
+        "return JSON.stringify(r);})(%d,%d)",
+        vx, vy);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onHitTestResult, this);
+}
+void BrowserPageWPE::onHitTestResult(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    std::string json = "{\"isNull\":true}";
+    if (v) { char* s = jsc_value_to_string(v); if (s) { json = s; g_free(s); } g_object_unref(v); }
+    else if (err) g_error_free(err);
+    if (self->m_server) self->m_server->msgHitTestResponse(self->m_proxy, self->m_hitTestQuery, json.c_str());
+}
+
+/* Save-image: 2-step async — JS to get the <img> src at the point, then download it (modern TLS) into the
+ * requested dir, then respond. State lives in a heap struct freed on finish/fail (like the favicon dl). */
+struct IsisImgDl { BrowserPageWPE* page; int query; std::string dest; gulong hFin, hFail; };
+static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok);
+static void isis_img_dl_finished(WebKitDownload* dl, gpointer ud) { isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), true); }
+static void isis_img_dl_failed(WebKitDownload* dl, GError*, gpointer ud) { isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), false); }
+static gboolean isis_img_decide_dest(WebKitDownload* dl, gchar*, gpointer ud) {
+    webkit_download_set_destination(dl, static_cast<IsisImgDl*>(ud)->dest.c_str()); return TRUE;
+}
+
+void BrowserPageWPE::saveImageAtPointAsync(int32_t queryNum, int32_t x, int32_t y, const char* dir)
+{
+    m_saveImgQuery = queryNum;
+    m_saveImgDir = (dir && *dir) ? dir : "/tmp";
+    if (!m_webView) { if (m_server) m_server->msgSaveImageAtPointResponse(m_proxy, queryNum, false, ""); return; }
+    int vx = x - m_scrollX, vy = y - m_renderedY;
+    char js[900];
+    snprintf(js, sizeof js,
+        "(function(x,y){"
+        "var st=(document.elementsFromPoint?document.elementsFromPoint(x,y):[document.elementFromPoint(x,y)]).filter(Boolean);"
+        "for(var j=0;j<st.length;j++){var s=st[j];if(s.tagName==='IMG')return s.currentSrc||s.src;var q=s.querySelector&&s.querySelector('img');if(q)return q.currentSrc||q.src;}"
+        "for(var k=0;k<st.length;k++){var d=st[k];while(d&&d.nodeType===1){var bi=getComputedStyle(d).backgroundImage;if(bi&&bi.indexOf('url(')>-1){var m=bi.match(/url\\((\"|')?([^\"')]+)/);if(m)return m[2];}d=d.parentElement;}}"
+        "return '';})(%d,%d)", vx, vy);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSaveImgSrcResult, this);
+}
+void BrowserPageWPE::onSaveImgSrcResult(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    std::string src;
+    if (v) { char* s = jsc_value_to_string(v); if (s) { src = s; g_free(s); } g_object_unref(v); }
+    else if (err) g_error_free(err);
+    if (src.empty() || !self->m_webView) {
+        if (self->m_server) self->m_server->msgSaveImageAtPointResponse(self->m_proxy, self->m_saveImgQuery, false, "");
+        return;
+    }
+    /* dest filename from the URL basename (or a fixed name for data: URIs) */
+    std::string leaf;
+    if (src.compare(0, 5, "data:") == 0) leaf = "isis-image.png";
+    else {
+        size_t qm = src.find('?'); std::string clean = (qm == std::string::npos) ? src : src.substr(0, qm);
+        size_t sl = clean.rfind('/'); leaf = (sl == std::string::npos) ? clean : clean.substr(sl + 1);
+        if (leaf.empty()) leaf = "isis-image";
+    }
+    mkdir(self->m_saveImgDir.c_str(), 0755);
+    std::string dest = self->m_saveImgDir + "/" + leaf;
+    WebKitDownload* dl = webkit_web_view_download_uri(self->m_webView, src.c_str());
+    if (!dl) { if (self->m_server) self->m_server->msgSaveImageAtPointResponse(self->m_proxy, self->m_saveImgQuery, false, ""); return; }
+    IsisImgDl* s = new IsisImgDl();
+    s->page = self; s->query = self->m_saveImgQuery; s->dest = dest;
+    webkit_download_set_destination(dl, dest.c_str());
+    g_signal_connect(dl, "decide-destination", G_CALLBACK(isis_img_decide_dest), s);
+    s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(isis_img_dl_finished), s);
+    s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(isis_img_dl_failed),   s);
+}
+void BrowserPageWPE::respondSaveImage(int32_t query, bool ok, const char* path)
+{
+    if (m_server && m_proxy) m_server->msgSaveImageAtPointResponse(m_proxy, query, ok, ok ? path : "");
+}
+static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok)
+{
+    if (s->page) s->page->respondSaveImage(s->query, ok, s->dest.c_str());
+    g_signal_handler_disconnect(dl, s->hFin);
+    g_signal_handler_disconnect(dl, s->hFail);
+    g_object_unref(dl);
+    delete s;
 }
 
 /* ---- input: dispatch on the wpe_view_backend (forwards to the WebProcess) ------------------- */
@@ -1519,6 +1669,56 @@ bool BrowserPageWPE::clickAt(uint32_t x, uint32_t y, uint32_t numClicks)
     return true;
 }
 bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) { dispatchPointer((int)x, (int)y, 1, true); return true; }
+
+/* ---- tap-to-select a word of web content; WebKit paints the selection highlight natively --------- */
+void BrowserPageWPE::selectWordAt(int docX, int docY)
+{
+    if (!m_webView) return;
+    int vx = docX - m_scrollX, vy = docY - m_renderedY;
+    char js[560];
+    snprintf(js, sizeof js,
+        "(function(x,y){var s=window.getSelection();if(!s)return 0;s.removeAllRanges();"
+        "var r=(document.caretRangeFromPoint?document.caretRangeFromPoint(x,y):null);"
+        "if(r){s.addRange(r);try{s.modify('move','backward','word');s.modify('extend','forward','word');}catch(e){}"
+        "if(s.toString().trim().length)return s.toString().length;s.removeAllRanges();}"
+        /* fallback: no caret/word here — select the block element's text at the point */
+        "var el=document.elementFromPoint(x,y);if(el){var rr=document.createRange();rr.selectNodeContents(el);s.addRange(rr);return s.toString().length;}"
+        "return 0;})(%d,%d)",
+        vx, vy);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+void BrowserPageWPE::onCopyText(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (!v) { if (err) g_error_free(err); return; }
+    char* s = jsc_value_to_string(v);
+    if (s && s[0] && self->m_server) self->m_server->msgActionData(self->m_proxy, "copiedText", s);
+    if (s) g_free(s);
+    g_object_unref(v);
+}
+
+/* ---- web-content drag: button-held pointer motion (in-page sliders/canvas/DnD under touch) ------- */
+void BrowserPageWPE::dragStart(int contentX, int contentY)
+{
+    m_dragX = contentX; m_dragY = contentY;
+    dispatchPointer(contentX, contentY, 1, true);   // press at the drag origin
+}
+void BrowserPageWPE::dragProcess(int deltaX, int deltaY)
+{
+    if (!m_viewBackend) return;
+    m_dragX += deltaX; m_dragY += deltaY;
+    int x = m_dragX - m_scrollX, y = m_dragY - m_renderedY;
+    /* motion WITH button 1 held so WebKit treats it as a drag, not a hover */
+    struct wpe_input_pointer_event move = { wpe_input_pointer_event_type_motion, 0, x, y, 1, 1, 0 };
+    wpe_view_backend_dispatch_pointer_event(m_viewBackend, &move);
+}
+void BrowserPageWPE::dragEnd(int contentX, int contentY)
+{
+    if (contentX || contentY) { m_dragX = contentX; m_dragY = contentY; }
+    dispatchPointer(m_dragX, m_dragY, 1, false);   // release
+}
 
 /* The webOS gesture recogniser delivers single-finger TAPS as gesture events (not mouse/click/
  * touch) — this was a no-op stub, so links, buttons and cookie-consent "Accept" never got a click.

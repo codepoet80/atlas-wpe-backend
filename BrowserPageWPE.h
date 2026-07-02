@@ -98,9 +98,11 @@ public:
     void cut() { if (m_webView) webkit_web_view_execute_editing_command(m_webView, "Cut"); }
     void disableEnhancedViewport(bool disable) {}
     void downloadCancel( const char* url ) {}
-    void dragEnd(int contentX, int contentY) {}
-    void dragProcess(int deltaX, int deltaY) {}
-    void dragStart(int contentX, int contentY) {}
+    /* Web-content drag: press at start, button-held motion per delta, release. Lets in-page draggables
+     * (sliders, canvas, map tiles, HTML5 DnD) work under touch. Out-of-line (uses libwpe input structs). */
+    void dragEnd(int contentX, int contentY);
+    void dragProcess(int deltaX, int deltaY);
+    void dragStart(int contentX, int contentY);
     void enableInterrogateClicks( bool enable ) {}
     int findString( const char* str, bool fwd ) {
         if (!m_webView) return 0;
@@ -125,6 +127,11 @@ public:
     void getTextCaretBounds(int& left, int& top, int& right, int& bottom) {}
     void hideSpellingWidget() {}
     QWebHitTestResult hitTest (uint32_t x, uint32_t y) { return {}; }
+    /* Feature 9 (context menu): WPE has no synchronous hit-test, so these run elementFromPoint JS / download
+     * the image asynchronously and answer via m_server->msgHitTestResponse / msgSaveImageAtPointResponse. */
+    void hitTestAsync(int32_t queryNum, int32_t cx, int32_t cy);
+    void saveImageAtPointAsync(int32_t queryNum, int32_t x, int32_t y, const char* dir);
+    void respondSaveImage(int32_t query, bool ok, const char* path);   // Feature 9: called from the image-download callback
     /* A payload starting with \x02 is an AUTOFILL request ("\x02" user "\x02" pass), routed through this
      * existing command to avoid new IPC. Otherwise it's a plain InsertText into the focused field. */
     void insertStringAtCursor(const char* text) {
@@ -150,6 +157,8 @@ public:
     void setMouseMode(enum BATypes::MouseMode mode) {}
     void setNetworkInterface(const char* interfaceName) {}
     void setSelectionMode(bool on) {}
+    /* Feature: tap-to-select a word of web content at (docX,docY); WebKit paints the highlight natively. */
+    void selectWordAt(int docX, int docY);
     void setShowClickedLink(bool enable) {}
     void settingsJavaScriptEnabled(bool enable) { if (m_webView) webkit_settings_set_enable_javascript(webkit_web_view_get_settings(m_webView), enable); }
     void settingsPopupsEnabled(bool enable) { if (m_webView) webkit_settings_set_javascript_can_open_windows_automatically(webkit_web_view_get_settings(m_webView), enable); }
@@ -171,7 +180,18 @@ public:
         return attachToBuffer(w, h, k1, k2, sz); }
 
     // ---- additional drop-in stubs ----
-    bool copy() { if (m_webView) webkit_web_view_execute_editing_command(m_webView, "Copy"); return true; }
+    /* Copy: run the native Copy command AND ferry the current selection text to the app (msgActionData
+     * "copiedText") so it can place it on the webOS system clipboard (WebKit's own clipboard isn't wired
+     * to LunaSysMgr). Async read via the proven evaluate_javascript path. */
+    bool copy() {
+        if (m_webView) {
+            webkit_web_view_execute_editing_command(m_webView, "Copy");
+            webkit_web_view_evaluate_javascript(m_webView,
+                "(function(){return window.getSelection?window.getSelection().toString():'';})()",
+                -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onCopyText, this);
+        }
+        return true;
+    }
 
     // ---- manager/main extras ----
     uint32_t getPriority() { return m_priority; }
@@ -206,6 +226,14 @@ private:
     static void onEditorCheckResult(GObject*, GAsyncResult*, gpointer);
     static void onSmartZoomResult(GObject*, GAsyncResult*, gpointer);   // double-tap zoom: block rect → response
     int m_smartZoomX, m_smartZoomY;          // echoed back in the smart-zoom response
+    static void onHitTestResult(GObject*, GAsyncResult*, gpointer);      // Feature 9: JS elementFromPoint result → msgHitTestResponse
+    static void onSaveImgSrcResult(GObject*, GAsyncResult*, gpointer);   // Feature 9: image src at point → start download
+    int m_hitTestQuery = 0;                  // Feature 9: queryNum echoed in the hit-test/save-image response
+    int m_saveImgQuery = 0;
+    static void onLoginCapture(GObject*, GAsyncResult*, gpointer);   // save-login: form-submit snapshot → msgActionData("saveLogin")
+    static void onCopyText(GObject*, GAsyncResult*, gpointer);       // copy: selection text → msgActionData("copiedText")
+    int m_dragX = 0, m_dragY = 0;            // web-content drag: tracked document-space pointer position
+    std::string m_saveImgDir;                // Feature 9: dir to save the image into (/media/internal or /tmp)
 
     // ---- Isis members (mirror BrowserPage) ----
     BrowserServer*      m_server;
