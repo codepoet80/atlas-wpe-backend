@@ -1517,26 +1517,27 @@ void BrowserPageWPE::onSmartZoomResult(GObject* obj, GAsyncResult* res, gpointer
 void BrowserPageWPE::hitTestAsync(int32_t queryNum, int32_t cx, int32_t cy)
 {
     m_hitTestQuery = queryNum;
-    if (!m_webView) { if (m_server) m_server->msgHitTestResponse(m_proxy, queryNum, "{\"isNull\":true}"); return; }
+    if (!m_webView) { if (m_server) m_server->msgHitTestResponse(m_proxy, queryNum, "{\"isNull\":true,\"x\":0,\"y\":0}"); return; }
     int vx = cx - m_scrollX, vy = cy - m_renderedY;   /* document -> viewport (WebKit's real scroll = m_renderedY) */
+    WLOG("hitTest q=%d doc(%d,%d) -> view(%d,%d) scrollX=%d renderedY=%d", queryNum, cx, cy, vx, vy, m_scrollX, m_renderedY);
     char js[2400];
     snprintf(js, sizeof js,
         "(function(x,y){"
         /* stacked elements at the point so we see images/links UNDER overlays and link wrappers */
         "var st=(document.elementsFromPoint?document.elementsFromPoint(x,y):[document.elementFromPoint(x,y)]).filter(Boolean);"
-        "if(!st.length)return JSON.stringify({isNull:true});var e=st[0];"
+        "if(!st.length)return JSON.stringify({isNull:true,x:x,y:y});var e=st[0];"
         /* link: nearest ancestor A[href] of anything in the stack */
         "var lk=null;for(var i=0;i<st.length&&!lk;i++){var p=st[i];while(p){if(p.tagName==='A'&&p.getAttribute('href')){lk=p;break;}p=p.parentElement;}}"
         /* image: an IMG in the stack (or a descendant), else the first CSS background-image up the tree */
         "var im=null,bg='';for(var j=0;j<st.length&&!im;j++){var s=st[j];if(s.tagName==='IMG'){im=s;break;}var qq=s.querySelector&&s.querySelector('img');if(qq){im=qq;break;}}"
         "if(!im){for(var k=0;k<st.length&&!bg;k++){var d=st[k];while(d&&d.nodeType===1){var cs=getComputedStyle(d);var bi=cs&&cs.backgroundImage;if(bi&&bi.indexOf('url(')>-1){var m=bi.match(/url\\((\"|')?([^\"')]+)/);if(m){bg=m[2];break;}}d=d.parentElement;}}}"
         "var ed=false,c=e;while(c){var t=c.tagName;if(t==='INPUT'||t==='TEXTAREA'||c.isContentEditable){ed=true;break;}c=c.parentElement;}"
-        "var r={isNull:false,isLink:!!lk,isImage:!!(im||bg),element:(e.tagName||'').toUpperCase(),editable:ed};"
+        "var r={isNull:false,isLink:!!lk,isImage:!!(im||bg),element:(e.tagName||'').toUpperCase(),editable:ed,x:%d,y:%d};"
         "if(lk){r.linkUrl=lk.href;r.linkText=(lk.textContent||'').replace(/\\s+/g,' ').trim().slice(0,200);r.linkTitle=lk.getAttribute('title')||'';}"
         "if(im){r.imageUrl=im.currentSrc||im.src;r.altText=im.getAttribute('alt')||'';}else if(bg){r.imageUrl=bg;r.altText='';}"
         "var bt=(im||e),b=bt.getBoundingClientRect();r.bounds={left:Math.round(b.left),top:Math.round(b.top),right:Math.round(b.right),bottom:Math.round(b.bottom)};"
         "return JSON.stringify(r);})(%d,%d)",
-        vx, vy);
+        cx, cy, vx, vy);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onHitTestResult, this);
 }
 void BrowserPageWPE::onHitTestResult(GObject* obj, GAsyncResult* res, gpointer ud)
@@ -1544,9 +1545,10 @@ void BrowserPageWPE::onHitTestResult(GObject* obj, GAsyncResult* res, gpointer u
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
-    std::string json = "{\"isNull\":true}";
+    std::string json = "{\"isNull\":true,\"x\":0,\"y\":0}";
     if (v) { char* s = jsc_value_to_string(v); if (s) { json = s; g_free(s); } g_object_unref(v); }
-    else if (err) g_error_free(err);
+    else if (err) { WLOG("hitTest JS error: %s", err->message ? err->message : "?"); g_error_free(err); }
+    WLOG("hitTest q=%d result: %s", self->m_hitTestQuery, json.c_str());
     if (self->m_server) self->m_server->msgHitTestResponse(self->m_proxy, self->m_hitTestQuery, json.c_str());
 }
 
@@ -1597,21 +1599,31 @@ void BrowserPageWPE::onSaveImgSrcResult(GObject* obj, GAsyncResult* res, gpointe
     }
     mkdir(self->m_saveImgDir.c_str(), 0755);
     std::string dest = self->m_saveImgDir + "/" + leaf;
+    /* A duplicate request (menu tap double-fires) would start a 2nd download onto the SAME file;
+     * the two collide and one fails — and the failure can respond first. Drop the duplicate. */
+    if (self->m_saveImgInFlight == dest) {
+        WLOG("saveImg q=%d DROP duplicate (already downloading %s)", self->m_saveImgQuery, dest.c_str());
+        return;
+    }
+    self->m_saveImgInFlight = dest;
+    WLOG("saveImg q=%d src=%s dest=%s", self->m_saveImgQuery, src.c_str(), dest.c_str());
     WebKitDownload* dl = webkit_web_view_download_uri(self->m_webView, src.c_str());
-    if (!dl) { if (self->m_server) self->m_server->msgSaveImageAtPointResponse(self->m_proxy, self->m_saveImgQuery, false, ""); return; }
+    if (!dl) { WLOG("saveImg: download_uri returned null"); if (self->m_server) self->m_server->msgSaveImageAtPointResponse(self->m_proxy, self->m_saveImgQuery, false, ""); return; }
     IsisImgDl* s = new IsisImgDl();
     s->page = self; s->query = self->m_saveImgQuery; s->dest = dest;
-    webkit_download_set_destination(dl, dest.c_str());
+    /* WPE 2.40+: decide-destination sets a PATH (not a URI) and returns TRUE. Don't pre-set. */
     g_signal_connect(dl, "decide-destination", G_CALLBACK(isis_img_decide_dest), s);
     s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(isis_img_dl_finished), s);
     s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(isis_img_dl_failed),   s);
 }
 void BrowserPageWPE::respondSaveImage(int32_t query, bool ok, const char* path)
 {
+    m_saveImgInFlight.clear();   // this download finished (ok or fail) — allow a future save of the same file
     if (m_server && m_proxy) m_server->msgSaveImageAtPointResponse(m_proxy, query, ok, ok ? path : "");
 }
 static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok)
 {
+    WLOG("saveImg done q=%d ok=%d dest=%s", s->query, ok, s->dest.c_str());
     if (s->page) s->page->respondSaveImage(s->query, ok, s->dest.c_str());
     g_signal_handler_disconnect(dl, s->hFin);
     g_signal_handler_disconnect(dl, s->hFail);

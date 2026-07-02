@@ -234,6 +234,7 @@ private:
     static void onCopyText(GObject*, GAsyncResult*, gpointer);       // copy: selection text → msgActionData("copiedText")
     int m_dragX = 0, m_dragY = 0;            // web-content drag: tracked document-space pointer position
     std::string m_saveImgDir;                // Feature 9: dir to save the image into (/media/internal or /tmp)
+    std::string m_saveImgInFlight;           // dest of an in-progress save — drop a duplicate so two downloads don't collide on one file
 
     // ---- Isis members (mirror BrowserPage) ----
     BrowserServer*      m_server;
