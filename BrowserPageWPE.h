@@ -125,7 +125,14 @@ public:
     void getTextCaretBounds(int& left, int& top, int& right, int& bottom) {}
     void hideSpellingWidget() {}
     QWebHitTestResult hitTest (uint32_t x, uint32_t y) { return {}; }
-    void insertStringAtCursor(const char* text) { if (m_webView && text) webkit_web_view_execute_editing_command_with_argument(m_webView, "InsertText", text); }
+    /* A payload starting with \x02 is an AUTOFILL request ("\x02" user "\x02" pass), routed through this
+     * existing command to avoid new IPC. Otherwise it's a plain InsertText into the focused field. */
+    void insertStringAtCursor(const char* text) {
+        if (!m_webView || !text) return;
+        if (text[0] == '\x02') { fillLoginForm(text); return; }
+        webkit_web_view_execute_editing_command_with_argument(m_webView, "InsertText", text);
+    }
+    void fillLoginForm(const char* payload);   // parse "\x02user\x02pass" and inject into the page's login form via JS
     bool isEditing() { return {}; }
     bool isInteractiveAtPoint( uint32_t x, uint32_t y ) { return {}; }
     void paste() { if (m_webView) webkit_web_view_execute_editing_command(m_webView, "Paste"); }
@@ -217,6 +224,8 @@ private:
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
+    double              m_uiZoom = 1.0;                 // adapter's pinch/content zoom (mZoomLevel). Used to convert the (zoomed) scroll the adapter sends into document space.
+    double              m_webkitZoom = 1.0;             // the webkit_web_view zoom level we render the buffer at (= m_uiZoom/fit, clamped >=1). onFrame reports contentZoom = fit*m_webkitZoom so the adapter blit divides back to a SHARP 1:1 after the crisp re-render.
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
     long                m_lastScrollMs;         // predictive pan: timestamp + Y of the previous scroll event
     int                 m_lastScrollY, m_scrollVel;  // m_scrollVel = px/sec, signed (down +). Re-center earlier + biased in this direction.

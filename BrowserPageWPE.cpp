@@ -394,6 +394,18 @@ void BrowserPageWPE::ensureWebView()
     g_object_unref(ctx);       // the WebView holds its own refs now
     g_object_unref(session);
 
+    /* Wire the native input-method focus signal → INSTANT webOS keyboard on field focus. The IsisIMContext
+     * (notify_focus_in/out → onEditorFocus → msgEditorFocused) was defined above but never attached, so
+     * editor focus relied entirely on the slow checkEditorFocus JS poll — which crawls behind a heavy page's
+     * own JS on this CPU, delaying the keyboard by many seconds (tweakers login). Attaching the context makes
+     * focus detection native + immediate. */
+    {
+        IsisIMContext* imctx = reinterpret_cast<IsisIMContext*>(g_object_new(isis_im_context_get_type(), NULL));
+        imctx->page = this;
+        webkit_web_view_set_input_method_context(m_webView, WEBKIT_INPUT_METHOD_CONTEXT(imctx));
+        g_object_unref(imctx);   /* the WebView holds its own ref */
+    }
+
     /* This page has a live WebView -> it's the scroll-test target (NOT a startPage/tab that only
      * attached buffers with screenH=0). Install the trigger once (poll works despite masked SIGUSR1). */
     g_testablePage = this;
@@ -884,8 +896,8 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
     BrowserOffscreenInfo* hdr = off->header();
     if (hdr) {
         hdr->bufferWidth = (int)w; hdr->bufferHeight = (int)h;
-        hdr->contentZoom = (self->m_virtualWindowWidth > 0)
-                           ? (double)w / (double)self->m_virtualWindowWidth : 1.0;
+        hdr->contentZoom = ((self->m_virtualWindowWidth > 0)
+                           ? (double)w / (double)self->m_virtualWindowWidth : 1.0) * self->m_webkitZoom;
         hdr->renderedX = 0; hdr->renderedY = self->m_renderedY;   /* pan model: buffer's content-top */
         hdr->renderedWidth = (int)w; hdr->renderedHeight = (int)h;
     }
@@ -1002,7 +1014,10 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     /* The adapter sends scroll in SCREEN (scaled) space; convert to DOCUMENT space by dividing by
      * contentZoom — matching the legacy BrowserPage::setScrollPosition (`cx = cx / m_zoomLevel`). Taps
      * arrive in document space, so m_scrollX must be document space too. No-op at 1:1 (contentZoom==1). */
-    double cz = contentZoom();
+    /* The adapter sends scroll in its CONTENT/zoomed space (screen px * mZoomLevel per document px). Convert
+     * to document space by dividing by the fit baseline AND the pinch zoom (m_uiZoom). At no zoom this is the
+     * fit baseline as before. */
+    double cz = contentZoom() * m_uiZoom;
     if (cz > 0.0 && cz != 1.0) { cx = (int)(cx / cz); cy = (int)(cy / cz); }
     m_scrollX = cx; m_scrollY = cy;
     /* Predictive pan: scroll velocity (px/sec, signed) so recenterForScroll can re-render EARLIER and
@@ -1304,20 +1319,28 @@ void BrowserPageWPE::reportScrollTest()
     if (rf) { fprintf(rf, "DONE steps=%d renders=%d uncovered=%d(%d%%) maxStall=%ldms finalRenderedY=%d finalDeliveredY=%d maxCy=%d\n",
                       g_st.steps, g_st.renders, g_st.uncovered, uncoveredPct, g_st.maxStallMs, m_renderedY, m_deliveredY, g_st.maxCy); fclose(rf); }
 }
-void BrowserPageWPE::setZoomAndScroll(double zoom, int, int)
+void BrowserPageWPE::setZoomAndScroll(double zoom, int sx, int sy)
 {
     if (!m_webView) return;
-    /* The adapter's zoom is the CONTENT zoom (on-screen px per document px). Our fixed fit-to-screen
-     * downscale already provides the baseline contentZoom (screenW/W) via the backend + header, so at
-     * the fit baseline WebKit must stay at layout scale 1.0 — NOT be zoomed to 0.8, which would shrink
-     * the page a second time. Map the adapter zoom relative to the fit baseline; clamp so we never zoom
-     * WebKit below layout scale (the downscale handles the shrink). At 1:1 this is a pass-through, so
-     * the previous behaviour is preserved. (Pinch-zoom crispness beyond fit is out of scope here.) */
+    /* Pinch zoom is done by the ADAPTER scaling the fit-baseline buffer (fast, live, anchored to the pinch
+     * centre). The engine must NOT also apply a webkit zoom — that would double the zoom AND force a slow
+     * full re-render. We just record the UI zoom (so the zoomed scroll the adapter sends converts to the
+     * right document position) and apply the anchored scroll so the region we keep rendered matches the
+     * zoomed viewport. At zoom==1 this is a plain scroll, so normal browsing is unchanged. */
+    m_uiZoom = (zoom > 0.0) ? zoom : 1.0;
+    /* Crisp re-render: zoom WebKit so the buffer is genuinely RENDERED at the target scale (not just the
+     * adapter's nearest-neighbor upscale of the fit buffer, which is pixelated). fit = our fixed downscale
+     * baseline; wk maps the content zoom onto WebKit's layout scale. onFrame then reports contentZoom =
+     * fit*wk (the buffer's TRUE scale), so the adapter's scaled blit divides back to 1:1 = SHARP. During the
+     * pinch the engine isn't re-rendered (only on release/settle), so the adapter scales the old buffer live;
+     * on release this snaps it crisp. Clamp wk>=1 so we never render below the fit baseline. */
     double fit = contentZoom();
-    double wk = (fit > 0.0) ? zoom / fit : zoom;
+    double wk = (fit > 0.0) ? (m_uiZoom / fit) : m_uiZoom;
     if (wk < 1.0) wk = 1.0;
-    WLOG("setZoomAndScroll adapterZoom=%.3f fit=%.3f -> webkitZoom=%.3f", zoom, fit, wk);
+    m_webkitZoom = wk;
+    WLOG("setZoomAndScroll uiZoom=%.3f fit=%.3f -> webkitZoom=%.3f scroll=%d,%d", m_uiZoom, fit, wk, sx, sy);
     webkit_web_view_set_zoom_level(m_webView, wk);
+    setScrollPosition(sx, sy, 0, 0);
 }
 
 /* WebKit told us an editable element gained/lost focus (via the IM context). Map the field purpose
@@ -1363,6 +1386,54 @@ void BrowserPageWPE::onEditorCheckResult(GObject* obj, GAsyncResult* res, gpoint
     self->onEditorFocus(code >= 0, code >= 0 ? code : 0);
 }
 
+/* Autofill: fill the page's login form in ONE JS pass so the user never has to tap each field (the slow
+ * part on heavy pages). payload = "\x02" username "\x02" password (routed via insertStringAtCursor). We set
+ * the password field + its form's first text/email field, dispatching input+change so the site's JS reacts.
+ * No-op if the page has no password field (so triggering on any site is safe). */
+static std::string isis_js_escape(const char* s) {
+    std::string o;
+    for (; s && *s; ++s) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+            case '"':  o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            case '<':  o += "\\x3c"; break;   /* avoid </script> style breakouts, just in case */
+            default:
+                if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\x%02x", c); o += b; }
+                else o += (char)c;
+        }
+    }
+    return o;
+}
+void BrowserPageWPE::fillLoginForm(const char* payload)
+{
+    if (!m_webView || !payload || payload[0] != '\x02') return;
+    const char* u = payload + 1;
+    const char* sep = strchr(u, '\x02');
+    if (!sep) return;
+    std::string user(u, sep - u);
+    std::string pass(sep + 1);
+    std::string js =
+        "(function(u,p){"
+        "var pw=document.querySelector('input[type=password]');"
+        "if(!pw)return;"
+        "var set=function(el,v){try{el.focus();}catch(e){}el.value=v;"
+        "el.dispatchEvent(new Event('input',{bubbles:true}));"
+        "el.dispatchEvent(new Event('change',{bubbles:true}));};"
+        "var scope=pw.form||document;var list=scope.querySelectorAll('input');var us=null;"
+        "for(var i=0;i<list.length;i++){if(list[i]===pw)break;"
+        "var t=(list[i].type||'text').toLowerCase();"
+        "if(t==='text'||t==='email'||t===''){us=list[i];}}"
+        "if(us)set(us,u);"
+        "set(pw,p);"
+        "})(\"" + isis_js_escape(user.c_str()) + "\",\"" + isis_js_escape(pass.c_str()) + "\")";
+    WLOG("fillLoginForm: user=%zu pass=%zu chars", user.size(), pass.size());
+    webkit_web_view_evaluate_javascript(m_webView, js.c_str(), -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
 /* Double-tap zoom: find the block-level element under the tap and report its rect so the adapter can
  * zoom to fit it (msgSmartZoomCalculateResponseSimple — the legacy double-tap path). Async via
  * evaluate_javascript; coords map content↔viewport through the tracked scroll (m_scrollX/Y). */
@@ -1370,7 +1441,10 @@ void BrowserPageWPE::smartZoomCalculate(uint32_t pointX, uint32_t pointY)
 {
     if (!m_webView) return;
     m_smartZoomX = (int)pointX; m_smartZoomY = (int)pointY;
-    int vx = (int)pointX - m_scrollX, vy = (int)pointY - m_scrollY;   /* content → viewport for elementFromPoint */
+    /* content → viewport for elementFromPoint: subtract WebKit's ACTUAL scroll (m_renderedY in the pan
+     * model), NOT the adapter pan (m_scrollY) — same fix as dispatchPointer. Using m_scrollY hit-tested the
+     * wrong spot whenever the page was panned within the buffer, so double-tap zoom fired only intermittently. */
+    int vx = (int)pointX - m_scrollX, vy = (int)pointY - m_renderedY;
     char js[512];
     snprintf(js, sizeof(js),
         "(function(){var e=document.elementFromPoint(%d,%d);if(!e)return '0,0,0,0';"
@@ -1549,7 +1623,7 @@ void BrowserPageWPE::clearToWhite()
     BrowserOffscreenInfo* hdr = off->header();
     if (hdr) {
         hdr->bufferWidth = m_renderWidth; hdr->bufferHeight = m_renderHeight;
-        hdr->contentZoom = (m_virtualWindowWidth > 0) ? (double)m_renderWidth / (double)m_virtualWindowWidth : 1.0;
+        hdr->contentZoom = ((m_virtualWindowWidth > 0) ? (double)m_renderWidth / (double)m_virtualWindowWidth : 1.0) * m_webkitZoom;
         hdr->renderedX = 0; hdr->renderedY = 0;
         hdr->renderedWidth = m_renderWidth; hdr->renderedHeight = m_renderHeight;
     }
