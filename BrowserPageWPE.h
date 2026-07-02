@@ -44,6 +44,7 @@ public:
                         int sharedBufferKey1, int sharedBufferKey2, int sharedBufferSize);
     void bufferReturned(int32_t sharedBufferKey);
     void flushBuffer(int buffer);
+    void clearToWhite();   // push a white frame + reset pan state on navigation (no stale last-page during load / on blank)
     bool freeze();
     bool thaw(int sharedBufferKey1, int sharedBufferKey2, int sharedBufferSize);
 

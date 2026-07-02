@@ -1067,6 +1067,30 @@ void BrowserPageWPE::setUserAgent(const char* ua)
 /* ---- WPE WebKit signals → Isis adapter notifications --------------------------------------- *
  * These map onto the existing BrowserServerBase msg* notifications the 602 doLoad / titleChanged
  * slots used. Exact method names per BrowserServerBase.h. */
+/* Fill the held offscreen with opaque white + reset pan state, and flush it so the adapter shows a blank
+ * page immediately. Called on navigation commit: otherwise the buffer keeps the OLD page's pixels until
+ * the new page paints (and on a blank page like about:blank WebKit may never composite a fresh frame, so
+ * the last page lingers indefinitely). White = 0xFFFFFFFF (ARGB32-premul opaque white). */
+void BrowserPageWPE::clearToWhite()
+{
+    int buf = m_ownOffscreen0 ? 0 : (m_ownOffscreen1 ? 1 : -1);
+    if (buf < 0) return;                                   /* both held by adapter — can't flush now */
+    BrowserOffscreenQt* off = (buf == 0) ? m_offscreen0 : m_offscreen1;
+    if (!off || m_renderWidth <= 0 || m_renderHeight <= 0) return;
+    m_renderedY = 0; m_deliveredY = 0; m_pageHeight = 0;   /* new page starts at top; pan off until new height known */
+    unsigned char* dst = off->rasterBuffer();
+    if (dst) memset(dst, 0xFF, (size_t)m_renderWidth * m_renderHeight * 4);
+    BrowserOffscreenInfo* hdr = off->header();
+    if (hdr) {
+        hdr->bufferWidth = m_renderWidth; hdr->bufferHeight = m_renderHeight;
+        hdr->contentZoom = (m_virtualWindowWidth > 0) ? (double)m_renderWidth / (double)m_virtualWindowWidth : 1.0;
+        hdr->renderedX = 0; hdr->renderedY = 0;
+        hdr->renderedWidth = m_renderWidth; hdr->renderedHeight = m_renderHeight;
+    }
+    m_renderPending = false;
+    flushBuffer(buf);
+    WLOG("clearToWhite: blanked buffer on navigation (%dx%d)", m_renderWidth, m_renderHeight);
+}
 void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointer ud)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
@@ -1076,6 +1100,8 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
             self->m_server->msgLoadStarted(self->m_proxy);
             break;
         case WEBKIT_LOAD_COMMITTED:
+            /* blank the old page NOW — the new document has committed; don't show the last page while it paints */
+            self->clearToWhite();
             /* tell the adapter the content size so it sets up the display area + shows painted buffers */
             self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, self->m_virtualWindowHeight);
             break;
