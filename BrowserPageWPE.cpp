@@ -1557,7 +1557,10 @@ void BrowserPageWPE::onHitTestResult(GObject* obj, GAsyncResult* res, gpointer u
 struct IsisImgDl { BrowserPageWPE* page; int query; std::string dest; gulong hFin, hFail; };
 static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok);
 static void isis_img_dl_finished(WebKitDownload* dl, gpointer ud) { isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), true); }
-static void isis_img_dl_failed(WebKitDownload* dl, GError*, gpointer ud) { isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), false); }
+static void isis_img_dl_failed(WebKitDownload* dl, GError* e, gpointer ud) {
+    WLOG("saveImg FAILED: %s", (e && e->message) ? e->message : "?");
+    isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), false);
+}
 static gboolean isis_img_decide_dest(WebKitDownload* dl, gchar*, gpointer ud) {
     webkit_download_set_destination(dl, static_cast<IsisImgDl*>(ud)->dest.c_str()); return TRUE;
 }
@@ -1606,6 +1609,7 @@ void BrowserPageWPE::onSaveImgSrcResult(GObject* obj, GAsyncResult* res, gpointe
         return;
     }
     self->m_saveImgInFlight = dest;
+    unlink(dest.c_str());   /* WebKitDownload can "failed" if the destination already exists — clear it first */
     WLOG("saveImg q=%d src=%s dest=%s", self->m_saveImgQuery, src.c_str(), dest.c_str());
     WebKitDownload* dl = webkit_web_view_download_uri(self->m_webView, src.c_str());
     if (!dl) { WLOG("saveImg: download_uri returned null"); if (self->m_server) self->m_server->msgSaveImageAtPointResponse(self->m_proxy, self->m_saveImgQuery, false, ""); return; }
