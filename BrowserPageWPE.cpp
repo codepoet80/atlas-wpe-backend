@@ -116,7 +116,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_pageHeight(0)
-    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0)
+    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -126,6 +126,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
 BrowserPageWPE::~BrowserPageWPE()
 {
     g_livePages.erase(this);   // stop onFrame touching this page the moment we start tearing down
+    if (m_settleTimer) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   // settle-render timer must not fire on a freed page
     if (m_webView) {
         /* Force-kill the WebProcess. Do NOT rely on WebView finalization to terminate it — the WebView
          * frequently lingers (stray refs; same reason the stale-frame UAF existed), so on card close the
@@ -665,7 +666,7 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
  * ALSO called from onFrame: the scroll that SETTLED while a render was in flight was gated by
  * m_renderPending, so when that frame lands we must re-check the latest scroll and follow it —
  * otherwise the buffer freezes wherever the last render left it and everything else shows white. */
-bool BrowserPageWPE::recenterForScroll(int cx, int cy)
+bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
 {
     if (!m_webView || m_screenHeight <= 0) return false;
     if (m_pageHeight <= 0 || m_pageHeight <= m_renderHeight) return false;   /* full-page-once owns this */
@@ -679,13 +680,35 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy)
     if (absVel > 1000) guard = (slack < screenH) ? slack / 2 : screenH;   /* fast: re-render earlier */
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
     if (inBuffer) return false;                             /* adapter pans — no re-render, no readback */
+    /* SETTLE-RENDER (gated /tmp/isis_settle): during a FAST flick, chasing the scroll just thrashes the
+     * WebProcess (each re-render then stalls ~1-2.5s) and still can't keep up. Instead DEFER — let the
+     * adapter pan the buffer it has (blank past the edge) — and (re)arm a one-shot timer that fires ONE
+     * sharp re-render ~160ms after scrolling stops, on an un-thrashed WebProcess. force=true (the timer)
+     * bypasses this to actually render the settled position. */
+    static int s_settle = -1;
+    if (s_settle < 0) s_settle = (access("/tmp/isis_nosettle", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/isis_nosettle */
+    if (s_settle && !force && absVel > 2500) {
+        /* Max-defer safeguard: only defer if we re-rendered recently. During CONTINUOUS fast motion (e.g.
+         * finger oscillating up/down) every event would otherwise re-arm the 160ms timer so it NEVER fires
+         * -> the buffer freezes and the content jumps to a stale position. If it's been >450ms since the
+         * last issued re-render, DON'T defer — force a re-render now (force=true -> centered, no lead swing)
+         * to keep tracking. A genuine single flick (motion then stop) still defers + settles via the timer. */
+        long sinceRender = _wlog_ms() - m_lastRenderMs; if (sinceRender < 0) sinceRender += 10000000;
+        if (sinceRender < 450) {
+            if (m_settleTimer) g_source_remove(m_settleTimer);
+            m_settleTimer = g_timeout_add(160, (GSourceFunc)&BrowserPageWPE::onSettleTimer, this);
+            return false;                                  /* defer: settle timer renders when the flick stops */
+        }
+        force = true;   /* deferred too long during continuous motion -> render now, CENTERED, keep tracking */
+    }
+    if (m_settleTimer) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   /* re-rendering now -> drop the pending settle */
     if (m_renderPending) {
         long age = _wlog_ms() - m_renderPendingMs; if (age < 0) age += 10000000;
         if (age < 1800) return false;                      /* a re-render is plausibly still in flight */
         WLOG("renderPending STALE %ldms -> force re-render", age);   /* frame lost -> never deadlock */
     }
     int lead = 0;
-    if (absVel > 700) { int L = slack / 2 - screenH / 3; if (L < 0) L = 0; lead = (m_scrollVel > 0) ? L : -L; }
+    if (!force && absVel > 700) { int L = slack / 2 - screenH / 3; if (L < 0) L = 0; lead = (m_scrollVel > 0) ? L : -L; }  /* settle centers on cy (no lead) */
     int newTop = cy - slack / 2 + lead; if (newTop < 0) newTop = 0;   /* bias the buffer toward the scroll direction */
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
@@ -700,13 +723,25 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy)
         wpe_isis_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
     }
     m_renderedY = newTop;
-    m_renderPending = true; m_renderPendingMs = _wlog_ms();
+    m_renderPending = true; m_renderPendingMs = _wlog_ms(); m_lastRenderMs = m_renderPendingMs;
     char js[96];
     snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
     WLOG("recenter cx=%d cy=%d vel=%d lead=%d -> renderedY=%d delta=%d", cx, cy, m_scrollVel, lead, newTop, delta);
     if (g_st.active) g_st.renders++;
     return true;
+}
+/* Settle timer: fired ~160ms after the last scroll while a fast flick was deferring re-render. The flick
+ * has stopped, so force a single sharp re-render to the settled position (force=true bypasses the defer
+ * and centers the buffer on cy — no lead). One-shot (returns G_SOURCE_REMOVE=0). */
+int BrowserPageWPE::onSettleTimer(void* ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (g_livePages.find(self) == g_livePages.end()) return 0;
+    self->m_settleTimer = 0;
+    WLOG("settle: flick stopped -> render settled cy=%d", self->m_scrollY);
+    self->recenterForScroll(self->m_scrollX, self->m_scrollY, /*force=*/true);
+    return 0;   /* G_SOURCE_REMOVE — one-shot */
 }
 
 /* async JS: report the real page height so the adapter knows the scroll range */

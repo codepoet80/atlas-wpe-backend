@@ -65,7 +65,8 @@ public:
     void getWindowSize(int& width, int& height);
     void getVirtualWindowSize(int& width, int& height);
     void setScrollPosition(int cx, int cy, int cw, int ch);
-    bool recenterForScroll(int cx, int cy);   // P2: windowed pan re-center; also the onFrame catch-up. Returns true if a re-render was issued.
+    bool recenterForScroll(int cx, int cy, bool force = false);   // P2: windowed pan re-center; also the onFrame catch-up. force=true bypasses the fast-flick defer (settle). Returns true if a re-render was issued.
+    static int onSettleTimer(void* self);     // settle-render: fires ~160ms after the last scroll -> render the settled position
     void setZoomAndScroll(double zoom, int cx, int cy);
 
     // ---- autonomous scroll test (kicked with SIGUSR1; drives setScrollPosition like the adapter) ----
@@ -217,6 +218,8 @@ private:
     bool                m_prewarmBlank; // BPWPE_PRESPAWN: WebView pre-warmed with about:blank (non-private)
     bool                m_renderPending; // pan re-render in flight; don't queue another (m_renderedY would race ahead of the delivered buffer)
     long                m_renderPendingMs; // _wlog_ms() when m_renderPending was set — staleness timeout so a lost frame can't deadlock the pan
+    unsigned int        m_settleTimer;   // settle-render: g_timeout id armed while a fast flick defers re-render; fires the settled re-render
+    long                m_lastRenderMs;  // settle-render: _wlog_ms() of the last ISSUED re-render — max-defer safeguard so continuous motion never freezes
     uint32_t            m_priority;
 
     // ---- WPE members (replace m_graphicsView/m_scene/m_webView/m_webPage) ----
