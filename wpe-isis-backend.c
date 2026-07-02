@@ -672,6 +672,9 @@ static bool lock_readback(struct isis_target* t, uint8_t* slot, uint32_t rw, uin
     }
 
     struct timeval a, b; gettimeofday(&a, NULL);
+    glFinish();   /* WebKit's render into t->tex must COMPLETE + be visible to the shared lock_ctx,
+                   * else the blit samples an incomplete/empty texture -> black frames. glReadPixels
+                   * did this implicitly; our blit path must do it explicitly. */
     if (!eglMakeCurrent(dpy, t->lock_surf, t->lock_surf, t->lock_ctx)) {
         ISIS_LOG("locksurf: makeCurrent fail 0x%x", eglGetError());
         eglMakeCurrent(dpy, pDraw, pRead, webctx); return false;
@@ -691,6 +694,7 @@ static bool lock_readback(struct isis_target* t, uint8_t* slot, uint32_t rw, uin
     glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glFinish();   /* blit must complete before we lock/map the surface */
 
     EGLint la[] = { EGL_MAP_PRESERVE_PIXELS_KHR, EGL_TRUE, EGL_LOCK_USAGE_HINT_KHR, EGL_READ_SURFACE_BIT_KHR, EGL_NONE };
     if (!p_lock(dpy, t->lock_surf, la)) {
