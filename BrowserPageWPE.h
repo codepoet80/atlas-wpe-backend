@@ -182,8 +182,6 @@ private:
     void dispatchPointer(int x, int y, uint32_t button, bool down);
     void updateContentsSize();               // async-query the real page height for scroll range
     static void onContentHeight(GObject*, GAsyncResult*, gpointer);
-    static void onScrollProbe(GObject*, GAsyncResult*, gpointer);   // jump diag: DOM scrollY vs renderedY
-    static void onScrollConfirm(GObject*, GAsyncResult*, gpointer); // label buffer with ACTUAL scrollY (no jump)
     void extractReaderContent();                                   // extract current DOM's article, push to app via msgActionData (on-demand from reader-open)
     static void onReaderProbe(GObject*, GAsyncResult*, gpointer);  // extraction result -> msgActionData("readerContent")
     void checkEditorFocus();                 // after a tap: poll document.activeElement → raise/hide the VKB
@@ -211,7 +209,6 @@ private:
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
     long                m_lastScrollMs;         // predictive pan: timestamp + Y of the previous scroll event
     int                 m_lastScrollY, m_scrollVel;  // m_scrollVel = px/sec, signed (down +). Re-center earlier + biased in this direction.
-    int                 m_pendingOldY;          // renderedY (buffer content-top) BEFORE the in-flight re-center — for the confirmed strip delta
     int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
     bool                m_focused;
     bool                m_frozen;

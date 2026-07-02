@@ -115,7 +115,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_virtualWindowWidth(0), m_virtualWindowHeight(0)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
-    , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_pendingOldY(0), m_pageHeight(0)
+    , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_pageHeight(0)
     , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0)
     , m_viewBackend(0), m_webView(0)
 {
@@ -530,12 +530,6 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
 
     self->m_deliveredY = self->m_renderedY;   /* the adapter now shows the buffer at this top (test coverage) */
 
-    /* jump diagnostic (throttled): does the DOM's actual scrollY match renderedY? */
-    { static struct timeval s_sp = {0, 0}; struct timeval now; gettimeofday(&now, NULL);
-      long dt = (now.tv_sec - s_sp.tv_sec) * 1000 + (now.tv_usec - s_sp.tv_usec) / 1000;
-      if (dt > 400 && self->m_webView) { s_sp = now;
-        webkit_web_view_evaluate_javascript(self->m_webView, "window.scrollY", -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onScrollProbe, self); } }
-
     /* P2 catch-up: the scroll may have moved outside the buffer while this frame was in flight (those
      * setScrollPosition calls got gated by m_renderPending). Now that we've delivered and cleared the
      * flag, follow the latest scroll so the buffer doesn't freeze behind the scroll (the "renderedY
@@ -696,46 +690,23 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy)
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
     if (newTop == m_renderedY) return false;               /* already centred here (clamp) — nothing to do */
-    /* Async-CONFIRM the scroll. window.scrollTo updates window.scrollY synchronously, so the eval RETURNS
-     * the ACTUAL, clamp-corrected scroll. We label the buffer with that actual position in onScrollConfirm
-     * (NOT the requested newTop) so hdr->renderedY always matches where the frame was truly rendered — the
-     * adapter's pan (panY - renderedY) only cancels then. m_renderedY is set optimistically to newTop now
-     * (best estimate if a frame lands before the confirm) and corrected to the actual in the callback. The
-     * strip hint moves to the callback too, computed from the ACTUAL delta (else full-readback fallback). */
-    m_pendingOldY = m_renderedY;
-    m_renderedY = newTop;                                  /* optimistic; corrected to actual in onScrollConfirm */
+    /* P2 strip readback: at 1:1, read back ONLY the newly-exposed strip + memmove the overlap. delta
+     * from the OLD renderedY; skip the hint if it exceeds the buffer (no overlap -> full readback). */
+    int delta = newTop - m_renderedY;
+    if (contentZoom() == 1.0 && (delta > 0 ? delta : -delta) < m_renderHeight) {
+        int y0, sh;
+        if (delta > 0) { y0 = m_renderHeight - delta; sh = delta; }   /* scrolled down: strip at bottom */
+        else           { y0 = 0;                       sh = -delta; } /* scrolled up:   strip at top    */
+        wpe_isis_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
+    }
+    m_renderedY = newTop;
     m_renderPending = true; m_renderPendingMs = _wlog_ms();
-    char js[128];
-    snprintf(js, sizeof(js), "window.scrollTo(%d,%d);Math.round(window.scrollY)", cx, newTop);
-    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr,
-                                        &BrowserPageWPE::onScrollConfirm, this);
-    WLOG("recenter cx=%d cy=%d vel=%d lead=%d -> newTop=%d (confirming, old=%d)", cx, cy, m_scrollVel, lead, newTop, m_pendingOldY);
+    char js[96];
+    snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    WLOG("recenter cx=%d cy=%d vel=%d lead=%d -> renderedY=%d delta=%d", cx, cy, m_scrollVel, lead, newTop, delta);
     if (g_st.active) g_st.renders++;
     return true;
-}
-/* Scroll confirmed: 'actual' = window.scrollY AFTER window.scrollTo (clamp-corrected true scroll). Label the
- * buffer with it so the adapter's pan cancels -> no jump. Send the strip hint with the ACTUAL delta (from the
- * pre-recenter top); if it lands after the backend's readback the ctrl-seq mismatch just yields a full readback. */
-void BrowserPageWPE::onScrollConfirm(GObject* obj, GAsyncResult* res, gpointer ud)
-{
-    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
-    if (g_livePages.find(self) == g_livePages.end()) return;
-    GError* err = nullptr;
-    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
-    if (!v) { if (err) g_error_free(err); return; }
-    int actual = (int)jsc_value_to_double(v);
-    g_object_unref(v);
-    if (actual < 0) actual = 0;
-    int delta = actual - self->m_pendingOldY;
-    if (self->contentZoom() == 1.0 && delta != 0 && (delta > 0 ? delta : -delta) < self->m_renderHeight) {
-        int y0, sh;
-        if (delta > 0) { y0 = self->m_renderHeight - delta; sh = delta; }   /* scrolled down: strip at bottom */
-        else           { y0 = 0;                            sh = -delta; }  /* scrolled up:   strip at top    */
-        wpe_isis_view_backend_scroll_hint(self->m_viewBackend, y0, sh, delta);
-    }
-    if (actual != self->m_renderedY)
-        WLOG("scrollConfirm CORRECT renderedY %d -> actual %d (old=%d delta=%d)", self->m_renderedY, actual, self->m_pendingOldY, delta);
-    self->m_renderedY = actual;
 }
 
 /* async JS: report the real page height so the adapter knows the scroll range */
@@ -755,23 +726,6 @@ void BrowserPageWPE::onContentHeight(GObject* obj, GAsyncResult* res, gpointer u
         self->m_pageHeight = h;   /* P1: full-page-fits check in setScrollPosition */
         self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, h);
     }
-}
-/* Jump diagnostic: the DOM's ACTUAL scrollY must equal m_renderedY (what we tell the adapter is the
- * buffer's content-top). If they diverge (window.scrollTo clamped/rounded, or the DOM scroll-range
- * differs from our m_pageHeight estimate), the adapter pans against the wrong base -> the content "jumps". */
-void BrowserPageWPE::onScrollProbe(GObject* obj, GAsyncResult* res, gpointer ud)
-{
-    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
-    if (g_livePages.find(self) == g_livePages.end()) return;
-    GError* err = nullptr;
-    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
-    if (!v) { if (err) g_error_free(err); return; }
-    int actual = (int)jsc_value_to_double(v);
-    g_object_unref(v);
-    int diff = actual - self->m_renderedY;
-    if (diff < -2 || diff > 2)   /* >2px mismatch = the adapter pans against the wrong base -> jump */
-        WLOG("SCROLLPROBE MISMATCH: DOM.scrollY=%d renderedY=%d scrollReq=%d diff=%d pageH=%d",
-             actual, self->m_renderedY, self->m_scrollY, diff, self->m_pageHeight);
 }
 /* On-demand: extract the article from the CURRENT DOM (works mid-load — the article text is present
  * long before the page "finishes" loading ads/trackers). Compact (<16KB yap limit). */
