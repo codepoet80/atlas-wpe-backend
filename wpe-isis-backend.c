@@ -160,6 +160,7 @@ static int view_get_renderer_host_fd(void* data)
         return -1;
     }
     struct isis_conn* c = (struct isis_conn*)calloc(1, sizeof(*c));
+    if (!c) { close(sv[0]); close(sv[1]); return -1; }
     c->v = v; c->sock_ui = sv[0]; c->sock_web = sv[1];
 
     /* tell THIS WebProcess where the shared frame buffer is (+ the fit-to-screen output size) */
@@ -228,6 +229,7 @@ struct wpe_view_backend* wpe_isis_view_backend_create(uint32_t width, uint32_t h
                                                       wpe_isis_frame_handler handler, void* userdata)
 {
     struct isis_view* v = (struct isis_view*)calloc(1, sizeof(*v));
+    if (!v) return NULL;
     v->handler = handler; v->userdata = userdata;
     v->width = width ? width : 1; v->height = height ? height : 1;
     /* Only downscale when a smaller-than-layout output was requested; otherwise 1:1 (0 = disabled). */
@@ -302,6 +304,7 @@ struct isis_egl { int host_fd; };
 static void* egl_create(int host_fd)
 {
     struct isis_egl* e = (struct isis_egl*)calloc(1, sizeof(*e));
+    if (!e) return NULL;
     e->host_fd = host_fd;   /* unused: display is EGL_DEFAULT_DISPLAY */
     return e;
 }
@@ -368,6 +371,7 @@ static bool target_read_setup(struct isis_target* t)
 static void* target_create(struct wpe_renderer_backend_egl_target* wpe, int host_fd)
 {
     struct isis_target* t = (struct isis_target*)calloc(1, sizeof(*t));
+    if (!t) return NULL;
     t->wpe = wpe; t->host_fd = host_fd; t->shmid = -1;
     t->lock_state = -1;   /* -1 = untried (calloc's 0 would mean "unavailable" and skip the probe) */
     ISIS_LOG("target_create (host_fd=%d)", host_fd);
