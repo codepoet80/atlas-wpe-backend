@@ -795,8 +795,8 @@ static void target_frame_rendered(void* d)
 
         /* C: lock_surface fast readback (full 1:1 frame). Gated by /tmp/isis_locksurf. On success it
          * bypasses glReadPixels entirely; on any failure it disables itself and falls through below. */
-        static int s_locksurf = -1;
-        if (s_locksurf < 0) s_locksurf = (access("/tmp/isis_locksurf", F_OK) == 0 || getenv("BPWPE_LOCKSURF")) ? 1 : 0;
+        static int s_locksurf = -1;   /* default ON (~3x faster full readback, verified correct); off via /tmp/isis_no_locksurf */
+        if (s_locksurf < 0) s_locksurf = (access("/tmp/isis_no_locksurf", F_OK) == 0 || getenv("BPWPE_NO_LOCKSURF")) ? 0 : 1;
         if (s_locksurf && !wantScale) {
             long us = 0;
             if (lock_readback(t, slot, rw, rh, &us)) {

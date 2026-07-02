@@ -250,17 +250,19 @@ void BrowserPageWPE::ensureWebView()
      * WebKit budget lets it grow past what the system can commit and it dies BEFORE WebKit ever
      * purges. Fix: set the budget near the real free memory so WebKit purges/GCs early enough.
      * Tunable to sweep the safe max: `echo 256 > /tmp/isis_memlimit` (or BPWPE_MEM_LIMIT). */
-    int memLimit = 256;
+    int memLimit = 480;   /* REVERTED to original — the 256/aggressive-purge (this session) is the regression
+                           * suspect: more frequent pressure handling drops an in-flight IPC SharedMemory ->
+                           * SIGBUS on the 1.86MB write. Original 480/0.40/0.60/0.95/2s scrolled the whole page. */
     { FILE* mf = fopen("/tmp/isis_memlimit", "r");
       if (mf) { int m = 0; if (fscanf(mf, "%d", &m) == 1 && m >= 64 && m <= 600) memLimit = m; fclose(mf); }
       else { const char* me = getenv("BPWPE_MEM_LIMIT"); if (me) { int m = atoi(me); if (m >= 64 && m <= 600) memLimit = m; } } }
     WebKitMemoryPressureSettings* webMem = webkit_memory_pressure_settings_new();
     webkit_memory_pressure_settings_set_memory_limit(webMem, memLimit);        /* MB budget / web process */
-    webkit_memory_pressure_settings_set_conservative_threshold(webMem, 0.30);  /* purge discardable early */
-    webkit_memory_pressure_settings_set_strict_threshold(webMem, 0.50);        /* aggressive purge + GC */
-    webkit_memory_pressure_settings_set_kill_threshold(webMem, 0.85);          /* clean self-kill+respawn beats a SIGBUS */
-    webkit_memory_pressure_settings_set_poll_interval(webMem, 1.0);            /* seconds — react fast during scroll */
-    WLOG("memory budget: %d MB (conservative 0.30 / strict 0.50 / kill 0.85)", memLimit);
+    webkit_memory_pressure_settings_set_conservative_threshold(webMem, 0.40);
+    webkit_memory_pressure_settings_set_strict_threshold(webMem, 0.60);
+    webkit_memory_pressure_settings_set_kill_threshold(webMem, 0.95);
+    webkit_memory_pressure_settings_set_poll_interval(webMem, 2.0);
+    WLOG("memory budget: %d MB (original 0.40/0.60/0.95/2s)", memLimit);
     WebKitWebContext* ctx = WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", webMem, NULL));
     webkit_memory_pressure_settings_free(webMem);
@@ -319,19 +321,25 @@ void BrowserPageWPE::ensureWebView()
      * The adapter already allocates this budget (screenW*screenH*4 * 4.0 = 12.58MB). Cap at the measured
      * GL_MAX_TEXTURE_SIZE (4096 on the Adreno 220). Was m_virtualWindowHeight (~1400 ≈ 1.8 screens). */
     if (screenH > 0) {
-        /* Buffer height = N screens. Taller = fewer re-renders but more WebKit compositor memory
-         * (the tall viewport composites N screens of layers) -> the WPEWebProcess OOM-kills during
-         * scroll ("white after 1/3"). Tunable to find the safe max: `echo 3 > /tmp/isis_bufscreens`
-         * (or BPWPE_BUF_SCREENS), default 4. Read per-load so the harness can sweep it. */
-        int mult = 2;   /* default 2 screens: 4 OOM-crashes the WebProcess on heavy pages (~180MB free) */
+        /* TALL PAN BUFFER (legacy ~4-screen budget) — smooth scroll: the adapter pans a tall pre-rendered
+         * window with NO readback, re-rendering only near the edges. The "white after ~1/3" that made this
+         * look memory-bound was actually the 2MB /dev/shm overflowing on WebKit's IPC SharedMemory (fixed in
+         * the BS wrapper: `mount -o remount,size=131072k /dev`), NOT the tile memory — so the tall buffer is
+         * viable again. Paired with lock_surface (~3x readback) for fast edge re-renders. mult=1 = the
+         * low-memory screen-sized fallback. Tunable: echo N > /tmp/isis_bufscreens (or BPWPE_BUF_SCREENS). */
+        int mult = 4;
         FILE* bf = fopen("/tmp/isis_bufscreens", "r");
         if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
         else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
-        renderH = screenH * mult;
-        if (renderH > 4096) renderH = 4096;
-        if (renderH < m_virtualWindowHeight) renderH = m_virtualWindowHeight;
+        if (mult <= 1) {
+            renderH = screenH;                       /* screen-sized: WebKit manages/discards tiles */
+        } else {
+            renderH = screenH * mult;                /* tall pan-buffer (memory-heavy) */
+            if (renderH > 4096) renderH = 4096;
+            if (renderH < m_virtualWindowHeight) renderH = m_virtualWindowHeight;
+        }
         m_virtualWindowHeight = renderH;
-        WLOG("buffer height: %d screens -> renderH=%d", mult, renderH);
+        WLOG("buffer height: %d screen(s) -> renderH=%d%s", mult, renderH, mult <= 1 ? " (screen-sized/WAM)" : "");
     }
     /* Fit-to-screen ("overview" on load) — the PROPER webOS path matching the legacy
      * BrowserOffscreenInfo contract: lay the page out at a WIDER layout width W so desktop sites use
