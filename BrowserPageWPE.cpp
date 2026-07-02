@@ -115,7 +115,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_virtualWindowWidth(0), m_virtualWindowHeight(0)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
-    , m_scrollX(0), m_scrollY(0), m_pageHeight(0)
+    , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_pageHeight(0)
     , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0)
     , m_viewBackend(0), m_webView(0)
 {
@@ -621,6 +621,11 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     double cz = contentZoom();
     if (cz > 0.0 && cz != 1.0) { cx = (int)(cx / cz); cy = (int)(cy / cz); }
     m_scrollX = cx; m_scrollY = cy;
+    /* Predictive pan: scroll velocity (px/sec, signed) so recenterForScroll can re-render EARLIER and
+     * biased in the scroll direction — the ~1.4s composite then lands before we reach the buffer edge. */
+    { long nowms = _wlog_ms(); long dt = nowms - m_lastScrollMs; if (dt < 0) dt += 10000000;
+      m_scrollVel = (m_lastScrollMs && dt > 0 && dt < 400) ? (int)((long)(cy - m_lastScrollY) * 1000 / dt) : 0;
+      m_lastScrollMs = nowms; m_lastScrollY = cy; }
     static int s_noPan = -1;
     if (s_noPan < 0) s_noPan = getenv("BPWPE_NO_PAN") ? 1 : 0;
     if (s_noPan) {   /* re-render-every-step path (safety net). renderedY = scroll so the adapter's pan
@@ -666,7 +671,12 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy)
     if (m_pageHeight <= 0 || m_pageHeight <= m_renderHeight) return false;   /* full-page-once owns this */
     int screenH = m_screenHeight;
     int slack   = m_renderHeight - screenH; if (slack < 0) slack = 0;
+    int absVel  = m_scrollVel < 0 ? -m_scrollVel : m_scrollVel;
+    /* Predictive pan: the ~1.4s composite means a re-render must START well before the viewport reaches
+     * the buffer edge, or it lands late and the content "jumps"/goes white. When scrolling fast, widen the
+     * guard (trigger earlier) AND lead the buffer in the scroll direction so we pan INTO fresh content. */
     int guard   = screenH / 3;
+    if (absVel > 1000) guard = (slack < screenH) ? slack / 2 : screenH;   /* fast: re-render earlier */
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
     if (inBuffer) return false;                             /* adapter pans — no re-render, no readback */
     if (m_renderPending) {
@@ -674,7 +684,9 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy)
         if (age < 1800) return false;                      /* a re-render is plausibly still in flight */
         WLOG("renderPending STALE %ldms -> force re-render", age);   /* frame lost -> never deadlock */
     }
-    int newTop = cy - slack / 2; if (newTop < 0) newTop = 0;
+    int lead = 0;
+    if (absVel > 700) { int L = slack / 2 - screenH / 3; if (L < 0) L = 0; lead = (m_scrollVel > 0) ? L : -L; }
+    int newTop = cy - slack / 2 + lead; if (newTop < 0) newTop = 0;   /* bias the buffer toward the scroll direction */
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
     if (newTop == m_renderedY) return false;               /* already centred here (clamp) — nothing to do */
@@ -692,7 +704,7 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy)
     char js[96];
     snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
-    WLOG("recenter cx=%d cy=%d -> renderedY=%d delta=%d", cx, cy, newTop, delta);
+    WLOG("recenter cx=%d cy=%d vel=%d lead=%d -> renderedY=%d delta=%d", cx, cy, m_scrollVel, lead, newTop, delta);
     if (g_st.active) g_st.renders++;
     return true;
 }

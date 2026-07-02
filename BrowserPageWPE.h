@@ -207,6 +207,8 @@ private:
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
+    long                m_lastScrollMs;         // predictive pan: timestamp + Y of the previous scroll event
+    int                 m_lastScrollY, m_scrollVel;  // m_scrollVel = px/sec, signed (down +). Re-center earlier + biased in this direction.
     int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
     bool                m_focused;
     bool                m_frozen;
