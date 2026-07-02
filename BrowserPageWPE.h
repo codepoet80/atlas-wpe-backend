@@ -67,6 +67,7 @@ public:
     void setScrollPosition(int cx, int cy, int cw, int ch);
     bool recenterForScroll(int cx, int cy, bool force = false);   // P2: windowed pan re-center; also the onFrame catch-up. force=true bypasses the fast-flick defer (settle). Returns true if a re-render was issued.
     static int onSettleTimer(void* self);     // settle-render: fires ~160ms after the last scroll -> render the settled position
+    static void onScrollConfirm(GObject*, GAsyncResult*, gpointer);  // label buffer with ACTUAL scrollY (fixes async-scrollTo mislabel jump)
     void setZoomAndScroll(double zoom, int cx, int cy);
 
     // ---- autonomous scroll test (kicked with SIGUSR1; drives setScrollPosition like the adapter) ----
@@ -211,6 +212,8 @@ private:
     int                 m_scrollX, m_scrollY;   // last scroll pos (content→view tap mapping)
     long                m_lastScrollMs;         // predictive pan: timestamp + Y of the previous scroll event
     int                 m_lastScrollY, m_scrollVel;  // m_scrollVel = px/sec, signed (down +). Re-center earlier + biased in this direction.
+    int                 m_dirStreak;    // consecutive same-direction scroll moves (signed); predictive lead only applies when SUSTAINED (not oscillation)
+    int                 m_pendingOldY;  // renderedY before the in-flight re-center — for the confirmed strip delta (confirm mode)
     int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
     bool                m_focused;
     bool                m_frozen;

@@ -115,7 +115,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_virtualWindowWidth(0), m_virtualWindowHeight(0)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
-    , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_pageHeight(0)
+    , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_dirStreak(0), m_pendingOldY(0), m_pageHeight(0)
     , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
     , m_viewBackend(0), m_webView(0)
 {
@@ -625,7 +625,13 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
     /* Predictive pan: scroll velocity (px/sec, signed) so recenterForScroll can re-render EARLIER and
      * biased in the scroll direction — the ~1.4s composite then lands before we reach the buffer edge. */
     { long nowms = _wlog_ms(); long dt = nowms - m_lastScrollMs; if (dt < 0) dt += 10000000;
-      m_scrollVel = (m_lastScrollMs && dt > 0 && dt < 400) ? (int)((long)(cy - m_lastScrollY) * 1000 / dt) : 0;
+      int dy = cy - m_lastScrollY;
+      m_scrollVel = (m_lastScrollMs && dt > 0 && dt < 400) ? (int)((long)dy * 1000 / dt) : 0;
+      /* Direction streak: consecutive same-direction moves (signed). The predictive lead only kicks in for
+       * SUSTAINED scrolling (|streak|>=3); on a direction flip it resets to ±1, so oscillation gets no lead
+       * -> the buffer stops swinging ~1500px on every up/down flip. */
+      if (m_lastScrollMs && dy != 0) { int d = dy > 0 ? 1 : -1;
+          if ((d > 0 && m_dirStreak > 0) || (d < 0 && m_dirStreak < 0)) m_dirStreak += d; else m_dirStreak = d; }
       m_lastScrollMs = nowms; m_lastScrollY = cy; }
     static int s_noPan = -1;
     if (s_noPan < 0) s_noPan = getenv("BPWPE_NO_PAN") ? 1 : 0;
@@ -708,26 +714,40 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
         WLOG("renderPending STALE %ldms -> force re-render", age);   /* frame lost -> never deadlock */
     }
     int lead = 0;
-    if (!force && absVel > 700) { int L = slack / 2 - screenH / 3; if (L < 0) L = 0; lead = (m_scrollVel > 0) ? L : -L; }  /* settle centers on cy (no lead) */
+    bool sustained = (m_dirStreak >= 3 || m_dirStreak <= -3);   /* only lead when scrolling one way consistently */
+    if (!force && sustained && absVel > 700) { int L = slack / 2 - screenH / 3; if (L < 0) L = 0; lead = (m_scrollVel > 0) ? L : -L; }  /* settle/oscillation center on cy (no lead) */
     int newTop = cy - slack / 2 + lead; if (newTop < 0) newTop = 0;   /* bias the buffer toward the scroll direction */
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
     if (newTop == m_renderedY) return false;               /* already centred here (clamp) — nothing to do */
     /* P2 strip readback: at 1:1, read back ONLY the newly-exposed strip + memmove the overlap. delta
      * from the OLD renderedY; skip the hint if it exceeds the buffer (no overlap -> full readback). */
-    int delta = newTop - m_renderedY;
-    if (contentZoom() == 1.0 && (delta > 0 ? delta : -delta) < m_renderHeight) {
-        int y0, sh;
-        if (delta > 0) { y0 = m_renderHeight - delta; sh = delta; }   /* scrolled down: strip at bottom */
-        else           { y0 = 0;                       sh = -delta; } /* scrolled up:   strip at top    */
-        wpe_isis_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
-    }
-    m_renderedY = newTop;
+    int delta = newTop - m_renderedY;   /* strip delta (plain path); confirm path uses m_pendingOldY in the cb */
+    static int s_confirm = -1;
+    if (s_confirm < 0) s_confirm = (access("/tmp/isis_noconfirm", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/isis_noconfirm */
     m_renderPending = true; m_renderPendingMs = _wlog_ms(); m_lastRenderMs = m_renderPendingMs;
-    char js[96];
-    snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
-    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
-    WLOG("recenter cx=%d cy=%d vel=%d lead=%d -> renderedY=%d delta=%d", cx, cy, m_scrollVel, lead, newTop, delta);
+    char js[128];
+    if (s_confirm) {
+        /* CONFIRM mode: the eval RETURNS the ACTUAL clamp-corrected scroll; onScrollConfirm labels
+         * m_renderedY with it + sends the strip hint (actual delta), so the buffer label matches where the
+         * frame truly rendered — fixes the async-scrollTo mislabel jump. Same eval COUNT as the plain path
+         * (no extra probe), so it shouldn't regress catch-up. m_renderedY optimistic here; corrected in cb. */
+        m_pendingOldY = m_renderedY;
+        m_renderedY = newTop;
+        snprintf(js, sizeof(js), "window.scrollTo(%d,%d);Math.round(window.scrollY)", cx, newTop);
+        webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onScrollConfirm, this);
+    } else {
+        if (contentZoom() == 1.0 && (delta > 0 ? delta : -delta) < m_renderHeight) {
+            int y0, sh;
+            if (delta > 0) { y0 = m_renderHeight - delta; sh = delta; }   /* scrolled down: strip at bottom */
+            else           { y0 = 0;                       sh = -delta; } /* scrolled up:   strip at top    */
+            wpe_isis_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
+        }
+        m_renderedY = newTop;
+        snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
+        webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+    WLOG("recenter cx=%d cy=%d vel=%d lead=%d -> renderedY=%d delta=%d cf=%d", cx, cy, m_scrollVel, lead, newTop, delta, s_confirm);
     if (g_st.active) g_st.renders++;
     return true;
 }
@@ -742,6 +762,29 @@ int BrowserPageWPE::onSettleTimer(void* ud)
     WLOG("settle: flick stopped -> render settled cy=%d", self->m_scrollY);
     self->recenterForScroll(self->m_scrollX, self->m_scrollY, /*force=*/true);
     return 0;   /* G_SOURCE_REMOVE — one-shot */
+}
+/* CONFIRM mode callback: 'actual' = window.scrollY AFTER window.scrollTo (clamp-corrected true scroll).
+ * Label the buffer with it (not the requested newTop) so the adapter pan cancels -> no mislabel jump. The
+ * strip hint uses the ACTUAL delta (from the pre-recenter top); if it lands after the backend readback the
+ * ctrl-seq mismatch just yields a full readback (still correct). */
+void BrowserPageWPE::onScrollConfirm(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (g_livePages.find(self) == g_livePages.end()) return;
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (!v) { if (err) g_error_free(err); return; }
+    int actual = (int)jsc_value_to_double(v);
+    g_object_unref(v);
+    if (actual < 0) actual = 0;
+    int delta = actual - self->m_pendingOldY;
+    if (self->contentZoom() == 1.0 && delta != 0 && (delta > 0 ? delta : -delta) < self->m_renderHeight) {
+        int y0, sh;
+        if (delta > 0) { y0 = self->m_renderHeight - delta; sh = delta; }
+        else           { y0 = 0;                            sh = -delta; }
+        wpe_isis_view_backend_scroll_hint(self->m_viewBackend, y0, sh, delta);
+    }
+    self->m_renderedY = actual;
 }
 
 /* async JS: report the real page height so the adapter knows the scroll range */
