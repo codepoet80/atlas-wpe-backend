@@ -712,11 +712,14 @@ static bool lock_readback(struct isis_target* t, uint8_t* slot, uint32_t rw, uin
     uint8_t* ptr = (uint8_t*)(uintptr_t)ptr_i;
     bool ok = false;
     if (ptr && pitch > 0) {
-        /* pbuffer is RGBA, content-top at GL bottom (same as the FBO). LOWER_LEFT map row0 = content top
-         * (no flip); UPPER_LEFT map row0 = content bottom (flip). Swizzle RGBA->BGRA into the slot. */
+        /* The EGL-locked bitmap is delivered as BGRA on this Adreno — i.e. ALREADY the adapter's format —
+         * NOT RGBA. Verified: a solid-red page rendered blue with swizzle_flip here (double-swap) and
+         * correct via the RGBA glReadPixels path. So COPY straight through (no R<->B swap); only the
+         * vertical flip is needed. content-top at GL bottom: LOWER_LEFT map row0 = content top (no flip);
+         * UPPER_LEFT map row0 = content bottom (flip). (glReadPixels/strip/CPU paths DO read RGBA -> keep swizzle.) */
         for (uint32_t y = 0; y < rh; y++) {
             uint32_t sy = (origin == EGL_UPPER_LEFT_KHR) ? (rh - 1 - y) : y;
-            swizzle_flip(ptr + (size_t)sy * pitch, slot + (size_t)y * rw * 4, rw, 1);
+            memcpy(slot + (size_t)y * rw * 4, ptr + (size_t)sy * pitch, (size_t)rw * 4);
         }
         ok = true;
     }
