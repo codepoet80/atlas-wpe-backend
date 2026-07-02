@@ -8,7 +8,11 @@
 #include "BrowserServer.h"
 #include "BrowserOffscreenQt.h"
 #include "YapProxy.h"
+#include "BrowserSyncReplyPipe.h"   // Feature 7: sync round-trip to the app for SSL/auth dialogs
 #include "wpe-isis-backend.h"
+
+#include <sys/statvfs.h>            // Feature 6: /dev/shm size in the isis:about diagnostics page
+#include <sys/stat.h>               // Feature 3: stat() the downloaded favicon file in renderToFile
 
 #include <cstring>
 #include <cstdlib>
@@ -116,7 +120,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_dirStreak(0), m_pendingOldY(0), m_pageHeight(0)
-    , m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
+    , m_navByHistory(false), m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -267,6 +271,11 @@ void BrowserPageWPE::ensureWebView()
     WebKitWebContext* ctx = WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", webMem, NULL));
     webkit_memory_pressure_settings_free(webMem);
+    m_memLimit = memLimit;   /* Feature 6: surfaced in the isis:about diagnostics page */
+
+    /* Feature 6: the internal `isis:` URI scheme (e.g. isis:about) serves a diagnostics page from
+     * onIsisScheme() below — WebKit version, memory budget, /dev/shm size, build stamp, renderer. */
+    webkit_web_context_register_uri_scheme(ctx, "isis", &BrowserPageWPE::onIsisScheme, this, nullptr);
 
     /* Persistent cookie storage — the missing piece. Cookies were memory-only (no store on disk), so
      * consent/logins died on every BS restart and consent-gated sites (nu.nl/DPG) bounced to their
@@ -292,10 +301,17 @@ void BrowserPageWPE::ensureWebView()
                                                      WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
         webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
     }
+    /* Feature 7: raise TLS errors so bad certs surface via load-failed-with-tls-errors (our SSL
+     * confirm dialog) instead of being silently ignored. Applies to both session branches. */
+    webkit_network_session_set_tls_errors_policy(session, WEBKIT_TLS_ERRORS_POLICY_FAIL);
 
     /* (webkit_web_context_set_web_process_count_limit removed in the 2.0 API — it was a no-op anyway.)
-     * DOCUMENT_VIEWER = lowest-memory cache model (zeroes bf-cache); stops suspended-process swap thrash. */
-    webkit_web_context_set_cache_model(ctx, WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
+     * Caching re-enabled: the "Too Many Cards" OOM was actually the 2MB /dev/shm SIGBUS + WebProcess leaks
+     * on card close (both fixed), NOT the cache. WEB_BROWSER model keeps a real resource/bf cache (faster
+     * repeat loads + back/forward); WebKit's memory-pressure settings evict under load. DOCUMENT_VIEWER
+     * fallback via /tmp/isis_nocache if memory regresses. */
+    bool s_cacheOn = (access("/tmp/isis_nocache", F_OK) != 0);
+    webkit_web_context_set_cache_model(ctx, s_cacheOn ? WEBKIT_CACHE_MODEL_WEB_BROWSER : WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
 
     /* Render at the FULL device width. The adapter seeds m_virtualWindowWidth at ~960, which
      * leaves a grey bar on the 1024-wide viewport; and the backend size is fixed at create
@@ -403,7 +419,7 @@ void BrowserPageWPE::ensureWebView()
     WebKitSettings* s = webkit_web_view_get_settings(m_webView);
     webkit_settings_set_javascript_can_open_windows_automatically(s, TRUE);
     webkit_settings_set_enable_developer_extras(s, FALSE);
-    webkit_settings_set_enable_page_cache(s, FALSE);   /* save memory on this 941MB device (OOM "Too Many Cards") */
+    webkit_settings_set_enable_page_cache(s, (access("/tmp/isis_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/isis_nocache */
     /* ALWAYS use a modern WebKit/Safari UA — the adapter otherwise sends the legacy
      * "HP TouchPad webOS 3.0.5" UA, making sites think we're the old engine.
      * WebKit 620 / Safari 18 = WPE 2.52 (was 612/15.0 = WPE 2.34-era). */
@@ -422,6 +438,9 @@ void BrowserPageWPE::ensureWebView()
     g_signal_connect(m_webView, "create",             G_CALLBACK(bpwpe_on_create), this);
     g_signal_connect(m_webView, "permission-request", G_CALLBACK(bpwpe_on_permission), this);
     g_signal_connect(m_webView, "decide-policy",      G_CALLBACK(onDecidePolicy), this);  // unsupported-mime → download
+    /* Feature 7: HTTP auth + SSL cert dialogs — route through the app UI via the sync reply pipe. */
+    g_signal_connect(m_webView, "authenticate",                 G_CALLBACK(onAuthenticate), this);
+    g_signal_connect(m_webView, "load-failed-with-tls-errors",  G_CALLBACK(onTlsErrors), this);
 
     applyContentBlocker(webkit_web_view_get_user_content_manager(m_webView));
 
@@ -429,6 +448,369 @@ void BrowserPageWPE::ensureWebView()
      * polls document.activeElement via evaluate_javascript — the same proven-safe path as the page-
      * height query. The script-message-received channel was tried but its signal value crashed the BS
      * (jsc_value_* on a non-JSCValue at the UIProcess), so it is intentionally not used. */
+}
+
+/* ---- Feature 6: isis: internal scheme (isis:about diagnostics page) ------------------------- */
+void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    const char* uri = webkit_uri_scheme_request_get_uri(req);   // e.g. "isis:about" (opaque, no //)
+    /* isis:about is opaque — get_path is empty; parse the part after the first ':'. */
+    const char* colon = uri ? strchr(uri, ':') : nullptr;
+    std::string path = colon ? std::string(colon + 1) : std::string();
+    /* strip any leading slashes just in case a "isis:/about" form arrives */
+    while (!path.empty() && path[0] == '/') path.erase(0, 1);
+
+    gchar* html = nullptr;
+    if (path == "about") {
+        /* Small helpers: slurp a /proc file, pull a "Key: value" field, format bytes as MB. */
+        auto slurp = [](const char* p) -> std::string {
+            std::string out; FILE* f = fopen(p, "r"); if (!f) return out;
+            char b[512]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) out.append(b, n);
+            fclose(f); return out;
+        };
+        auto field = [](const std::string& s, const char* key) -> std::string {
+            size_t p = s.find(key); if (p == std::string::npos) return "";
+            p = s.find(':', p); if (p == std::string::npos) return "";
+            ++p; while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
+            size_t e = s.find('\n', p);
+            std::string v = s.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+            return v;
+        };
+        auto mb = [](unsigned long long bytes) -> std::string {
+            char b[48]; snprintf(b, sizeof b, "%.1f MB", (double)bytes / (1024.0 * 1024.0)); return b;
+        };
+
+        /* System memory (2.6.35 has no MemAvailable → approximate as free+cached+buffers). */
+        std::string mi = slurp("/proc/meminfo");
+        long memTotalKB = atol(field(mi, "MemTotal").c_str());
+        long memFreeKB  = atol(field(mi, "MemFree").c_str());
+        long cachedKB   = atol(field(mi, "Cached").c_str());
+        long buffersKB  = atol(field(mi, "Buffers").c_str());
+        long memAvailKB = memFreeKB + cachedKB + buffersKB;
+
+        /* CPU / load / uptime. */
+        std::string ci = slurp("/proc/cpuinfo");
+        std::string cpu = field(ci, "Processor"); if (cpu.empty()) cpu = field(ci, "model name");
+        int cores = 0; for (size_t p = 0; (p = ci.find("processor", p)) != std::string::npos; p += 9) ++cores;
+        std::string la = slurp("/proc/loadavg");   /* keep the 3 load figures, drop the rest */
+        { size_t sp = la.find(' '); if (sp != std::string::npos) sp = la.find(' ', sp + 1);
+          if (sp != std::string::npos) sp = la.find(' ', sp + 1);
+          if (sp != std::string::npos) la.resize(sp); }
+        double up = atof(slurp("/proc/uptime").c_str());
+        int upH = (int)(up / 3600), upM = (int)((up - upH * 3600) / 60);
+
+        /* /dev/shm (WebKit IPC SharedMemory budget) + persistent storage free. */
+        unsigned long long shmTot = 0, shmFree = 0, medTot = 0, medFree = 0;
+        struct statvfs st;
+        if (statvfs("/dev/shm", &st) == 0) {
+            shmTot  = (unsigned long long)st.f_blocks * st.f_bsize;
+            shmFree = (unsigned long long)st.f_bavail * st.f_bsize;
+        }
+        struct statvfs ms;
+        if (statvfs("/media/internal", &ms) == 0) {
+            medTot  = (unsigned long long)ms.f_blocks * ms.f_frsize;
+            medFree = (unsigned long long)ms.f_bavail * ms.f_frsize;
+        }
+
+        /* Cookie store size (fopen/ftell — no extra includes). */
+        long long cookieSz = -1;
+        { FILE* cf = fopen("/media/internal/wpe-252/cookies.db", "rb");
+          if (cf) { fseek(cf, 0, SEEK_END); cookieSz = ftell(cf); fclose(cf); } }
+        char cookieBuf[48];
+        if (cookieSz >= 0) snprintf(cookieBuf, sizeof cookieBuf, "%.1f KB", cookieSz / 1024.0);
+        else               snprintf(cookieBuf, sizeof cookieBuf, "(none)");
+
+        const char* ua = (self && self->m_webView)
+            ? webkit_settings_get_user_agent(webkit_web_view_get_settings(self->m_webView)) : "(n/a)";
+        const char* tls  = getenv("GIO_USE_TLS");
+        const char* cert = getenv("SSL_CERT_FILE");
+        bool cacheOn = (access("/tmp/isis_nocache", F_OK) != 0);
+
+        std::string h;
+        h += "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+             /* Light, webOS/Enyo-like: Prelude UI font, light-grey page, white cards, dark text. */
+             "<style>body{background:#e5e5e5;color:#333;font-family:Prelude,sans-serif;margin:0;padding:20px}"
+             "h1{color:#2b2b2b;font-size:22px;font-weight:bold;margin:0 0 2px}"
+             "h2{color:#777;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:22px 0 6px;"
+             "padding-bottom:4px;border-bottom:1px solid #cfcfcf}"
+             ".sub{color:#999;font-size:12px;margin:0 0 8px}"
+             "table{border-collapse:separate;border-spacing:0;width:100%;background:#fff;"
+             "border:1px solid #cfcfcf;-webkit-border-radius:6px;border-radius:6px;overflow:hidden}"
+             "td{padding:8px 12px;border-bottom:1px solid #ededed;font-size:14px;vertical-align:top}"
+             "tr:last-child td{border-bottom:none}"
+             "td.k{color:#888;width:42%}code{color:#1a6bb5;font-family:monospace;word-break:break-all}</style>"
+             "<title>Isis Diagnostics</title></head><body>";
+        h += "<h1>Isis Browser</h1><p class='sub'>WPE WebKit engine diagnostics</p>";
+
+        char row[2048];
+        #define ROW(k, fmt, ...) do { snprintf(row, sizeof row, \
+            "<tr><td class='k'>" k "</td><td><code>" fmt "</code></td></tr>", ##__VA_ARGS__); h += row; } while (0)
+
+        h += "<h2>Engine</h2><table>";
+        ROW("WebKit version", "%d.%d.%d", webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version());
+        ROW("Port", "%s", "WPE 2.52 &middot; offscreen isis backend");
+        ROW("Cache model", "%s", cacheOn ? "Web browser (resource + bf cache)" : "Document viewer (no cache)");
+        ROW("Page cache (bf)", "%s", cacheOn ? "enabled" : "disabled");
+        ROW("TLS backend", "GIO_USE_TLS=%s", tls ? tls : "(unset!)");
+        ROW("CA bundle", "%s", cert ? cert : "(unset!)");
+        ROW("User agent", "%s", ua ? ua : "(n/a)");
+        ROW("Build", "%s", __DATE__ " " __TIME__);
+        h += "</table>";
+
+        h += "<h2>Display</h2><table>";
+        ROW("Renderer", "%s", "Qualcomm Adreno 220");
+        ROW("Screen", "%d &times; %d", self ? self->m_screenWidth : 0, self ? self->m_screenHeight : 0);
+        ROW("Render buffer", "%d &times; %d", self ? self->m_virtualWindowWidth : 0, self ? self->m_virtualWindowHeight : 0);
+        h += "</table>";
+
+        h += "<h2>Memory</h2><table>";
+        ROW("WebProcess budget", "%d MB", self ? self->m_memLimit : 0);
+        ROW("System RAM total", "%ld MB", memTotalKB / 1024);
+        ROW("System RAM free", "%ld MB (avail ~%ld MB)", memFreeKB / 1024, memAvailKB / 1024);
+        ROW("Cached / buffers", "%ld MB / %ld MB", cachedKB / 1024, buffersKB / 1024);
+        ROW("/dev/shm (IPC)", "%s free of %s", mb(shmFree).c_str(), mb(shmTot).c_str());
+        h += "</table>";
+
+        h += "<h2>System</h2><table>";
+        ROW("CPU", "%s", cpu.empty() ? "(unknown)" : cpu.c_str());
+        ROW("Cores", "%d", cores);
+        ROW("Load average", "%s", la.empty() ? "(n/a)" : la.c_str());
+        ROW("Uptime", "%dh %dm", upH, upM);
+        ROW("Storage (/media/internal)", "%s free of %s", mb(medFree).c_str(), mb(medTot).c_str());
+        h += "</table>";
+
+        h += "<h2>Session</h2><table>";
+        ROW("Private browsing", "%s", (self && self->m_private) ? "yes (ephemeral)" : "no (persistent)");
+        ROW("Cookie store", "%s", cookieBuf);
+        ROW("Identifier", "%s", (self && self->m_identifier) ? self->m_identifier : "(none)");
+        h += "</table>";
+        #undef ROW
+
+        h += "</body></html>";
+        html = g_strdup(h.c_str());
+    } else {
+        html = g_strdup_printf(
+            "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<style>body{background:#101418;color:#e6e6e6;font-family:sans-serif;padding:24px}</style></head>"
+            "<body><h2>Isis internal page</h2><p>Unknown page: <code>%s</code></p>"
+            "<p>Try <a style='color:#4ea1ff' href='isis:about'>isis:about</a>.</p></body></html>",
+            path.empty() ? "(none)" : path.c_str());
+    }
+
+    gsize len = html ? strlen(html) : 0;
+    gchar* buf = g_strdup(html ? html : "");
+    if (html) g_free(html);
+    GInputStream* s = g_memory_input_stream_new_from_data(buf, (gssize)len, g_free);
+    webkit_uri_scheme_request_finish(req, s, (gint64)len, "text/html");
+    g_object_unref(s);
+}
+
+/* ---- Feature 3: bookmark favicon — the app calls saveViewToFile → renderToFile; we download the site's
+ * favicon (via our modern-TLS engine) to a LOCAL file the app chrome can display. The app chrome runs in
+ * LunaSysMgr's old WebKit (system OpenSSL 0.9.8) and CANNOT fetch modern-TLS https favicons itself, so the
+ * engine does it. WPE 2.52 here has NO favicon-database API, so we can't read the page's declared
+ * <link rel=icon> — we use the conventional origin + "/favicon.ico" (covers the large majority of sites).
+ *
+ * CRITICAL: this is best-effort and runs ASYNCHRONOUSLY — it ALWAYS returns 0 immediately. A non-zero
+ * return makes the adapter throw a JS exception that aborts addBookmark BEFORE the DB write (breaks
+ * bookmarking entirely). And a blocking (nested-loop) download would stall every bookmark. So we just kick
+ * off the download and let it land in the background; the icon appears next time the list renders. ------- */
+/* The old LunaSysMgr WebKit (which renders the app chrome) can decode PNG but NOT ICO, so we must fetch a
+ * PNG icon, not favicon.ico. Try the de-facto PNG icon paths first; favicon.ico is last (works only for the
+ * minority of sites that actually serve a PNG there — for ICO sites it just fails and we end up with no icon,
+ * which is no worse than before). Chained: on each download failure we advance to the next candidate. */
+static const char* const ISIS_FAVICON_CANDIDATES[] = {
+    "/apple-touch-icon.png",
+    "/apple-touch-icon-precomposed.png",
+    "/favicon.ico",
+    nullptr
+};
+struct IsisFaviconDl {
+    WebKitWebView* view;
+    std::string origin;   /* scheme://host[:port] */
+    std::string dest;
+    int idx;
+    gulong hDst, hFin, hFail;
+};
+
+static void isis_favicon_try_next(IsisFaviconDl* s);   /* fwd */
+
+static void isis_favicon_disconnect(WebKitDownload* dl, IsisFaviconDl* s) {
+    if (s->hDst)  { g_signal_handler_disconnect(dl, s->hDst);  s->hDst = 0; }
+    if (s->hFin)  { g_signal_handler_disconnect(dl, s->hFin);  s->hFin = 0; }
+    if (s->hFail) { g_signal_handler_disconnect(dl, s->hFail); s->hFail = 0; }
+}
+static gboolean isis_favicon_decide_dest(WebKitDownload* dl, gchar* /*suggested*/, gpointer ud) {
+    IsisFaviconDl* s = static_cast<IsisFaviconDl*>(ud);
+    webkit_download_set_destination(dl, s->dest.c_str());   /* plain path in 2.40+ API */
+    return TRUE;
+}
+static void isis_favicon_dl_finished(WebKitDownload* dl, gpointer ud) {
+    IsisFaviconDl* s = static_cast<IsisFaviconDl*>(ud);
+    WLOG("favicon saved -> %s (via %s)", s->dest.c_str(), ISIS_FAVICON_CANDIDATES[s->idx]);
+    isis_favicon_disconnect(dl, s);
+    g_object_unref(dl);
+    delete s;
+}
+static void isis_favicon_dl_failed(WebKitDownload* dl, GError*, gpointer ud) {
+    IsisFaviconDl* s = static_cast<IsisFaviconDl*>(ud);
+    isis_favicon_disconnect(dl, s);
+    g_object_unref(dl);
+    s->idx++;
+    isis_favicon_try_next(s);   /* advance to the next candidate path, or clean up when exhausted */
+}
+static void isis_favicon_try_next(IsisFaviconDl* s) {
+    if (!ISIS_FAVICON_CANDIDATES[s->idx]) { delete s; return; }   /* exhausted — leave no file */
+    std::string uri = s->origin + ISIS_FAVICON_CANDIDATES[s->idx];
+    WebKitDownload* dl = webkit_web_view_download_uri(s->view, uri.c_str());
+    if (!dl) { delete s; return; }
+    webkit_download_set_destination(dl, s->dest.c_str());
+    s->hDst  = g_signal_connect(dl, "decide-destination", G_CALLBACK(isis_favicon_decide_dest), s);
+    s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(isis_favicon_dl_finished), s);
+    s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(isis_favicon_dl_failed),   s);
+}
+
+/* Favicons MUST live inside the app's own bundle: LunaSysMgr's isAllowedFileAccess policy blocks the app
+ * from reading /var/luna/data/browser/icons (that's the stock Palm browser's privileged dir). The app can
+ * only read files under its own install dir, so we write there and the app references them via a RELATIVE
+ * "faviconcache/..." path. The host authority is sanitized to [A-Za-z0-9.-] (else '_'); the APP computes the
+ * SAME leaf name. Empty for non-http(s) URIs. */
+#define ISIS_FAVICON_DIR "/media/cryptofs/apps/usr/palm/applications/com.junoavalon.app.isisbrowser/faviconcache"
+static std::string isis_favicon_dest_for(const char* pageUri) {
+    if (!pageUri || strncmp(pageUri, "http", 4) != 0) return std::string();
+    const char* p = strstr(pageUri, "://");
+    if (!p) return std::string();
+    p += 3;
+    const char* slash = strchr(p, '/');
+    std::string authority = slash ? std::string(p, slash - p) : std::string(p);
+    if (authority.empty()) return std::string();
+    std::string safe;
+    safe.reserve(authority.size());
+    for (size_t i = 0; i < authority.size(); ++i) {
+        char c = authority[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-';
+        safe += ok ? c : '_';
+    }
+    return std::string(ISIS_FAVICON_DIR "/fav_") + safe + ".png";
+}
+
+/* Kick off the chained favicon download (PNG candidates first). Best-effort, never blocks. */
+static void isis_start_favicon_download(WebKitWebView* view, const char* pageUri, const std::string& dest) {
+    if (!view || !pageUri) return;
+    const char* p = strstr(pageUri, "://");
+    if (!p) return;
+    const char* slash = strchr(p + 3, '/');
+    std::string origin = slash ? std::string(pageUri, slash - pageUri) : std::string(pageUri);
+    /* Remove any stale icon (e.g. a previously-saved ICO) so a candidate can write fresh; if all candidates
+     * fail we correctly end up with no icon rather than a broken leftover. */
+    unlink(dest.c_str());
+    IsisFaviconDl* s = new IsisFaviconDl();
+    s->view = view;
+    s->origin = origin;
+    s->dest = dest;
+    s->idx = 0;
+    s->hDst = s->hFin = s->hFail = 0;
+    isis_favicon_try_next(s);
+}
+
+/* The saveViewToFile sync command doesn't reach here reliably in the WPE port, so favicon fetching is driven
+ * from onLoadChanged(LOAD_FINISHED) instead (see isis_start_favicon_download). This stays a no-op that NEVER
+ * fails — a non-zero return makes the adapter throw and abort addBookmark. */
+int BrowserPageWPE::renderToFile(const char*, int32_t, int32_t, int32_t, int32_t)
+{
+    return 0;
+}
+
+/* ---- Feature 7: HTTP auth dialog — round-trips to the app UI for username/password ---------- */
+gboolean BrowserPageWPE::onAuthenticate(WebKitWebView*, WebKitAuthenticationRequest* req, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (!self || !self->m_proxy) return FALSE;
+    if (!self->m_syncReplyPipe)
+        self->m_syncReplyPipe = new BrowserSyncReplyPipe(reinterpret_cast<BrowserPage*>(self));
+
+    const char* host = webkit_authentication_request_get_host(req);
+    self->m_server->msgDialogUserPassword(self->m_proxy, self->m_syncReplyPipe->pipePath(),
+                                          host ? host : "");
+
+    GPtrArray* reply = nullptr;
+    if (!self->m_syncReplyPipe->getReply(&reply, self->m_proxy->commandSocketFd()) || !reply) {
+        webkit_authentication_request_cancel(req);
+        return TRUE;
+    }
+
+    bool ok = reply->len >= 1 && ::atoi(static_cast<const char*>(g_ptr_array_index(reply, 0))) != 0;
+    if (ok && reply->len >= 3) {
+        const char* user = static_cast<const char*>(g_ptr_array_index(reply, 1));
+        const char* pass = static_cast<const char*>(g_ptr_array_index(reply, 2));
+        WebKitCredential* c = webkit_credential_new(user ? user : "", pass ? pass : "",
+                                                    WEBKIT_CREDENTIAL_PERSISTENCE_FOR_SESSION);
+        webkit_authentication_request_authenticate(req, c);
+        webkit_credential_free(c);
+    } else {
+        webkit_authentication_request_cancel(req);
+    }
+
+    for (guint i = 0; i < reply->len; i++) ::free(g_ptr_array_index(reply, i));
+    g_ptr_array_free(reply, TRUE);
+    return TRUE;
+}
+
+/* ---- Feature 7: SSL cert confirm dialog — writes the cert PEM to a temp file for the app ----- */
+gboolean BrowserPageWPE::onTlsErrors(WebKitWebView* v, const char* uri, GTlsCertificate* cert,
+                                     GTlsCertificateFlags errs, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (!self || !self->m_proxy) return FALSE;
+    if (!self->m_syncReplyPipe)
+        self->m_syncReplyPipe = new BrowserSyncReplyPipe(reinterpret_cast<BrowserPage*>(self));
+
+    /* host from the failing URI */
+    std::string host;
+    if (uri) {
+        const char* p = strstr(uri, "://");
+        p = p ? p + 3 : uri;
+        const char* e = p;
+        while (*e && *e != '/' && *e != ':') e++;
+        host.assign(p, e - p);
+    }
+
+    /* write the cert PEM to a temp file the app can read/display */
+    char certPath[] = "/tmp/isis-cert-XXXXXX";
+    int fd = mkstemp(certPath);
+    gchar* pem = nullptr;
+    if (cert) g_object_get(cert, "certificate-pem", &pem, NULL);
+    if (fd >= 0) {
+        if (pem) { ssize_t n = write(fd, pem, strlen(pem)); (void)n; }
+        close(fd);
+    }
+
+    self->m_server->msgDialogSSLConfirm(self->m_proxy, self->m_syncReplyPipe->pipePath(),
+                                        host.c_str(), (int)errs, certPath);
+
+    GPtrArray* reply = nullptr;
+    gboolean gotReply = self->m_syncReplyPipe->getReply(&reply, self->m_proxy->commandSocketFd()) && reply;
+
+    int decision = 0;   // 0 = reject (default)
+    if (gotReply && reply->len >= 1)
+        decision = ::atoi(static_cast<const char*>(g_ptr_array_index(reply, 0)));
+
+    if (decision != 0 && cert) {
+        /* accept: pin the cert for this host and retry the load */
+        webkit_network_session_allow_tls_certificate_for_host(
+            webkit_web_view_get_network_session(v), cert, host.c_str());
+        webkit_web_view_load_uri(v, uri);
+    }
+
+    if (gotReply && reply) {
+        for (guint i = 0; i < reply->len; i++) ::free(g_ptr_array_index(reply, i));
+        g_ptr_array_free(reply, TRUE);
+    }
+    if (pem) g_free(pem);
+    unlink(certPath);
+    return TRUE;
 }
 
 /* ---- Isis buffer attach (mirrors BrowserPage::attachToBuffer) ------------------------------ */
@@ -584,13 +966,14 @@ void BrowserPageWPE::openUrl(const char* url)
      * The adapter passes the raw typed text (e.g. "cnn.com"), so add http:// if missing. */
     if (!u.empty() && u.find("://") == std::string::npos
         && u.compare(0, 5, "data:") != 0 && u.compare(0, 6, "about:") != 0
-        && u.compare(0, 5, "file:") != 0 && u.compare(0, 7, "mailto:") != 0)
+        && u.compare(0, 5, "file:") != 0 && u.compare(0, 7, "mailto:") != 0
+        && u.compare(0, 5, "isis:") != 0)   /* Feature 6: keep "isis:about" verbatim for the custom scheme */
         u = "http://" + u;
     webkit_web_view_load_uri(m_webView, u.c_str());
 }
 void BrowserPageWPE::setHTML(const char* url, const char* body) { ensureWebView(); webkit_web_view_load_html(m_webView, body, url); }
-void BrowserPageWPE::pageBackward()             { if (m_webView) webkit_web_view_go_back(m_webView); }
-void BrowserPageWPE::pageForward()              { if (m_webView) webkit_web_view_go_forward(m_webView); }
+void BrowserPageWPE::pageBackward()             { WLOG("pageBackward (engine go_back)"); if (m_webView) { m_navByHistory = true; webkit_web_view_go_back(m_webView); } }
+void BrowserPageWPE::pageForward()              { WLOG("pageForward (engine go_forward)"); if (m_webView) { m_navByHistory = true; webkit_web_view_go_forward(m_webView); } }
 void BrowserPageWPE::pageReload()               { if (m_webView) webkit_web_view_reload(m_webView); }
 void BrowserPageWPE::pageStop()                 { if (m_webView) webkit_web_view_stop_loading(m_webView); }
 bool BrowserPageWPE::canGoBackward() const      { return m_webView && webkit_web_view_can_go_back(m_webView); }
@@ -1023,8 +1406,13 @@ void BrowserPageWPE::dispatchPointer(int x, int y, uint32_t button, bool down)
      * space (m_virtualWindowWidth). WebKit's viewport is laid out at that same width, so we dispatch
      * as-is. (The earlier x*virtualW/screenW rescale double-transformed taps → they landed too low.)
      * The adapter hands document-ABSOLUTE coords; WebKit wants viewport-relative — subtract scroll. */
-    x -= m_scrollX; y -= m_scrollY;
-    WLOG("  -> viewport %d,%d (scroll %d,%d)", x, y, m_scrollX, m_scrollY);
+    /* Convert document-absolute -> viewport by subtracting WebKit's ACTUAL scroll. In the pan model that is
+     * m_renderedY (the top of the region WebKit is scrolled to via window.scrollTo), NOT the adapter's visual
+     * pan position m_scrollY. They diverge when a page fits the tall pan buffer: WebKit's scroll stays 0 while
+     * the adapter pans down, so subtracting m_scrollY put clicks m_scrollY px too high — e.g. a one-screen
+     * cookie-consent page where "Accept"/"Reject" never got hit. (X has no pan buffer, so m_scrollX is right.) */
+    x -= m_scrollX; y -= m_renderedY;
+    WLOG("  -> viewport %d,%d (scrollX %d renderedY %d panY %d)", x, y, m_scrollX, m_renderedY, m_scrollY);
     struct wpe_input_pointer_event move = { wpe_input_pointer_event_type_motion, 0, x, y, 0, 0, 0 };
     wpe_view_backend_dispatch_pointer_event(m_viewBackend, &move);
     if (button) {
@@ -1178,10 +1566,44 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
             self->m_server->msgLoadStarted(self->m_proxy);
             break;
         case WEBKIT_LOAD_COMMITTED:
-            /* blank the old page NOW — the new document has committed; don't show the last page while it paints */
-            self->clearToWhite();
+            if (self->m_navByHistory) {
+                /* bf-cache back/forward: the restore is INSTANT and composites its own frame right away.
+                 * Do NOT blank-flush (that consumes an offscreen buffer the fast restore frame then can't
+                 * get -> onFrame DROP both-held -> blank page). Reset the pan state for the restored page,
+                 * and CRITICALLY tell the adapter to scroll to 0 (msgScrolledTo) — otherwise the adapter keeps
+                 * the PREVIOUS page's scroll and blits oy = local + oldScroll - renderedY(0) -> reads outside
+                 * the buffer -> white/wrong. With mScrollPos=0 the blit is identity -> restored page shows from top. */
+                self->m_navByHistory = false;
+                self->m_renderedY = 0; self->m_deliveredY = 0; self->m_pageHeight = 0; self->m_renderPending = false;
+                self->m_scrollX = 0; self->m_scrollY = 0; self->m_lastScrollY = 0; self->m_dirStreak = 0; self->m_scrollVel = 0;
+                if (self->m_settleTimer) { g_source_remove(self->m_settleTimer); self->m_settleTimer = 0; }
+                self->m_server->msgScrolledTo(self->m_proxy, 0, 0);   /* reset adapter mScrollPos -> identity blit */
+                /* Offscreen WPE bf-cache restore does NOT auto-composite a frame (the layer tree is cached),
+                 * so the buffer keeps the OLD page -> "repaint not from cache". Force a composite with a scroll
+                 * nudge that ends at the top (matching the adapter reset); onFrame then delivers the restored page. */
+                webkit_web_view_evaluate_javascript(v, "window.scrollTo(0,4);window.scrollTo(0,0);", -1,
+                                                    nullptr, nullptr, nullptr, nullptr, nullptr);
+                WLOG("HISTORY restore commit -> reset pan + msgScrolledTo(0,0) + repaint nudge");
+            } else {
+                /* blank the old page NOW — the new document has committed; don't show the last page while it paints */
+                self->clearToWhite();
+            }
             /* tell the adapter the content size so it sets up the display area + shows painted buffers */
             self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, self->m_virtualWindowHeight);
+            /* Feature 3: fetch the favicon EARLY — at commit (final URL known), not at finish. On slow sites
+             * the page can take many seconds to finish; the favicon only needs the host, so downloading it
+             * here (in parallel with the page) makes it ready well before the user can bookmark. */
+            {
+                const char* cu = webkit_web_view_get_uri(v);
+                if (cu) {
+                    std::string favDest = isis_favicon_dest_for(cu);
+                    if (!favDest.empty()) {
+                        mkdir(ISIS_FAVICON_DIR, 0755);   /* under the app bundle; parent exists; ignore EEXIST */
+                        isis_start_favicon_download(v, cu, favDest);
+                        WLOG("favicon prefetch (commit) -> %s", favDest.c_str());
+                    }
+                }
+            }
             break;
         case WEBKIT_LOAD_FINISHED: {
             const char* t = webkit_web_view_get_title(v);

@@ -27,6 +27,8 @@
 class BrowserServer;
 class YapProxy;
 class BrowserOffscreenQt;
+class BrowserPage;             // opaque — BrowserSyncReplyPipe's ctor takes a BrowserPage* (used only as a %p id)
+class BrowserSyncReplyPipe;    // Feature 7: sync round-trip to the app for SSL/auth dialogs
 struct wpe_view_backend;
 
 enum UrlMatchType {
@@ -130,7 +132,7 @@ public:
     void pluginSpotlightEnd() {}
     void pluginSpotlightStart(int x, int y, int cx, int cy) {}
     void printFrame(const char* frameName, int lpsJobId, int width, int height, int dpi, bool landscape, bool reverseOrder) {}
-    int renderToFile(const char* filename, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH) { return {}; }
+    int renderToFile(const char* filename, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH);
     bool saveImageAtPoint(uint32_t x, uint32_t y, QString& filepath) { return {}; }
     void scrollLayer(int id, int deltaX, int deltaY) {}
     void selectAll() { if (m_webView) webkit_web_view_execute_editing_command(m_webView, "SelectAll"); }
@@ -181,6 +183,12 @@ private:
     static void onProgressChanged(GObject*, GParamSpec*, gpointer);
     static int  onDecidePolicy(WebKitWebView*, WebKitPolicyDecision*, WebKitPolicyDecisionType, gpointer);  // unsupported-mime → download handoff
 
+    // Feature 6: isis: internal scheme (isis:about diagnostics page)
+    static void     onIsisScheme(WebKitURISchemeRequest* req, gpointer ud);
+    // Feature 7: SSL cert + HTTP auth dialogs (round-trip to app UI via the sync reply pipe)
+    static gboolean onAuthenticate(WebKitWebView*, WebKitAuthenticationRequest*, gpointer);
+    static gboolean onTlsErrors(WebKitWebView*, const char* uri, GTlsCertificate*, GTlsCertificateFlags, gpointer);
+
     void ensureWebView();                    // create m_viewBackend + m_webView once size is known
     void dispatchPointer(int x, int y, uint32_t button, bool down);
     void updateContentsSize();               // async-query the real page height for scroll range
@@ -215,6 +223,7 @@ private:
     int                 m_dirStreak;    // consecutive same-direction scroll moves (signed); predictive lead only applies when SUSTAINED (not oscillation)
     int                 m_pendingOldY;  // renderedY before the in-flight re-center — for the confirmed strip delta (confirm mode)
     int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
+    bool                m_navByHistory; // pageBackward/Forward set this -> LOAD_COMMITTED skips the blank-flush (bf-cache restore is instant + needs the buffer)
     bool                m_focused;
     bool                m_frozen;
     bool                m_private;     // ephemeral session (private browsing) — set by the openUrl marker
@@ -230,6 +239,8 @@ private:
     WebKitWebView*           m_webView;
     std::string              m_userAgent;
     std::string              m_lastFind;     // last find query → new vs next/prev (highlight-all stays up)
+    int                      m_memLimit = 480;        // Feature 6: WebProcess memory budget (MB) shown in isis:about
+    BrowserSyncReplyPipe*    m_syncReplyPipe = nullptr; // Feature 7: lazily-created sync pipe for SSL/auth dialogs
 };
 
 #endif /* BROWSER_PAGE_WPE_H */
