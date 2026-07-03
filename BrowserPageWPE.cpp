@@ -1749,17 +1749,35 @@ void BrowserPageWPE::selectWordAt(int docX, int docY)
 {
     if (!m_webView) return;
     int vx = docX - m_scrollX, vy = docY - m_renderedY;
-    char js[560];
+    /* Select the word at the point, then return the selection's first+last client rects converted BACK to
+     * the app's coord space (+SX,+SY undo the viewport shift selectWordAt applied) so the app can pin the
+     * drag markers + Copy popover exactly over the highlight. Reported on the "selectionBounds" channel. */
+    char js[900];
     snprintf(js, sizeof js,
-        "(function(x,y){var s=window.getSelection();if(!s)return 0;s.removeAllRanges();"
+        "(function(x,y,SX,SY){var s=window.getSelection();if(!s)return '';s.removeAllRanges();"
         "var r=(document.caretRangeFromPoint?document.caretRangeFromPoint(x,y):null);"
         "if(r){s.addRange(r);try{s.modify('move','backward','word');s.modify('extend','forward','word');}catch(e){}"
-        "if(s.toString().trim().length)return s.toString().length;s.removeAllRanges();}"
-        /* fallback: no caret/word here — select the block element's text at the point */
-        "var el=document.elementFromPoint(x,y);if(el){var rr=document.createRange();rr.selectNodeContents(el);s.addRange(rr);return s.toString().length;}"
-        "return 0;})(%d,%d)",
-        vx, vy);
-    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+        "if(!s.toString().trim().length)s.removeAllRanges();}"
+        "if(!s.rangeCount||!s.toString().length){var el=document.elementFromPoint(x,y);if(el){var rr=document.createRange();rr.selectNodeContents(el);try{s.addRange(rr);}catch(e){}}}"
+        "if(!s.rangeCount||!s.toString().length)return '';"
+        "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return '';"
+        "var a=rc[0],b=rc[rc.length-1];"
+        "return JSON.stringify({sx:Math.round(a.left+SX),sy:Math.round(a.top+SY),sh:Math.round(a.height),ex:Math.round(b.right+SX),ey:Math.round(b.bottom+SY),len:s.toString().length});"
+        "})(%d,%d,%d,%d)",
+        vx, vy, m_scrollX, m_renderedY);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
+}
+/* Selection-geometry result -> app via the "selectionBounds" channel (JSON start/end rects). */
+void BrowserPageWPE::onSelectResult(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (!v) { if (err) g_error_free(err); return; }
+    char* s = jsc_value_to_string(v);
+    if (s && s[0] && self->m_server) self->m_server->msgActionData(self->m_proxy, "selectionBounds", s);
+    if (s) g_free(s);
+    g_object_unref(v);
 }
 void BrowserPageWPE::onCopyText(GObject* obj, GAsyncResult* res, gpointer ud)
 {

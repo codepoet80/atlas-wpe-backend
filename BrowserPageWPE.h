@@ -158,7 +158,8 @@ public:
     void setMouseMode(enum BATypes::MouseMode mode) {}
     void setNetworkInterface(const char* interfaceName) {}
     void setSelectionMode(bool on) {}
-    /* Feature: tap-to-select a word of web content at (docX,docY); WebKit paints the highlight natively. */
+    /* Feature: tap-to-select a word of web content at (docX,docY); WebKit paints the highlight natively.
+     * Reports the selection's start/end rects back on the "selectionBounds" channel for the drag markers. */
     void selectWordAt(int docX, int docY);
     void setShowClickedLink(bool enable) {}
     void settingsJavaScriptEnabled(bool enable) { if (m_webView) webkit_settings_set_enable_javascript(webkit_web_view_get_settings(m_webView), enable); }
@@ -234,6 +235,7 @@ private:
     static void onLoginCapture(GObject*, GAsyncResult*, gpointer);   // save-login: form-submit snapshot → msgActionData("saveLogin")
     static gboolean onLoginDeferTimeout(gpointer);                   // failsafe: resume a deferred login-snapshot navigation if the capture callback never fires
     static void onCopyText(GObject*, GAsyncResult*, gpointer);       // copy: selection text → msgActionData("copiedText")
+    static void onSelectResult(GObject*, GAsyncResult*, gpointer);   // select: start/end rects → msgActionData("selectionBounds")
     int m_dragX = 0, m_dragY = 0;            // web-content drag: tracked document-space pointer position
     std::string m_saveImgDir;                // Feature 9: dir to save the image into (/media/internal or /tmp)
     std::string m_saveImgInFlight;           // dest of an in-progress save — drop a duplicate so two downloads don't collide on one file
