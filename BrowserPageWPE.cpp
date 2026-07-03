@@ -1,17 +1,17 @@
 /*
- * BrowserPageWPE.cpp — WPE WebKit BrowserPage for the Isis BrowserServer. See BrowserPageWPE.h.
+ * BrowserPageWPE.cpp — WPE WebKit BrowserPage for the Atlas BrowserServer. See BrowserPageWPE.h.
  * Real browse path; long-tail commands stubbed with TODO. Uses the WPE WebKit C API + the custom
- * libwpe backend (wpe_isis_view_backend_create). Input is dispatched on the wpe_view_backend (it
- * forwards to the WebProcess); rendering returns via onFrame() → Isis offscreen → msgPainted.
+ * libwpe backend (wpe_atlas_view_backend_create). Input is dispatched on the wpe_view_backend (it
+ * forwards to the WebProcess); rendering returns via onFrame() → Atlas offscreen → msgPainted.
  */
 #include "BrowserPageWPE.h"
 #include "BrowserServer.h"
 #include "BrowserOffscreenQt.h"
 #include "YapProxy.h"
 #include "BrowserSyncReplyPipe.h"   // Feature 7: sync round-trip to the app for SSL/auth dialogs
-#include "wpe-isis-backend.h"
+#include "wpe-atlas-backend.h"
 
-#include <sys/statvfs.h>            // Feature 6: /dev/shm size in the isis:about diagnostics page
+#include <sys/statvfs.h>            // Feature 6: /dev/shm size in the atlas:about diagnostics page
 #include <sys/stat.h>               // Feature 3: stat() the downloaded favicon file in renderToFile
 
 #include <cstring>
@@ -52,6 +52,8 @@ __attribute__((constructor)) static void bpwpe_install_crash_handler(void)
     signal(SIGSEGV, bpwpe_crash_handler);
     signal(SIGABRT, bpwpe_crash_handler);
     signal(SIGBUS,  bpwpe_crash_handler);
+    signal(SIGTRAP, bpwpe_crash_handler);   /* JIT/-mthumb WebContext crash is SIGTRAP (RELEASE_ASSERT/CRASH) */
+    signal(SIGILL,  bpwpe_crash_handler);
 }
 
 /* Device display resolution comes from webOS config (/etc/palm/luna.conf: DisplayWidth/DisplayHeight),
@@ -72,28 +74,32 @@ static int lunaConfInt(const char* key)
  * loses focus. We subclass it, override notify_focus_in/out, and forward to the page, which raises
  * the webOS virtual keyboard via msgEditorFocused — the same adapter signal the legacy QtWebKit
  * BrowserServer used. ---- */
-struct IsisIMContext      { WebKitInputMethodContext      parent_instance; BrowserPageWPE* page; };
-struct IsisIMContextClass { WebKitInputMethodContextClass parent_class; };
-G_DEFINE_TYPE(IsisIMContext, isis_im_context, WEBKIT_TYPE_INPUT_METHOD_CONTEXT)
-static void isis_im_focus_in(WebKitInputMethodContext* c) {
-    IsisIMContext* s = reinterpret_cast<IsisIMContext*>(c);
-    if (s->page) s->page->onEditorFocus(true, (int)webkit_input_method_context_get_input_purpose(c));
+struct AtlasIMContext      { WebKitInputMethodContext      parent_instance; BrowserPageWPE* page; };
+struct AtlasIMContextClass { WebKitInputMethodContextClass parent_class; };
+G_DEFINE_TYPE(AtlasIMContext, atlas_im_context, WEBKIT_TYPE_INPUT_METHOD_CONTEXT)
+static void atlas_im_focus_in(WebKitInputMethodContext* c) {
+    AtlasIMContext* s = reinterpret_cast<AtlasIMContext*>(c);
+    /* Only raise the VKB for editor focus that follows a USER interaction. A page that AUTOFOCUSES an input
+     * on load (search/login sites) would otherwise grab the keyboard before any tap — which then blocks the
+     * app's own address bar from getting focus/VKB ("no focus after a site loads"). m_userInteracted resets
+     * on each navigation and is set on the first pointer event, so tap-to-focus stays instant. */
+    if (s->page && s->page->m_userInteracted) s->page->onEditorFocus(true, (int)webkit_input_method_context_get_input_purpose(c));
 }
-static void isis_im_focus_out(WebKitInputMethodContext* c) {
-    IsisIMContext* s = reinterpret_cast<IsisIMContext*>(c);
+static void atlas_im_focus_out(WebKitInputMethodContext* c) {
+    AtlasIMContext* s = reinterpret_cast<AtlasIMContext*>(c);
     if (s->page) s->page->onEditorFocus(false, 0);
 }
-static void isis_im_context_class_init(IsisIMContextClass* k) {
+static void atlas_im_context_class_init(AtlasIMContextClass* k) {
     WebKitInputMethodContextClass* c = WEBKIT_INPUT_METHOD_CONTEXT_CLASS(k);
-    c->notify_focus_in  = isis_im_focus_in;
-    c->notify_focus_out = isis_im_focus_out;
+    c->notify_focus_in  = atlas_im_focus_in;
+    c->notify_focus_out = atlas_im_focus_out;
 }
-static void isis_im_context_init(IsisIMContext*) {}
+static void atlas_im_context_init(AtlasIMContext*) {}
 
 #include <set>
 /* Live-page guard: a destroyed BrowserPageWPE's backend/conn can still deliver a queued
  * MSG_FRAME_READY — the WebView isn't always finalized synchronously on unref, so view_destroy
- * hasn't run, the isis_view lingers, and v->userdata still points at the freed page. onFrame checks
+ * hasn't run, the atlas_view lingers, and v->userdata still points at the freed page. onFrame checks
  * this set so a stale frame on a freed page is dropped instead of dereferencing freed memory.
  * Everything (ctor/dtor/onFrame) runs on the glib main loop, so no locking is needed. */
 static std::set<BrowserPageWPE*> g_livePages;
@@ -145,9 +151,9 @@ BrowserPageWPE::~BrowserPageWPE()
     delete m_offscreen1;
 }
 
-/* ---- create the WPE view bound to the Isis frame sink (once size is known) ----------------- */
+/* ---- create the WPE view bound to the Atlas frame sink (once size is known) ----------------- */
 /* The page asked to open a new window/popup (window.open, target=_blank). Many cookie-consent
- * CMPs open the consent UI this way. Isis has one WebView per card, so load the popup target in
+ * CMPs open the consent UI this way. Atlas has one WebView per card, so load the popup target in
  * THIS view rather than dropping it (which is why "no consent popup" appeared). */
 static WebKitWebView* bpwpe_on_create(WebKitWebView* view, WebKitNavigationAction* action, gpointer)
 {
@@ -171,7 +177,7 @@ static gboolean bpwpe_on_permission(WebKitWebView*, WebKitPermissionRequest* req
 }
 
 /* Download handoff: WebKit can't DISPLAY this response (a file — .zip/.pdf/.apk/etc), so emit
- * msgDownloadStart. The adapter forwards it to the Isis app (BrowserApp.js downloadResource),
+ * msgDownloadStart. The adapter forwards it to the Atlas app (BrowserApp.js downloadResource),
  * which hands the URL to com.palm.downloadmanager — the webOS system download service. We do NOT
  * download in the BS; webOS owns the download queue/notifications/storage. */
 int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision,
@@ -196,22 +202,48 @@ int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decisio
     else if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
         WebKitNavigationPolicyDecision* nd = WEBKIT_NAVIGATION_POLICY_DECISION(decision);
         WebKitNavigationAction* act = webkit_navigation_policy_decision_get_navigation_action(nd);
-        if (act && webkit_navigation_action_get_navigation_type(act) == WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED) {
+        WebKitNavigationType nt = act ? webkit_navigation_action_get_navigation_type(act)
+                                      : WEBKIT_NAVIGATION_TYPE_OTHER;
+        WLOG("decidePolicy NAVIGATION type=%d", (int)nt);
+        /* Save-login trigger: real form POSTs report FORM_SUBMITTED/FORM_RESUBMITTED, but a page that
+         * calls form.submit() from JS reports OTHER — cover all three. The snapshot JS runs on the main
+         * frame and returns '' unless a password field is filled, so non-login navigations send nothing. */
+        bool formish = (nt == WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED ||
+                        nt == WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED ||
+                        nt == WEBKIT_NAVIGATION_TYPE_OTHER);
+        if (act && formish) {
             BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
-            /* Save-login: the submitting document is still live at decide-policy time. Snapshot any
-             * filled password form's username+password (proven evaluate_javascript path — script message
-             * handlers crash this BS build) and offer it to the app to save. We do NOT block the submit. */
-            if (self && self->m_webView) {
+            /* Save-login: snapshot the submitting form's username+password. evaluate_javascript is ASYNC,
+             * but the form submit navigates immediately — if we let the nav proceed the old document (with
+             * the filled fields) is gone before the snapshot runs and we capture nothing. Fix: HOLD the
+             * policy decision (return TRUE, ref it) and resume the navigation from the capture callback, so
+             * the JS runs against the still-live submitting document. TWO SAFETY NETS so this never stalls
+             * normal browsing: (1) a suppression window — after one deferral we skip the next ~1.8s of
+             * OTHER navs (the post-login redirect is ALSO type=OTHER and must not be held up); (2) a failsafe
+             * timer that resumes the nav even if the eval callback never fires (e.g. page torn down mid-eval).
+             * The snapshot JS returns '' when no password field is filled, so non-login navs send nothing.
+             * (Script message handlers would be cleaner but crash this BS build.) */
+            gint64 nowms = g_get_monotonic_time() / 1000;
+            if (self && self->m_webView && !self->m_loginDecision &&
+                (nowms - self->m_lastLoginDeferMs) > 1800) {
                 static const char* kCapJs =
                     "(function(){var ps=document.querySelectorAll('input[type=password]');"
                     "for(var i=0;i<ps.length;i++){var p=ps[i];if(!p.value)continue;"
-                    "var u='',f=p.form;if(f){var ins=f.querySelectorAll('input');"
-                    "for(var j=0;j<ins.length;j++){var t=(ins[j].type||'text').toLowerCase();"
-                    "if((t==='text'||t==='email'||t==='tel')&&ins[j].value)u=ins[j].value;}}"
-                    "return JSON.stringify({u:u,p:p.value,host:location.host});}"
+                    "var scope=p.form?p.form:document,ins=scope.querySelectorAll('input');"
+                    "var before='',any='',seen=false;"
+                    "for(var j=0;j<ins.length;j++){if(ins[j]===p){seen=true;continue;}"
+                    "var t=(ins[j].type||'text').toLowerCase();"
+                    "if((t==='text'||t==='email'||t==='tel')&&ins[j].value){"
+                    "if(!seen)before=ins[j].value;if(!any)any=ins[j].value;}}"
+                    "return JSON.stringify({u:before||any,p:p.value,host:location.host});}"
                     "return '';})()";
+                WLOG("saveLogin: form nav type=%d -> snapshot creds (deferring, failsafe 500ms)", (int)nt);
+                self->m_lastLoginDeferMs = nowms;
+                self->m_loginDecision = WEBKIT_POLICY_DECISION(g_object_ref(decision));
                 webkit_web_view_evaluate_javascript(self->m_webView, kCapJs, -1, nullptr, nullptr, nullptr,
                                                     &BrowserPageWPE::onLoginCapture, self);
+                g_timeout_add(500, &BrowserPageWPE::onLoginDeferTimeout, self);
+                return TRUE;   /* we own the decision now; resumed in onLoginCapture or the failsafe timer */
             }
         }
     }
@@ -224,12 +256,37 @@ void BrowserPageWPE::onLoginCapture(GObject* obj, GAsyncResult* res, gpointer ud
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
-    if (!v) { if (err) g_error_free(err); return; }
-    char* s = jsc_value_to_string(v);
-    if (s && s[0] == '{' && self->m_server)
-        self->m_server->msgActionData(self->m_proxy, "saveLogin", s);
-    if (s) g_free(s);
-    g_object_unref(v);
+    if (v) {
+        char* s = jsc_value_to_string(v);
+        WLOG("saveLogin: capture -> %s", (s && s[0]) ? s : "(empty)");
+        if (s && s[0] == '{' && self->m_server)
+            self->m_server->msgActionData(self->m_proxy, "saveLogin", s);
+        if (s) g_free(s);
+        g_object_unref(v);
+    } else {
+        WLOG("saveLogin: capture js failed: %s", err ? err->message : "?");
+        if (err) g_error_free(err);
+    }
+    /* Resume the navigation we deferred so the snapshot could run against the live document. */
+    if (self->m_loginDecision) {
+        webkit_policy_decision_use(self->m_loginDecision);
+        g_object_unref(self->m_loginDecision);
+        self->m_loginDecision = nullptr;
+    }
+}
+
+/* Failsafe: if the capture callback never fires (page torn down mid-eval), resume the deferred navigation
+ * anyway so browsing can never permanently stall on a login-form snapshot. One-shot. */
+gboolean BrowserPageWPE::onLoginDeferTimeout(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (self->m_loginDecision) {
+        WLOG("saveLogin: failsafe timer resuming deferred navigation");
+        webkit_policy_decision_use(self->m_loginDecision);
+        g_object_unref(self->m_loginDecision);
+        self->m_loginDecision = nullptr;
+    }
+    return G_SOURCE_REMOVE;
 }
 
 /* ---- ad/tracker content blocker (WKContentRuleList) ---------------------------------------- *
@@ -290,11 +347,11 @@ void BrowserPageWPE::ensureWebView()
      * IPC/StringImpl across threads) = SYSTEM memory exhaustion. Only ~180MB is free, so a 480MB
      * WebKit budget lets it grow past what the system can commit and it dies BEFORE WebKit ever
      * purges. Fix: set the budget near the real free memory so WebKit purges/GCs early enough.
-     * Tunable to sweep the safe max: `echo 256 > /tmp/isis_memlimit` (or BPWPE_MEM_LIMIT). */
+     * Tunable to sweep the safe max: `echo 256 > /tmp/atlas_memlimit` (or BPWPE_MEM_LIMIT). */
     int memLimit = 480;   /* REVERTED to original — the 256/aggressive-purge (this session) is the regression
                            * suspect: more frequent pressure handling drops an in-flight IPC SharedMemory ->
                            * SIGBUS on the 1.86MB write. Original 480/0.40/0.60/0.95/2s scrolled the whole page. */
-    { FILE* mf = fopen("/tmp/isis_memlimit", "r");
+    { FILE* mf = fopen("/tmp/atlas_memlimit", "r");
       if (mf) { int m = 0; if (fscanf(mf, "%d", &m) == 1 && m >= 64 && m <= 600) memLimit = m; fclose(mf); }
       else { const char* me = getenv("BPWPE_MEM_LIMIT"); if (me) { int m = atoi(me); if (m >= 64 && m <= 600) memLimit = m; } } }
     WebKitMemoryPressureSettings* webMem = webkit_memory_pressure_settings_new();
@@ -307,11 +364,11 @@ void BrowserPageWPE::ensureWebView()
     WebKitWebContext* ctx = WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", webMem, NULL));
     webkit_memory_pressure_settings_free(webMem);
-    m_memLimit = memLimit;   /* Feature 6: surfaced in the isis:about diagnostics page */
+    m_memLimit = memLimit;   /* Feature 6: surfaced in the atlas:about diagnostics page */
 
-    /* Feature 6: the internal `isis:` URI scheme (e.g. isis:about) serves a diagnostics page from
-     * onIsisScheme() below — WebKit version, memory budget, /dev/shm size, build stamp, renderer. */
-    webkit_web_context_register_uri_scheme(ctx, "isis", &BrowserPageWPE::onIsisScheme, this, nullptr);
+    /* Feature 6: the internal `atlas:` URI scheme (e.g. atlas:about) serves a diagnostics page from
+     * onAtlasScheme() below — WebKit version, memory budget, /dev/shm size, build stamp, renderer. */
+    webkit_web_context_register_uri_scheme(ctx, "atlas", &BrowserPageWPE::onAtlasScheme, this, nullptr);
 
     /* Persistent cookie storage — the missing piece. Cookies were memory-only (no store on disk), so
      * consent/logins died on every BS restart and consent-gated sites (nu.nl/DPG) bounced to their
@@ -345,8 +402,8 @@ void BrowserPageWPE::ensureWebView()
      * Caching re-enabled: the "Too Many Cards" OOM was actually the 2MB /dev/shm SIGBUS + WebProcess leaks
      * on card close (both fixed), NOT the cache. WEB_BROWSER model keeps a real resource/bf cache (faster
      * repeat loads + back/forward); WebKit's memory-pressure settings evict under load. DOCUMENT_VIEWER
-     * fallback via /tmp/isis_nocache if memory regresses. */
-    bool s_cacheOn = (access("/tmp/isis_nocache", F_OK) != 0);
+     * fallback via /tmp/atlas_nocache if memory regresses. */
+    bool s_cacheOn = (access("/tmp/atlas_nocache", F_OK) != 0);
     webkit_web_context_set_cache_model(ctx, s_cacheOn ? WEBKIT_CACHE_MODEL_WEB_BROWSER : WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
 
     /* Render at the FULL device width. The adapter seeds m_virtualWindowWidth at ~960, which
@@ -379,9 +436,9 @@ void BrowserPageWPE::ensureWebView()
          * look memory-bound was actually the 2MB /dev/shm overflowing on WebKit's IPC SharedMemory (fixed in
          * the BS wrapper: `mount -o remount,size=131072k /dev`), NOT the tile memory — so the tall buffer is
          * viable again. Paired with lock_surface (~3x readback) for fast edge re-renders. mult=1 = the
-         * low-memory screen-sized fallback. Tunable: echo N > /tmp/isis_bufscreens (or BPWPE_BUF_SCREENS). */
+         * low-memory screen-sized fallback. Tunable: echo N > /tmp/atlas_bufscreens (or BPWPE_BUF_SCREENS). */
         int mult = 4;
-        FILE* bf = fopen("/tmp/isis_bufscreens", "r");
+        FILE* bf = fopen("/tmp/atlas_bufscreens", "r");
         if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
         else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
         if (mult <= 1) {
@@ -420,7 +477,7 @@ void BrowserPageWPE::ensureWebView()
     WLOG("ensureWebView layout %dx%d -> render %dx%d (screen=%d contentZoom=%.3f)",
          renderW, renderH, m_renderWidth, m_renderHeight, screenW, (double)m_renderWidth/renderW);
 
-    m_viewBackend = wpe_isis_view_backend_create(renderW, renderH, scaledW, scaledH,
+    m_viewBackend = wpe_atlas_view_backend_create(renderW, renderH, scaledW, scaledH,
                                                  &BrowserPageWPE::onFrame, this);
     WebKitWebViewBackend* vb = webkit_web_view_backend_new(m_viewBackend, nullptr, nullptr);
     m_webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,    // 2.0: context + network session
@@ -430,13 +487,13 @@ void BrowserPageWPE::ensureWebView()
     g_object_unref(ctx);       // the WebView holds its own refs now
     g_object_unref(session);
 
-    /* Wire the native input-method focus signal → INSTANT webOS keyboard on field focus. The IsisIMContext
+    /* Wire the native input-method focus signal → INSTANT webOS keyboard on field focus. The AtlasIMContext
      * (notify_focus_in/out → onEditorFocus → msgEditorFocused) was defined above but never attached, so
      * editor focus relied entirely on the slow checkEditorFocus JS poll — which crawls behind a heavy page's
      * own JS on this CPU, delaying the keyboard by many seconds (tweakers login). Attaching the context makes
      * focus detection native + immediate. */
     {
-        IsisIMContext* imctx = reinterpret_cast<IsisIMContext*>(g_object_new(isis_im_context_get_type(), NULL));
+        AtlasIMContext* imctx = reinterpret_cast<AtlasIMContext*>(g_object_new(atlas_im_context_get_type(), NULL));
         imctx->page = this;
         webkit_web_view_set_input_method_context(m_webView, WEBKIT_INPUT_METHOD_CONTEXT(imctx));
         g_object_unref(imctx);   /* the WebView holds its own ref */
@@ -467,7 +524,7 @@ void BrowserPageWPE::ensureWebView()
     WebKitSettings* s = webkit_web_view_get_settings(m_webView);
     webkit_settings_set_javascript_can_open_windows_automatically(s, TRUE);
     webkit_settings_set_enable_developer_extras(s, FALSE);
-    webkit_settings_set_enable_page_cache(s, (access("/tmp/isis_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/isis_nocache */
+    webkit_settings_set_enable_page_cache(s, (access("/tmp/atlas_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/atlas_nocache */
     /* ALWAYS use a modern WebKit/Safari UA — the adapter otherwise sends the legacy
      * "HP TouchPad webOS 3.0.5" UA, making sites think we're the old engine.
      * WebKit 620 / Safari 18 = WPE 2.52 (was 612/15.0 = WPE 2.34-era). */
@@ -498,15 +555,15 @@ void BrowserPageWPE::ensureWebView()
      * (jsc_value_* on a non-JSCValue at the UIProcess), so it is intentionally not used. */
 }
 
-/* ---- Feature 6: isis: internal scheme (isis:about diagnostics page) ------------------------- */
-void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
+/* ---- Feature 6: atlas: internal scheme (atlas:about diagnostics page) ------------------------- */
+void BrowserPageWPE::onAtlasScheme(WebKitURISchemeRequest* req, gpointer ud)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
-    const char* uri = webkit_uri_scheme_request_get_uri(req);   // e.g. "isis:about" (opaque, no //)
-    /* isis:about is opaque — get_path is empty; parse the part after the first ':'. */
+    const char* uri = webkit_uri_scheme_request_get_uri(req);   // e.g. "atlas:about" (opaque, no //)
+    /* atlas:about is opaque — get_path is empty; parse the part after the first ':'. */
     const char* colon = uri ? strchr(uri, ':') : nullptr;
     std::string path = colon ? std::string(colon + 1) : std::string();
-    /* strip any leading slashes just in case a "isis:/about" form arrives */
+    /* strip any leading slashes just in case a "atlas:/about" form arrives */
     while (!path.empty() && path[0] == '/') path.erase(0, 1);
 
     gchar* html = nullptr;
@@ -574,7 +631,7 @@ void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
             ? webkit_settings_get_user_agent(webkit_web_view_get_settings(self->m_webView)) : "(n/a)";
         const char* tls  = getenv("GIO_USE_TLS");
         const char* cert = getenv("SSL_CERT_FILE");
-        bool cacheOn = (access("/tmp/isis_nocache", F_OK) != 0);
+        bool cacheOn = (access("/tmp/atlas_nocache", F_OK) != 0);
 
         std::string h;
         h += "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -589,8 +646,8 @@ void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
              "td{padding:8px 12px;border-bottom:1px solid #ededed;font-size:14px;vertical-align:top}"
              "tr:last-child td{border-bottom:none}"
              "td.k{color:#888;width:42%}code{color:#1a6bb5;font-family:monospace;word-break:break-all}</style>"
-             "<title>Isis Diagnostics</title></head><body>";
-        h += "<h1>Isis Browser</h1><p class='sub'>WPE WebKit engine diagnostics</p>";
+             "<title>Atlas Diagnostics</title></head><body>";
+        h += "<h1>Atlas Browser</h1><p class='sub'>WPE WebKit engine diagnostics</p>";
 
         char row[2048];
         #define ROW(k, fmt, ...) do { snprintf(row, sizeof row, \
@@ -598,7 +655,7 @@ void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
 
         h += "<h2>Engine</h2><table>";
         ROW("WebKit version", "%d.%d.%d", webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version());
-        ROW("Port", "%s", "WPE 2.52 &middot; offscreen isis backend");
+        ROW("Port", "%s", "WPE 2.52 &middot; offscreen atlas backend");
         ROW("Cache model", "%s", cacheOn ? "Web browser (resource + bf cache)" : "Document viewer (no cache)");
         ROW("Page cache (bf)", "%s", cacheOn ? "enabled" : "disabled");
         ROW("TLS backend", "GIO_USE_TLS=%s", tls ? tls : "(unset!)");
@@ -642,8 +699,8 @@ void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
         html = g_strdup_printf(
             "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<style>body{background:#101418;color:#e6e6e6;font-family:sans-serif;padding:24px}</style></head>"
-            "<body><h2>Isis internal page</h2><p>Unknown page: <code>%s</code></p>"
-            "<p>Try <a style='color:#4ea1ff' href='isis:about'>isis:about</a>.</p></body></html>",
+            "<body><h2>Atlas internal page</h2><p>Unknown page: <code>%s</code></p>"
+            "<p>Try <a style='color:#4ea1ff' href='atlas:about'>atlas:about</a>.</p></body></html>",
             path.empty() ? "(none)" : path.c_str());
     }
 
@@ -669,13 +726,13 @@ void BrowserPageWPE::onIsisScheme(WebKitURISchemeRequest* req, gpointer ud)
  * PNG icon, not favicon.ico. Try the de-facto PNG icon paths first; favicon.ico is last (works only for the
  * minority of sites that actually serve a PNG there — for ICO sites it just fails and we end up with no icon,
  * which is no worse than before). Chained: on each download failure we advance to the next candidate. */
-static const char* const ISIS_FAVICON_CANDIDATES[] = {
+static const char* const ATLAS_FAVICON_CANDIDATES[] = {
     "/apple-touch-icon.png",
     "/apple-touch-icon-precomposed.png",
     "/favicon.ico",
     nullptr
 };
-struct IsisFaviconDl {
+struct AtlasFaviconDl {
     WebKitWebView* view;
     std::string origin;   /* scheme://host[:port] */
     std::string dest;
@@ -683,41 +740,41 @@ struct IsisFaviconDl {
     gulong hDst, hFin, hFail;
 };
 
-static void isis_favicon_try_next(IsisFaviconDl* s);   /* fwd */
+static void atlas_favicon_try_next(AtlasFaviconDl* s);   /* fwd */
 
-static void isis_favicon_disconnect(WebKitDownload* dl, IsisFaviconDl* s) {
+static void atlas_favicon_disconnect(WebKitDownload* dl, AtlasFaviconDl* s) {
     if (s->hDst)  { g_signal_handler_disconnect(dl, s->hDst);  s->hDst = 0; }
     if (s->hFin)  { g_signal_handler_disconnect(dl, s->hFin);  s->hFin = 0; }
     if (s->hFail) { g_signal_handler_disconnect(dl, s->hFail); s->hFail = 0; }
 }
-static gboolean isis_favicon_decide_dest(WebKitDownload* dl, gchar* /*suggested*/, gpointer ud) {
-    IsisFaviconDl* s = static_cast<IsisFaviconDl*>(ud);
+static gboolean atlas_favicon_decide_dest(WebKitDownload* dl, gchar* /*suggested*/, gpointer ud) {
+    AtlasFaviconDl* s = static_cast<AtlasFaviconDl*>(ud);
     webkit_download_set_destination(dl, s->dest.c_str());   /* plain path in 2.40+ API */
     return TRUE;
 }
-static void isis_favicon_dl_finished(WebKitDownload* dl, gpointer ud) {
-    IsisFaviconDl* s = static_cast<IsisFaviconDl*>(ud);
-    WLOG("favicon saved -> %s (via %s)", s->dest.c_str(), ISIS_FAVICON_CANDIDATES[s->idx]);
-    isis_favicon_disconnect(dl, s);
+static void atlas_favicon_dl_finished(WebKitDownload* dl, gpointer ud) {
+    AtlasFaviconDl* s = static_cast<AtlasFaviconDl*>(ud);
+    WLOG("favicon saved -> %s (via %s)", s->dest.c_str(), ATLAS_FAVICON_CANDIDATES[s->idx]);
+    atlas_favicon_disconnect(dl, s);
     g_object_unref(dl);
     delete s;
 }
-static void isis_favicon_dl_failed(WebKitDownload* dl, GError*, gpointer ud) {
-    IsisFaviconDl* s = static_cast<IsisFaviconDl*>(ud);
-    isis_favicon_disconnect(dl, s);
+static void atlas_favicon_dl_failed(WebKitDownload* dl, GError*, gpointer ud) {
+    AtlasFaviconDl* s = static_cast<AtlasFaviconDl*>(ud);
+    atlas_favicon_disconnect(dl, s);
     g_object_unref(dl);
     s->idx++;
-    isis_favicon_try_next(s);   /* advance to the next candidate path, or clean up when exhausted */
+    atlas_favicon_try_next(s);   /* advance to the next candidate path, or clean up when exhausted */
 }
-static void isis_favicon_try_next(IsisFaviconDl* s) {
-    if (!ISIS_FAVICON_CANDIDATES[s->idx]) { delete s; return; }   /* exhausted — leave no file */
-    std::string uri = s->origin + ISIS_FAVICON_CANDIDATES[s->idx];
+static void atlas_favicon_try_next(AtlasFaviconDl* s) {
+    if (!ATLAS_FAVICON_CANDIDATES[s->idx]) { delete s; return; }   /* exhausted — leave no file */
+    std::string uri = s->origin + ATLAS_FAVICON_CANDIDATES[s->idx];
     WebKitDownload* dl = webkit_web_view_download_uri(s->view, uri.c_str());
     if (!dl) { delete s; return; }
     webkit_download_set_destination(dl, s->dest.c_str());
-    s->hDst  = g_signal_connect(dl, "decide-destination", G_CALLBACK(isis_favicon_decide_dest), s);
-    s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(isis_favicon_dl_finished), s);
-    s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(isis_favicon_dl_failed),   s);
+    s->hDst  = g_signal_connect(dl, "decide-destination", G_CALLBACK(atlas_favicon_decide_dest), s);
+    s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(atlas_favicon_dl_finished), s);
+    s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(atlas_favicon_dl_failed),   s);
 }
 
 /* Favicons MUST live inside the app's own bundle: LunaSysMgr's isAllowedFileAccess policy blocks the app
@@ -725,8 +782,8 @@ static void isis_favicon_try_next(IsisFaviconDl* s) {
  * only read files under its own install dir, so we write there and the app references them via a RELATIVE
  * "faviconcache/..." path. The host authority is sanitized to [A-Za-z0-9.-] (else '_'); the APP computes the
  * SAME leaf name. Empty for non-http(s) URIs. */
-#define ISIS_FAVICON_DIR "/media/cryptofs/apps/usr/palm/applications/com.junoavalon.app.isisbrowser/faviconcache"
-static std::string isis_favicon_dest_for(const char* pageUri) {
+#define ATLAS_FAVICON_DIR "/media/cryptofs/apps/usr/palm/applications/org.webosports.app.atlas/faviconcache"
+static std::string atlas_favicon_dest_for(const char* pageUri) {
     if (!pageUri || strncmp(pageUri, "http", 4) != 0) return std::string();
     const char* p = strstr(pageUri, "://");
     if (!p) return std::string();
@@ -741,11 +798,11 @@ static std::string isis_favicon_dest_for(const char* pageUri) {
         bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-';
         safe += ok ? c : '_';
     }
-    return std::string(ISIS_FAVICON_DIR "/fav_") + safe + ".png";
+    return std::string(ATLAS_FAVICON_DIR "/fav_") + safe + ".png";
 }
 
 /* Kick off the chained favicon download (PNG candidates first). Best-effort, never blocks. */
-static void isis_start_favicon_download(WebKitWebView* view, const char* pageUri, const std::string& dest) {
+static void atlas_start_favicon_download(WebKitWebView* view, const char* pageUri, const std::string& dest) {
     if (!view || !pageUri) return;
     const char* p = strstr(pageUri, "://");
     if (!p) return;
@@ -754,17 +811,17 @@ static void isis_start_favicon_download(WebKitWebView* view, const char* pageUri
     /* Remove any stale icon (e.g. a previously-saved ICO) so a candidate can write fresh; if all candidates
      * fail we correctly end up with no icon rather than a broken leftover. */
     unlink(dest.c_str());
-    IsisFaviconDl* s = new IsisFaviconDl();
+    AtlasFaviconDl* s = new AtlasFaviconDl();
     s->view = view;
     s->origin = origin;
     s->dest = dest;
     s->idx = 0;
     s->hDst = s->hFin = s->hFail = 0;
-    isis_favicon_try_next(s);
+    atlas_favicon_try_next(s);
 }
 
 /* The saveViewToFile sync command doesn't reach here reliably in the WPE port, so favicon fetching is driven
- * from onLoadChanged(LOAD_FINISHED) instead (see isis_start_favicon_download). This stays a no-op that NEVER
+ * from onLoadChanged(LOAD_FINISHED) instead (see atlas_start_favicon_download). This stays a no-op that NEVER
  * fails — a non-zero return makes the adapter throw and abort addBookmark. */
 int BrowserPageWPE::renderToFile(const char*, int32_t, int32_t, int32_t, int32_t)
 {
@@ -826,7 +883,7 @@ gboolean BrowserPageWPE::onTlsErrors(WebKitWebView* v, const char* uri, GTlsCert
     }
 
     /* write the cert PEM to a temp file the app can read/display */
-    char certPath[] = "/tmp/isis-cert-XXXXXX";
+    char certPath[] = "/tmp/atlas-cert-XXXXXX";
     int fd = mkstemp(certPath);
     gchar* pem = nullptr;
     if (cert) g_object_get(cert, "certificate-pem", &pem, NULL);
@@ -861,7 +918,7 @@ gboolean BrowserPageWPE::onTlsErrors(WebKitWebView* v, const char* uri, GTlsCert
     return TRUE;
 }
 
-/* ---- Isis buffer attach (mirrors BrowserPage::attachToBuffer) ------------------------------ */
+/* ---- Atlas buffer attach (mirrors BrowserPage::attachToBuffer) ------------------------------ */
 bool BrowserPageWPE::attachToBuffer(uint32_t vWidth, uint32_t vHeight,
                                     int key1, int key2, int size)
 {
@@ -939,8 +996,8 @@ void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t
     }
 
     if (getenv("BPWPE_DUMPFRAME")) {   /* dump the offscreen the adapter will show → diagnose the 3× repeat */
-        FILE* fp = fopen("/tmp/isis_frame.bgra", "wb");
-        if (fp) { fprintf(fp, "ISIS %u %u %u\n", w, h, dstStride);
+        FILE* fp = fopen("/tmp/atlas_frame.bgra", "wb");
+        if (fp) { fprintf(fp, "ATLAS %u %u %u\n", w, h, dstStride);
                   fwrite(dst, 1, (size_t)h * dstStride, fp); fclose(fp); }
         WLOG("dumped offscreen %ux%u stride=%u renderedY=%d", w, h, dstStride, self->m_renderedY);
     }
@@ -990,15 +1047,15 @@ void BrowserPageWPE::openUrl(const char* url)
     WLOG("openUrl %s", url ? url : "(null)");
     std::string u = url ? url : "";
     /* Private-browsing marker — the only reliable per-card signal (the adapter does NOT forward
-     * setIdentifier to the BS). The app opens a private card with "isis-private:" + the real target,
-     * BUT the app prepends http:// to unknown schemes, so it can arrive as "isis-private:X" OR
-     * "http://isis-private:X". Strip an optional leading http:// before matching. Detect it BEFORE
+     * setIdentifier to the BS). The app opens a private card with "atlas-private:" + the real target,
+     * BUT the app prepends http:// to unknown schemes, so it can arrive as "atlas-private:X" OR
+     * "http://atlas-private:X". Strip an optional leading http:// before matching. Detect it BEFORE
      * ensureWebView so the session is created ephemeral, then strip the marker and load the target. */
     {
         std::string c = (u.compare(0, 7, "http://") == 0) ? u.substr(7) : u;
-        if (c.compare(0, 13, "isis-private:") == 0) {
+        if (c.compare(0, 14, "atlas-private:") == 0) {
             m_private = true;
-            u = c.substr(13);
+            u = c.substr(14);
             if (u.empty() || u == "about:blank") u = "about:blank";
             WLOG("private marker -> ephemeral session; target='%s'", u.c_str());
         }
@@ -1015,7 +1072,7 @@ void BrowserPageWPE::openUrl(const char* url)
     if (!u.empty() && u.find("://") == std::string::npos
         && u.compare(0, 5, "data:") != 0 && u.compare(0, 6, "about:") != 0
         && u.compare(0, 5, "file:") != 0 && u.compare(0, 7, "mailto:") != 0
-        && u.compare(0, 5, "isis:") != 0)   /* Feature 6: keep "isis:about" verbatim for the custom scheme */
+        && u.compare(0, 6, "atlas:") != 0)   /* Feature 6: keep "atlas:about" verbatim for the custom scheme */
         u = "http://" + u;
     webkit_web_view_load_uri(m_webView, u.c_str());
 }
@@ -1033,7 +1090,7 @@ void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
 {
     WLOG("setWindowSize %ux%u (was win=%dx%d virt=%dx%d webView=%p)", w, h, m_windowWidth, m_windowHeight, m_virtualWindowWidth, m_virtualWindowHeight, (void*)m_webView);
     m_windowWidth = (int)w; m_windowHeight = (int)h;
-    if (m_viewBackend) wpe_isis_view_backend_resize(m_viewBackend, w, h);
+    if (m_viewBackend) wpe_atlas_view_backend_resize(m_viewBackend, w, h);
 }
 void BrowserPageWPE::setVirtualWindowSize(uint32_t w, uint32_t h)
 {
@@ -1120,13 +1177,13 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
     if (absVel > 1000) guard = (slack < screenH) ? slack / 2 : screenH;   /* fast: re-render earlier */
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
     if (inBuffer) return false;                             /* adapter pans — no re-render, no readback */
-    /* SETTLE-RENDER (gated /tmp/isis_settle): during a FAST flick, chasing the scroll just thrashes the
+    /* SETTLE-RENDER (gated /tmp/atlas_settle): during a FAST flick, chasing the scroll just thrashes the
      * WebProcess (each re-render then stalls ~1-2.5s) and still can't keep up. Instead DEFER — let the
      * adapter pan the buffer it has (blank past the edge) — and (re)arm a one-shot timer that fires ONE
      * sharp re-render ~160ms after scrolling stops, on an un-thrashed WebProcess. force=true (the timer)
      * bypasses this to actually render the settled position. */
     static int s_settle = -1;
-    if (s_settle < 0) s_settle = (access("/tmp/isis_nosettle", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/isis_nosettle */
+    if (s_settle < 0) s_settle = (access("/tmp/atlas_nosettle", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/atlas_nosettle */
     if (s_settle && !force && absVel > 2500) {
         /* Max-defer safeguard: only defer if we re-rendered recently. During CONTINUOUS fast motion (e.g.
          * finger oscillating up/down) every event would otherwise re-arm the 160ms timer so it NEVER fires
@@ -1158,7 +1215,7 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
      * from the OLD renderedY; skip the hint if it exceeds the buffer (no overlap -> full readback). */
     int delta = newTop - m_renderedY;   /* strip delta (plain path); confirm path uses m_pendingOldY in the cb */
     static int s_confirm = -1;
-    if (s_confirm < 0) s_confirm = (access("/tmp/isis_noconfirm", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/isis_noconfirm */
+    if (s_confirm < 0) s_confirm = (access("/tmp/atlas_noconfirm", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/atlas_noconfirm */
     m_renderPending = true; m_renderPendingMs = _wlog_ms(); m_lastRenderMs = m_renderPendingMs;
     char js[128];
     if (s_confirm) {
@@ -1175,7 +1232,7 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
             int y0, sh;
             if (delta > 0) { y0 = m_renderHeight - delta; sh = delta; }   /* scrolled down: strip at bottom */
             else           { y0 = 0;                       sh = -delta; } /* scrolled up:   strip at top    */
-            wpe_isis_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
+            wpe_atlas_view_backend_scroll_hint(m_viewBackend, y0, sh, delta);
         }
         m_renderedY = newTop;
         snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", cx, newTop);
@@ -1216,7 +1273,7 @@ void BrowserPageWPE::onScrollConfirm(GObject* obj, GAsyncResult* res, gpointer u
         int y0, sh;
         if (delta > 0) { y0 = self->m_renderHeight - delta; sh = delta; }
         else           { y0 = 0;                            sh = -delta; }
-        wpe_isis_view_backend_scroll_hint(self->m_viewBackend, y0, sh, delta);
+        wpe_atlas_view_backend_scroll_hint(self->m_viewBackend, y0, sh, delta);
     }
     self->m_renderedY = actual;
 }
@@ -1296,12 +1353,12 @@ static gboolean on_sigusr1(gpointer)
         WLOG("SIGUSR1: no testable page (or a test is already running)");
     return G_SOURCE_CONTINUE;   /* keep the handler for repeated runs */
 }
-/* File trigger: the host `touch`es /tmp/isis_scrolltest; polled on the glib loop (which is clearly
+/* File trigger: the host `touch`es /tmp/atlas_scrolltest; polled on the glib loop (which is clearly
  * dispatching — frames render), so it works even though the app-spawned BS has SIGUSR1 masked. */
 static gboolean scrolltest_poll(gpointer)
 {
-    if (access("/tmp/isis_scrolltest", F_OK) == 0) {
-        unlink("/tmp/isis_scrolltest");
+    if (access("/tmp/atlas_scrolltest", F_OK) == 0) {
+        unlink("/tmp/atlas_scrolltest");
         if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end() && !g_st.active)
             g_testablePage->startScrollTest();
         else
@@ -1317,16 +1374,16 @@ void BrowserPageWPE::startScrollTest()
     const char* es = getenv("BPWPE_TEST_STEP"); const char* em = getenv("BPWPE_TEST_MS");
     g_st.step = es ? atoi(es) : 120; if (g_st.step < 1) g_st.step = 120;
     int ms    = em ? atoi(em) : 50;  if (ms < 5) ms = 50;
-    /* /tmp/isis_test.cfg ("<stepPx> <intervalMs>") overrides env, so the host can vary scroll speed
+    /* /tmp/atlas_test.cfg ("<stepPx> <intervalMs>") overrides env, so the host can vary scroll speed
      * per run (slow drag vs fast flick) without relaunching the BS. */
-    FILE* cf = fopen("/tmp/isis_test.cfg", "r");
+    FILE* cf = fopen("/tmp/atlas_test.cfg", "r");
     if (cf) { int s = 0, m = 0; if (fscanf(cf, "%d %d", &s, &m) == 2) { if (s > 0) g_st.step = s; if (m >= 5) ms = m; } fclose(cf); }
     g_st.active = true; g_st.cy = 0; g_st.dir = 1; g_st.maxCy = maxCy;
     g_st.steps = g_st.renders = g_st.uncovered = 0; g_st.maxStallMs = 0;
     WLOG("SCROLLTEST START maxCy=%d step=%d ms=%d pageH=%d screenH=%d renderH=%d deliveredY=%d",
          maxCy, g_st.step, ms, pageH, m_screenHeight, m_renderHeight, m_deliveredY);
     /* Unconditional result file (WLOG needs BPWPE_DEBUG, which the app-spawned BS lacks). */
-    FILE* rf = fopen("/tmp/isis_scrolltest.result", "w");
+    FILE* rf = fopen("/tmp/atlas_scrolltest.result", "w");
     if (rf) { fprintf(rf, "START maxCy=%d step=%d ms=%d pageH=%d screenH=%d renderH=%d bgra?\n",
                       maxCy, g_st.step, ms, pageH, m_screenHeight, m_renderHeight); fclose(rf); }
     g_st.tick = g_timeout_add(ms, scrolltest_tick, nullptr);
@@ -1351,7 +1408,7 @@ void BrowserPageWPE::reportScrollTest()
     int uncoveredPct = g_st.steps ? (g_st.uncovered * 100 / g_st.steps) : 0;
     WLOG("SCROLLTEST DONE steps=%d renders=%d uncovered=%d(%d%%) maxStall=%ldms finalRenderedY=%d finalDeliveredY=%d maxCy=%d",
          g_st.steps, g_st.renders, g_st.uncovered, uncoveredPct, g_st.maxStallMs, m_renderedY, m_deliveredY, g_st.maxCy);
-    FILE* rf = fopen("/tmp/isis_scrolltest.result", "a");
+    FILE* rf = fopen("/tmp/atlas_scrolltest.result", "a");
     if (rf) { fprintf(rf, "DONE steps=%d renders=%d uncovered=%d(%d%%) maxStall=%ldms finalRenderedY=%d finalDeliveredY=%d maxCy=%d\n",
                       g_st.steps, g_st.renders, g_st.uncovered, uncoveredPct, g_st.maxStallMs, m_renderedY, m_deliveredY, g_st.maxCy); fclose(rf); }
 }
@@ -1380,7 +1437,7 @@ void BrowserPageWPE::setZoomAndScroll(double zoom, int sx, int sy)
 }
 
 /* WebKit told us an editable element gained/lost focus (via the IM context). Map the field purpose
- * to the Isis field type and signal the adapter, which raises/hides the webOS virtual keyboard
+ * to the Atlas field type and signal the adapter, which raises/hides the webOS virtual keyboard
  * (msgEditorFocused — the legacy QtWebKit path that was never wired in the WPE port). */
 void BrowserPageWPE::onEditorFocus(bool focused, int purpose)
 {
@@ -1426,7 +1483,7 @@ void BrowserPageWPE::onEditorCheckResult(GObject* obj, GAsyncResult* res, gpoint
  * part on heavy pages). payload = "\x02" username "\x02" password (routed via insertStringAtCursor). We set
  * the password field + its form's first text/email field, dispatching input+change so the site's JS reacts.
  * No-op if the page has no password field (so triggering on any site is safe). */
-static std::string isis_js_escape(const char* s) {
+static std::string atlas_js_escape(const char* s) {
     std::string o;
     for (; s && *s; ++s) {
         unsigned char c = (unsigned char)*s;
@@ -1465,7 +1522,7 @@ void BrowserPageWPE::fillLoginForm(const char* payload)
         "if(t==='text'||t==='email'||t===''){us=list[i];}}"
         "if(us)set(us,u);"
         "set(pw,p);"
-        "})(\"" + isis_js_escape(user.c_str()) + "\",\"" + isis_js_escape(pass.c_str()) + "\")";
+        "})(\"" + atlas_js_escape(user.c_str()) + "\",\"" + atlas_js_escape(pass.c_str()) + "\")";
     WLOG("fillLoginForm: user=%zu pass=%zu chars", user.size(), pass.size());
     webkit_web_view_evaluate_javascript(m_webView, js.c_str(), -1, nullptr, nullptr, nullptr, nullptr, nullptr);
 }
@@ -1554,15 +1611,15 @@ void BrowserPageWPE::onHitTestResult(GObject* obj, GAsyncResult* res, gpointer u
 
 /* Save-image: 2-step async — JS to get the <img> src at the point, then download it (modern TLS) into the
  * requested dir, then respond. State lives in a heap struct freed on finish/fail (like the favicon dl). */
-struct IsisImgDl { BrowserPageWPE* page; int query; std::string dest; gulong hFin, hFail; };
-static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok);
-static void isis_img_dl_finished(WebKitDownload* dl, gpointer ud) { isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), true); }
-static void isis_img_dl_failed(WebKitDownload* dl, GError* e, gpointer ud) {
+struct AtlasImgDl { BrowserPageWPE* page; int query; std::string dest; gulong hFin, hFail; };
+static void atlas_img_dl_done(WebKitDownload* dl, AtlasImgDl* s, bool ok);
+static void atlas_img_dl_finished(WebKitDownload* dl, gpointer ud) { atlas_img_dl_done(dl, static_cast<AtlasImgDl*>(ud), true); }
+static void atlas_img_dl_failed(WebKitDownload* dl, GError* e, gpointer ud) {
     WLOG("saveImg FAILED: %s", (e && e->message) ? e->message : "?");
-    isis_img_dl_done(dl, static_cast<IsisImgDl*>(ud), false);
+    atlas_img_dl_done(dl, static_cast<AtlasImgDl*>(ud), false);
 }
-static gboolean isis_img_decide_dest(WebKitDownload* dl, gchar*, gpointer ud) {
-    webkit_download_set_destination(dl, static_cast<IsisImgDl*>(ud)->dest.c_str()); return TRUE;
+static gboolean atlas_img_decide_dest(WebKitDownload* dl, gchar*, gpointer ud) {
+    webkit_download_set_destination(dl, static_cast<AtlasImgDl*>(ud)->dest.c_str()); return TRUE;
 }
 
 void BrowserPageWPE::saveImageAtPointAsync(int32_t queryNum, int32_t x, int32_t y, const char* dir)
@@ -1594,11 +1651,11 @@ void BrowserPageWPE::onSaveImgSrcResult(GObject* obj, GAsyncResult* res, gpointe
     }
     /* dest filename from the URL basename (or a fixed name for data: URIs) */
     std::string leaf;
-    if (src.compare(0, 5, "data:") == 0) leaf = "isis-image.png";
+    if (src.compare(0, 5, "data:") == 0) leaf = "atlas-image.png";
     else {
         size_t qm = src.find('?'); std::string clean = (qm == std::string::npos) ? src : src.substr(0, qm);
         size_t sl = clean.rfind('/'); leaf = (sl == std::string::npos) ? clean : clean.substr(sl + 1);
-        if (leaf.empty()) leaf = "isis-image";
+        if (leaf.empty()) leaf = "atlas-image";
     }
     mkdir(self->m_saveImgDir.c_str(), 0755);
     std::string dest = self->m_saveImgDir + "/" + leaf;
@@ -1613,19 +1670,19 @@ void BrowserPageWPE::onSaveImgSrcResult(GObject* obj, GAsyncResult* res, gpointe
     WLOG("saveImg q=%d src=%s dest=%s", self->m_saveImgQuery, src.c_str(), dest.c_str());
     WebKitDownload* dl = webkit_web_view_download_uri(self->m_webView, src.c_str());
     if (!dl) { WLOG("saveImg: download_uri returned null"); if (self->m_server) self->m_server->msgSaveImageAtPointResponse(self->m_proxy, self->m_saveImgQuery, false, ""); return; }
-    IsisImgDl* s = new IsisImgDl();
+    AtlasImgDl* s = new AtlasImgDl();
     s->page = self; s->query = self->m_saveImgQuery; s->dest = dest;
     /* WPE 2.40+: decide-destination sets a PATH (not a URI) and returns TRUE. Don't pre-set. */
-    g_signal_connect(dl, "decide-destination", G_CALLBACK(isis_img_decide_dest), s);
-    s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(isis_img_dl_finished), s);
-    s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(isis_img_dl_failed),   s);
+    g_signal_connect(dl, "decide-destination", G_CALLBACK(atlas_img_decide_dest), s);
+    s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(atlas_img_dl_finished), s);
+    s->hFail = g_signal_connect(dl, "failed",   G_CALLBACK(atlas_img_dl_failed),   s);
 }
 void BrowserPageWPE::respondSaveImage(int32_t query, bool ok, const char* path)
 {
     m_saveImgInFlight.clear();   // this download finished (ok or fail) — allow a future save of the same file
     if (m_server && m_proxy) m_server->msgSaveImageAtPointResponse(m_proxy, query, ok, ok ? path : "");
 }
-static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok)
+static void atlas_img_dl_done(WebKitDownload* dl, AtlasImgDl* s, bool ok)
 {
     WLOG("saveImg done q=%d ok=%d dest=%s", s->query, ok, s->dest.c_str());
     if (s->page) s->page->respondSaveImage(s->query, ok, s->dest.c_str());
@@ -1639,6 +1696,7 @@ static void isis_img_dl_done(WebKitDownload* dl, IsisImgDl* s, bool ok)
 void BrowserPageWPE::dispatchPointer(int x, int y, uint32_t button, bool down)
 {
     WLOG("dispatchPointer %d,%d btn=%u down=%d", x, y, button, down);
+    m_userInteracted = true;   // a real tap on the page — subsequent editor focus may raise the VKB
     if (!m_viewBackend) return;
     /* NO tap scaling here. The offscreen now satisfies the legacy contract (buffer holds the page
      * already scaled by contentZoom), so the adapter has ALREADY divided the on-screen tap by
@@ -1664,7 +1722,7 @@ void BrowserPageWPE::dispatchPointer(int x, int y, uint32_t button, bool down)
 
 void BrowserPageWPE::mouseEvent(int type, int contentX, int contentY, int detail)
 {
-    /* type: 0=move 1=down 2=up (Isis BATypes). detail = button. TODO: map content→view coords
+    /* type: 0=move 1=down 2=up (Atlas BATypes). detail = button. TODO: map content→view coords
      * (subtract scroll, apply zoom) once setScrollPosition is wired. */
     const uint32_t BTN_LEFT = 1;
     switch (type) {
@@ -1750,7 +1808,7 @@ void BrowserPageWPE::gestureEvent(int type, int contentX, int contentY, double s
     }
 }
 
-/* The Isis adapter delivers taps as touch events (not mouseEvent/clickAt) — this was a no-op stub,
+/* The Atlas adapter delivers taps as touch events (not mouseEvent/clickAt) — this was a no-op stub,
  * so taps (e.g. the cookie-consent "Accept") never reached the page. Map touches to pointer events
  * so the page gets a real click. */
 void BrowserPageWPE::touchEvent(int type, int32_t touchCount, int32_t /*modifiers*/, const char* touchesJson)
@@ -1772,24 +1830,41 @@ void BrowserPageWPE::touchEvent(int type, int32_t touchCount, int32_t /*modifier
     }
 }
 
+/* webOS/Palm delivers ASCII-based raw key codes (ESC=27, etc.). WPE's keyboard event wants an XKB KEYSYM.
+ * Printable Latin-1 (0x20–0x7e) already IS its keysym, so those pass through (why typing letters worked);
+ * but the control keys need remapping — notably BackSpace (0x08 → 0xff08), or WebKit never deletes. */
+static uint32_t atlas_key_to_keysym(int32_t key)
+{
+    switch (key) {
+        case 8:   return 0xff08;   /* BackSpace */
+        case 9:   return 0xff09;   /* Tab       */
+        case 10:
+        case 13:  return 0xff0d;   /* Return    */
+        case 27:  return 0xff1b;   /* Escape    */
+        case 127: return 0xffff;   /* Delete    */
+        default:  return (uint32_t)key;   /* printable ASCII == its own keysym */
+    }
+}
 void BrowserPageWPE::keyDown(int32_t key, int32_t modifiers, int32_t /*chr*/)
 {
     if (!m_viewBackend) return;
-    /* TODO: map the Isis key code → xkb keysym (wpe/keysyms.h). Passing `key` through for now. */
-    struct wpe_input_keyboard_event ev = { 0, (uint32_t)key, 0, true, (uint32_t)modifiers };
+    uint32_t ks = atlas_key_to_keysym(key);
+    WLOG("keyDown raw=%d(0x%x) -> keysym=0x%x mod=0x%x", key, key, ks, modifiers);
+    struct wpe_input_keyboard_event ev = { 0, ks, (uint32_t)key, true, (uint32_t)modifiers };
     wpe_view_backend_dispatch_keyboard_event(m_viewBackend, &ev);
 }
 void BrowserPageWPE::keyUp(int32_t key, int32_t modifiers, int32_t /*chr*/)
 {
     if (!m_viewBackend) return;
-    struct wpe_input_keyboard_event ev = { 0, (uint32_t)key, 0, false, (uint32_t)modifiers };
+    uint32_t ks = atlas_key_to_keysym(key);
+    struct wpe_input_keyboard_event ev = { 0, ks, (uint32_t)key, false, (uint32_t)modifiers };
     wpe_view_backend_dispatch_keyboard_event(m_viewBackend, &ev);
 }
 
 void BrowserPageWPE::setFocus(bool enable)
 {
     m_focused = enable;
-    if (m_viewBackend) wpe_isis_view_backend_set_visible(m_viewBackend, enable);
+    if (m_viewBackend) wpe_atlas_view_backend_set_visible(m_viewBackend, enable);
 }
 
 /* ---- freeze / thaw (purge offscreens on backgrounding; re-attach on return) ----------------- */
@@ -1798,14 +1873,14 @@ bool BrowserPageWPE::freeze()
     m_frozen = true;
     delete m_offscreen0; m_offscreen0 = 0; m_ownOffscreen0 = false;
     delete m_offscreen1; m_offscreen1 = 0; m_ownOffscreen1 = false;
-    if (m_viewBackend) wpe_isis_view_backend_set_visible(m_viewBackend, false);
+    if (m_viewBackend) wpe_atlas_view_backend_set_visible(m_viewBackend, false);
     return true;
 }
 bool BrowserPageWPE::thaw(int key1, int key2, int size)
 {
     m_frozen = false;
     bool ok = attachToBuffer(m_virtualWindowWidth, m_virtualWindowHeight, key1, key2, size);
-    if (m_viewBackend) wpe_isis_view_backend_set_visible(m_viewBackend, true);
+    if (m_viewBackend) wpe_atlas_view_backend_set_visible(m_viewBackend, true);
     return ok;
 }
 
@@ -1820,7 +1895,7 @@ void BrowserPageWPE::setUserAgent(const char* ua)
     m_userAgent = ua ? ua : "";
 }
 
-/* ---- WPE WebKit signals → Isis adapter notifications --------------------------------------- *
+/* ---- WPE WebKit signals → Atlas adapter notifications --------------------------------------- *
  * These map onto the existing BrowserServerBase msg* notifications the 602 doLoad / titleChanged
  * slots used. Exact method names per BrowserServerBase.h. */
 /* Fill the held offscreen with opaque white + reset pan state, and flush it so the adapter shows a blank
@@ -1834,6 +1909,13 @@ void BrowserPageWPE::clearToWhite()
     BrowserOffscreenQt* off = (buf == 0) ? m_offscreen0 : m_offscreen1;
     if (!off || m_renderWidth <= 0 || m_renderHeight <= 0) return;
     m_renderedY = 0; m_deliveredY = 0; m_pageHeight = 0;   /* new page starts at top; pan off until new height known */
+    /* A fresh page always starts scrolled to the top. If the PREVIOUS page was scrolled (e.g. the user
+     * panned a login form up to see a field behind the VKB), the adapter still holds that scroll offset and
+     * would blit the new (often short) page at that offset — reading past the buffer -> WHITE page. Reset
+     * the engine scroll state AND tell the adapter to scroll to 0 so its blit is identity (same fix the
+     * history-restore branch applies). */
+    m_scrollX = 0; m_scrollY = 0; m_lastScrollY = 0; m_dirStreak = 0; m_scrollVel = 0;
+    if (m_server) m_server->msgScrolledTo(m_proxy, 0, 0);
     unsigned char* dst = off->rasterBuffer();
     if (dst) memset(dst, 0xFF, (size_t)m_renderWidth * m_renderHeight * 4);
     BrowserOffscreenInfo* hdr = off->header();
@@ -1853,6 +1935,7 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
     WLOG("loadChanged ev=%d (0=start 1=redir 2=commit 3=finish) uri=%s", ev, webkit_web_view_get_uri(v) ? webkit_web_view_get_uri(v) : "?");
     switch (ev) {
         case WEBKIT_LOAD_STARTED:
+            self->m_userInteracted = false;   // new page: ignore autofocus VKB grabs until the user taps
             self->m_server->msgLoadStarted(self->m_proxy);
             break;
         case WEBKIT_LOAD_COMMITTED:
@@ -1886,10 +1969,10 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
             {
                 const char* cu = webkit_web_view_get_uri(v);
                 if (cu) {
-                    std::string favDest = isis_favicon_dest_for(cu);
+                    std::string favDest = atlas_favicon_dest_for(cu);
                     if (!favDest.empty()) {
-                        mkdir(ISIS_FAVICON_DIR, 0755);   /* under the app bundle; parent exists; ignore EEXIST */
-                        isis_start_favicon_download(v, cu, favDest);
+                        mkdir(ATLAS_FAVICON_DIR, 0755);   /* under the app bundle; parent exists; ignore EEXIST */
+                        atlas_start_favicon_download(v, cu, favDest);
                         WLOG("favicon prefetch (commit) -> %s", favDest.c_str());
                     }
                 }

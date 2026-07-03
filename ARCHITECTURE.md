@@ -1,14 +1,14 @@
-# WPE-Isis backend — custom libwpe backend for webOS / HP TouchPad
+# WPE-Atlas backend — custom libwpe backend for webOS / HP TouchPad
 
-Bridges WPE WebKit's multiprocess EGL rendering into the Isis BrowserServer's shared-buffer +
+Bridges WPE WebKit's multiprocess EGL rendering into the Atlas BrowserServer's shared-buffer +
 Yap display path, replacing the Qt `QGraphicsView` render the 602 engine used. There is **no
 Wayland compositor** on webOS, so wpebackend-fdo cannot be used — this backend renders WebKit
-offscreen and hands ARGB frames to the existing Isis offscreen buffers.
+offscreen and hands ARGB frames to the existing Atlas offscreen buffers.
 
 ## Process model
 
 ```
- ┌─ UIProcess = Isis BrowserServer ──────────────┐      ┌─ WebProcess (WPEWebProcess) ─────────┐
+ ┌─ UIProcess = Atlas BrowserServer ──────────────┐      ┌─ WebProcess (WPEWebProcess) ─────────┐
  │  WPEWebView                                    │      │                                       │
  │   ├ wpe_view_backend  (this backend)           │      │  wpe_renderer_backend_egl (this)      │
  │   │   • get_renderer_host_fd  ───socketpair────┼──fd──┤   • get_native_display → Adreno EGL   │
@@ -39,33 +39,33 @@ Per view, a `socketpair(AF_UNIX, SOCK_SEQPACKET)`:
   the WebProcess as the target's `create(int)` arg).
 - One shared frame buffer: an **memfd / shm** of `width*height*4`, its fd passed once over the
   socket (SCM_RIGHTS). Both processes `mmap` it. (memfd_create is Linux 3.17 — NOT on kernel
-  2.6.35; use `shm_open` + `ftruncate` or a SysV `shmget`, which the Isis side already uses.)
+  2.6.35; use `shm_open` + `ftruncate` or a SysV `shmget`, which the Atlas side already uses.)
 - Each rendered frame: WebProcess `glReadPixels` into the shared buffer, then sends a 1-byte
   "frame ready" datagram. No 3 MB/frame socket copy.
 
-Double buffering mirrors Isis: two shared frame slots, ping-pong, so the WebProcess can render
+Double buffering mirrors Atlas: two shared frame slots, ping-pong, so the WebProcess can render
 slot N+1 while the UIProcess blits slot N.
 
 ## Pixel format
 
-GL readback is `GL_RGBA`/`GL_UNSIGNED_BYTE` (or `GL_BGRA_EXT` if the Adreno exposes it). Isis
+GL readback is `GL_RGBA`/`GL_UNSIGNED_BYTE` (or `GL_BGRA_EXT` if the Adreno exposes it). Atlas
 wants **ARGB32 premultiplied** = BGRA byte order on little-endian ARM, premultiplied alpha.
 WebKit composits premultiplied, so alpha is fine; a channel swizzle (RGBA→BGRA) is needed unless
 `GL_BGRA_EXT` readback is available (it usually is on Adreno). Also flip vertically (GL origin is
 bottom-left; the offscreen/QImage origin is top-left).
 
-## Isis integration seam
+## Atlas integration seam
 
-The backend stays Isis-agnostic: the view backend invokes a `wpe_isis_frame_handler` callback
+The backend stays Atlas-agnostic: the view backend invokes a `wpe_atlas_frame_handler` callback
 (set by the BrowserServer) with `(argb, width, height, stride)`. The BrowserServer's handler does
-the Isis-specific work — pick the current offscreen, `memcpy` (or row-copy if strides differ) into
+the Atlas-specific work — pick the current offscreen, `memcpy` (or row-copy if strides differ) into
 `m_offscreenN->rasterBuffer()`, then `BrowserPage::flushBuffer(N)`. This keeps the backend
 testable standalone (dump frames to PNG) and confines the Yap/shm/double-buffer protocol to the
 BrowserServer, exactly where the 602 port already implements it.
 
 ## Input
 
-Isis adapter events arrive over Yap (BrowserAdapter → BrowserServer). The BrowserServer translates
+Atlas adapter events arrive over Yap (BrowserAdapter → BrowserServer). The BrowserServer translates
 them into libwpe events and calls `wpe_view_backend_dispatch_{pointer,axis,touch,keyboard}_event`
 on the view backend, which forwards them to the WebProcess. Coordinate space is the virtual page
 (same as the 602 setVisibleSize path).
@@ -80,5 +80,5 @@ pbuffer-config window or the device fbdev native window and still read back via 
 
 ## Build
 
-`libWPEBackend-isis.so`, linked against `libwpe-1.0`, `libEGL`/`libGLESv2` (stubs at build,
-device Adreno at runtime). Run WebKit with `WPE_BACKEND_LIBRARY=libWPEBackend-isis.so`.
+`libWPEBackend-atlas.so`, linked against `libwpe-1.0`, `libEGL`/`libGLESv2` (stubs at build,
+device Adreno at runtime). Run WebKit with `WPE_BACKEND_LIBRARY=libWPEBackend-atlas.so`.

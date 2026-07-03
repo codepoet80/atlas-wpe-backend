@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-build the Isis BrowserServer with the WPE WebKit engine (glibc-2.23 toolchain).
+# Cross-build the Atlas BrowserServer with the WPE WebKit engine (glibc-2.23 toolchain).
 # BrowserPage is the WPE implementation (src/BrowserPage.{h,cpp} = merged BrowserPageWPE); the QtWebKit
 # engine (libWebKitLuna/v8) is dropped. QtWebKit headers are pulled compile-only (QT_NO_KEYWORDS) for the
 # legacy interface TYPES (QWebHitTestResult etc.) — see §8 of BROWSERSERVER-INTEGRATION-PLAN.md for the
@@ -10,7 +10,7 @@ SRC=$WPE/browserserver-wpe/src; OBJ=$WPE/browserserver-wpe/obj; L=$WPE/logs
 . "${WPE_ENV:-$WPE/env-glibc.sh}"
 mkdir -p "$OBJ"
 [ -d "$SRC" ] || cp -r "$BS/Src" "$SRC"
-# re-merge src/BrowserPage.{h,cpp} from the canonical backend-isis/BrowserPageWPE.* (orig enums + WPE class)
+# re-merge src/BrowserPage.{h,cpp} from the canonical backend-atlas/BrowserPageWPE.* (orig enums + WPE class)
 python3 - "$BS" "$WPE" "$SRC" <<'PYMERGE'
 import sys
 BS,WPE,SRC=sys.argv[1:4]
@@ -23,15 +23,15 @@ def block(t,n):
             d-=1
             if d==0: return i, t.index(';',k)+1
         k+=1
-orig=open(f'{BS}/Src/BrowserPage.h').read(); wpe=open(f'{WPE}/backend-isis/BrowserPageWPE.h').read()
+orig=open(f'{BS}/Src/BrowserPage.h').read(); wpe=open(f'{WPE}/backend-atlas/BrowserPageWPE.h').read()
 o0,o1=block(orig,'BrowserPage'); w0,w1=block(wpe,'BrowserPageWPE')
 wc=wpe[w0:w1].replace('BrowserPageWPE','BrowserPage')
 open(f'{SRC}/BrowserPage.h','w').write(orig[:o0]+'#include <wpe/webkit.h>\n#include <semaphore.h>\n\n'+wc+orig[o1:])
-open(f'{SRC}/BrowserPage.cpp','w').write(open(f'{WPE}/backend-isis/BrowserPageWPE.cpp').read().replace('BrowserPageWPE','BrowserPage'))
+open(f'{SRC}/BrowserPage.cpp','w').write(open(f'{WPE}/backend-atlas/BrowserPageWPE.cpp').read().replace('BrowserPageWPE','BrowserPage'))
 PYMERGE
 SI=$DS/build-deps/staging/include
 CF=$(pkg-config --cflags wpe-webkit-2.0 wpe-1.0 glib-2.0 2>/dev/null)
-INC="-I$WPE/browserserver-wpe -I$SRC -I$BS/Yap -I$WPE/backend-isis \
+INC="-I$WPE/browserserver-wpe -I$SRC -I$BS/Yap -I$WPE/backend-atlas \
  -I$SI -I$SI/webkit -I$SI/QtCore -I$SI/QtGui -I$SI/QtNetwork -I$SI/QtWebKit -I$SI/WebKitSupplemental \
  -I$DS/build-deps/WebKitSupplemental/misc"
 DEF="-DQT_NO_KEYWORDS -DNDEBUG -D_GLIBCXX_USE_CXX11_ABI=0 -Demit="

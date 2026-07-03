@@ -1,9 +1,9 @@
 /*
- * BrowserPageWPE.h — WPE WebKit replacement for the QtWebKit-602 BrowserPage in the Isis
- * BrowserServer. Keeps the entire Isis output path (offscreen double buffer, flushBuffer,
+ * BrowserPageWPE.h — WPE WebKit replacement for the QtWebKit-602 BrowserPage in the Atlas
+ * BrowserServer. Keeps the entire Atlas output path (offscreen double buffer, flushBuffer,
  * msgPainted, the buffer-lock handshake with the adapter) and the QBsClient command surface;
  * swaps the QGraphicsWebView/WebOSWebPage rendering for a WebKitWebView driven by the custom
- * libwpe backend (wpe-isis-backend). The BrowserServer creates one of these per proxy instead
+ * libwpe backend (wpe-atlas-backend). The BrowserServer creates one of these per proxy instead
  * of a BrowserPage (A/B switchable, as the 602 was switched in against 537).
  *
  * Scope of this skeleton: the browse path (attach buffers, load, render→flush, input,
@@ -41,7 +41,7 @@ public:
     BrowserPageWPE(BrowserServer* server, YapProxy* proxy);
     virtual ~BrowserPageWPE();
 
-    // ---- Isis buffer / lifecycle (kept from BrowserPage) ----
+    // ---- Atlas buffer / lifecycle (kept from BrowserPage) ----
     bool attachToBuffer(uint32_t virtualPageWidth, uint32_t virtualPageHeight,
                         int sharedBufferKey1, int sharedBufferKey2, int sharedBufferSize);
     void bufferReturned(int32_t sharedBufferKey);
@@ -85,6 +85,7 @@ public:
     void keyUp(int32_t key, int32_t modifiers, int32_t chr);
     void setFocus(bool enable);
     void onEditorFocus(bool focused, int purpose);   // IM-context focus → msgEditorFocused (raises webOS VKB)
+    bool m_userInteracted = false;                    // gate IME autofocus: only raise the VKB after a user tap (reset per navigation)
 
     // ---- proxy / identity ----
     YapProxy* getProxy() { return m_proxy; }
@@ -108,7 +109,7 @@ public:
         if (!m_webView) return 0;
         /* On-demand reader extraction trigger (app calls viewCall findString with this magic on
          * reader-open) — extract from the CURRENT DOM, no wait for full page load. */
-        if (str && strcmp(str, "__ISIS_EXTRACT__") == 0) { extractReaderContent(); return 1; }
+        if (str && strcmp(str, "__ATLAS_EXTRACT__") == 0) { extractReaderContent(); return 1; }
         WebKitFindController* fc = webkit_web_view_get_find_controller(m_webView);
         if (!str || !*str) { webkit_find_controller_search_finish(fc); m_lastFind.clear(); return 0; }  /* "" = reset/close (legacy findInPage("")) */
         guint32 o = WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | WEBKIT_FIND_OPTIONS_WRAP_AROUND |
@@ -210,8 +211,8 @@ private:
     static void onProgressChanged(GObject*, GParamSpec*, gpointer);
     static int  onDecidePolicy(WebKitWebView*, WebKitPolicyDecision*, WebKitPolicyDecisionType, gpointer);  // unsupported-mime → download handoff
 
-    // Feature 6: isis: internal scheme (isis:about diagnostics page)
-    static void     onIsisScheme(WebKitURISchemeRequest* req, gpointer ud);
+    // Feature 6: atlas: internal scheme (atlas:about diagnostics page)
+    static void     onAtlasScheme(WebKitURISchemeRequest* req, gpointer ud);
     // Feature 7: SSL cert + HTTP auth dialogs (round-trip to app UI via the sync reply pipe)
     static gboolean onAuthenticate(WebKitWebView*, WebKitAuthenticationRequest*, gpointer);
     static gboolean onTlsErrors(WebKitWebView*, const char* uri, GTlsCertificate*, GTlsCertificateFlags, gpointer);
@@ -231,12 +232,15 @@ private:
     int m_hitTestQuery = 0;                  // Feature 9: queryNum echoed in the hit-test/save-image response
     int m_saveImgQuery = 0;
     static void onLoginCapture(GObject*, GAsyncResult*, gpointer);   // save-login: form-submit snapshot → msgActionData("saveLogin")
+    static gboolean onLoginDeferTimeout(gpointer);                   // failsafe: resume a deferred login-snapshot navigation if the capture callback never fires
     static void onCopyText(GObject*, GAsyncResult*, gpointer);       // copy: selection text → msgActionData("copiedText")
     int m_dragX = 0, m_dragY = 0;            // web-content drag: tracked document-space pointer position
     std::string m_saveImgDir;                // Feature 9: dir to save the image into (/media/internal or /tmp)
     std::string m_saveImgInFlight;           // dest of an in-progress save — drop a duplicate so two downloads don't collide on one file
+    WebKitPolicyDecision* m_loginDecision = nullptr;  // held form-submit decision — navigation deferred until the save-login snapshot completes
+    gint64 m_lastLoginDeferMs = 0;                    // monotonic ms of the last deferral — suppression window so the post-login redirect (also type=OTHER) isn't stalled
 
-    // ---- Isis members (mirror BrowserPage) ----
+    // ---- Atlas members (mirror BrowserPage) ----
     BrowserServer*      m_server;
     YapProxy*           m_proxy;
     char*               m_identifier;
@@ -277,7 +281,7 @@ private:
     WebKitWebView*           m_webView;
     std::string              m_userAgent;
     std::string              m_lastFind;     // last find query → new vs next/prev (highlight-all stays up)
-    int                      m_memLimit = 480;        // Feature 6: WebProcess memory budget (MB) shown in isis:about
+    int                      m_memLimit = 480;        // Feature 6: WebProcess memory budget (MB) shown in atlas:about
     BrowserSyncReplyPipe*    m_syncReplyPipe = nullptr; // Feature 7: lazily-created sync pipe for SSL/auth dialogs
 };
 

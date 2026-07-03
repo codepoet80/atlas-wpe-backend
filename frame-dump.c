@@ -1,24 +1,24 @@
 /*
- * frame-dump.c — standalone WPE WebKit render test for the Isis backend. No BrowserServer/Qt/Yap.
- * Loads a URL through libWPEBackend-isis and writes each rendered frame to a PNG, so the EGL surface
+ * frame-dump.c — standalone WPE WebKit render test for the Atlas backend. No BrowserServer/Qt/Yap.
+ * Loads a URL through libWPEBackend-atlas and writes each rendered frame to a PNG, so the EGL surface
  * path + readback can be validated in isolation on-device before touching the BrowserServer.
  *
- * Build:  build.sh  (produces ./frame-dump alongside libWPEBackend-isis.so)
+ * Build:  build.sh  (produces ./frame-dump alongside libWPEBackend-atlas.so)
  *
  * Run on device (musl binaries on a glibc device — needs the musl loader present):
  *   # one-time: make the musl interpreter resolvable for the exec'd WPEWebProcess
- *   mount -o remount,rw /; ln -sf /media/internal/isis2/lib/ld-musl-arm.so.1 /lib/ld-musl-arm.so.1
- *   export LD_LIBRARY_PATH=/media/internal/isis2/lib
- *   export WPE_BACKEND_LIBRARY=/media/internal/isis2/lib/libWPEBackend-isis.so
- *   export WEBKIT_EXEC_PATH=/media/internal/isis2/libexec/wpe-webkit-1.0   # where WPEWebProcess lives
- *   export WEBKIT_INJECTED_BUNDLE_PATH=/media/internal/isis2/lib/wpe-webkit-1.0/injected-bundle
- *   /media/internal/isis2/lib/ld-musl-arm.so.1 --library-path /media/internal/isis2/lib \
- *       /media/internal/isis2/frame-dump https://example.com /tmp/frame_
+ *   mount -o remount,rw /; ln -sf /media/internal/atlas2/lib/ld-musl-arm.so.1 /lib/ld-musl-arm.so.1
+ *   export LD_LIBRARY_PATH=/media/internal/atlas2/lib
+ *   export WPE_BACKEND_LIBRARY=/media/internal/atlas2/lib/libWPEBackend-atlas.so
+ *   export WEBKIT_EXEC_PATH=/media/internal/atlas2/libexec/wpe-webkit-1.0   # where WPEWebProcess lives
+ *   export WEBKIT_INJECTED_BUNDLE_PATH=/media/internal/atlas2/lib/wpe-webkit-1.0/injected-bundle
+ *   /media/internal/atlas2/lib/ld-musl-arm.so.1 --library-path /media/internal/atlas2/lib \
+ *       /media/internal/atlas2/frame-dump https://example.com /tmp/frame_
  *
  * Watch stderr: "[harness] wrote frame_000.png" = success; WebKit "Cannot create EGL ... surface"
  * means the Adreno rejected the target_get_native_window strategy (try the alternatives there).
  */
-#include "wpe-isis-backend.h"
+#include "wpe-atlas-backend.h"
 #include <wpe/webkit.h>
 #include <glib.h>
 #include <png.h>
@@ -119,14 +119,14 @@ int main(int argc, char** argv)
     int H = (argc > 4) ? atoi(argv[4]) : 768;
 
     /* Only set if the user didn't (allows overriding with a full path). */
-    setenv("WPE_BACKEND_LIBRARY", "libWPEBackend-isis.so", 0);
+    setenv("WPE_BACKEND_LIBRARY", "libWPEBackend-atlas.so", 0);
 
     const char* nav2 = getenv("WPE_DUMP_NAV2");   /* set to a 2nd URL to test in-process re-render */
     struct ctx c = { g_main_loop_new(NULL, FALSE), 0, /*max_frames*/ 6, prefix, NULL, nav2, 1 };
 
     fprintf(stderr, "[m] pre-backend\n"); fflush(stderr);
     /* no fit-to-screen downscale in the dump harness (0,0 = 1:1) */
-    struct wpe_view_backend* vb = wpe_isis_view_backend_create((uint32_t)W, (uint32_t)H, 0, 0, on_frame, &c);
+    struct wpe_view_backend* vb = wpe_atlas_view_backend_create((uint32_t)W, (uint32_t)H, 0, 0, on_frame, &c);
     fprintf(stderr, "[m] vb=%p\n", (void*)vb); fflush(stderr);
     WebKitWebViewBackend* wvb = webkit_web_view_backend_new(vb, NULL, NULL);
     fprintf(stderr, "[m] wvb=%p\n", (void*)wvb); fflush(stderr);

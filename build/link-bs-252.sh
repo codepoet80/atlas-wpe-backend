@@ -12,9 +12,9 @@ RL=$DS/untouched-rootfs
 
 $CXX -o $OBJ/BrowserServer-wpe $OBJ/*.o \
   -Wl,--dynamic-linker=/media/internal/wpe-252/lib/ld-linux.so.3 \
-  -Wl,-rpath=/media/internal/wpe-252/lib:/media/internal/isis:/usr/lib:/lib \
-  -L$STAGING/lib -L$WPE/backend-isis -L$DEVLIB \
-  -lWPEWebKit-2.0 -lwpe-1.0 -lWPEBackend-isis \
+  -Wl,-rpath=/media/internal/wpe-252/lib:/media/internal/atlas:/usr/lib:/lib \
+  -L$STAGING/lib -L$WPE/backend-atlas -L$DEVLIB \
+  -lWPEWebKit-2.0 -lwpe-1.0 -lWPEBackend-atlas \
   -lglib-2.0 -lgobject-2.0 -lgio-2.0 -lgthread-2.0 -lpng16 \
   -lQtCore -lQtGui -lQtNetwork \
   -lssl -lcrypto -llunaservice -lpbnjson_cpp -lpbnjson_c -lyajl -luriparser \

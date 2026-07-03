@@ -3,5 +3,5 @@
 eglprobe
 eglprobe-glibc
 frame-dump
-libWPEBackend-isis.so
+libWPEBackend-atlas.so
 gctest/*.o

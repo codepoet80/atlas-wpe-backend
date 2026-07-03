@@ -1,15 +1,15 @@
 /*
- * isis-wpe-glue.cpp — SKETCH of the BrowserServer (UIProcess) side wiring the Isis WPE backend
+ * atlas-wpe-glue.cpp — SKETCH of the BrowserServer (UIProcess) side wiring the Atlas WPE backend
  * into a WebKitWebView. This is reference glue for the BrowserServer port, not a standalone file;
  * the members (m_offscreen0/1, flushBuffer, m_proxy ...) map onto the existing BrowserPage.
  *
  * Run env (autostart job):
- *   WPE_BACKEND_LIBRARY=/media/internal/isis2/lib/libWPEBackend-isis.so
- *   LD_LIBRARY_PATH=/media/internal/isis2/lib   (deploy bundle; device Adreno provides libEGL/GLESv2)
- *   ld-musl-arm.so.1 --library-path /media/internal/isis2/lib ./WPEWebProcess  (musl interp)
+ *   WPE_BACKEND_LIBRARY=/media/internal/atlas2/lib/libWPEBackend-atlas.so
+ *   LD_LIBRARY_PATH=/media/internal/atlas2/lib   (deploy bundle; device Adreno provides libEGL/GLESv2)
+ *   ld-musl-arm.so.1 --library-path /media/internal/atlas2/lib ./WPEWebProcess  (musl interp)
  */
 
-#include "wpe-isis-backend.h"
+#include "wpe-atlas-backend.h"
 #include <wpe/webkit.h>          /* WPE WebKit C API: WebKitWebView, webkit_web_view_backend_new */
 #include <cstring>
 
@@ -19,7 +19,7 @@ class BrowserPageWPE {
 public:
     void init(uint32_t width, uint32_t height);
     void loadUrl(const char* uri);
-    // Isis ↔ WebKit input bridges (called from the Yap command handlers):
+    // Atlas ↔ WebKit input bridges (called from the Yap command handlers):
     void mouseEvent(int type, int x, int y, int button);
     void keyEvent(int type, int keysym, int modifiers);
 
@@ -38,17 +38,17 @@ private:
     void flushBuffer(int buffer);                 // -> m_server->msgPainted(m_proxy, key)
 };
 
-// 1) Bring up a WPE web view backed by the Isis frame sink. ----------------------------------
+// 1) Bring up a WPE web view backed by the Atlas frame sink. ----------------------------------
 void BrowserPageWPE::init(uint32_t width, uint32_t height)
 {
     m_width = width; m_height = height;
 
     // Our custom view backend; `this` is delivered back to onFrame() as userdata.
-    m_viewBackend = wpe_isis_view_backend_create(width, height, &BrowserPageWPE::onFrame, this);
+    m_viewBackend = wpe_atlas_view_backend_create(width, height, &BrowserPageWPE::onFrame, this);
 
     WebKitWebViewBackend* vb = webkit_web_view_backend_new(m_viewBackend, nullptr, nullptr);
 
-    // One shared web context per BrowserServer; cookies/cache point at /media/internal/isis2.
+    // One shared web context per BrowserServer; cookies/cache point at /media/internal/atlas2.
     WebKitWebContext* ctx = webkit_web_context_get_default();
     m_webView = webkit_web_view_new_with_context(vb, ctx);   // (or _new(vb) on this API level)
 
@@ -62,7 +62,7 @@ void BrowserPageWPE::loadUrl(const char* uri)
 }
 
 // 2) THE SEAM: a rendered ARGB frame arrives on the UIProcess main thread. --------------------
-//    Drop it into the current Isis offscreen and flush exactly like the 602 path did.
+//    Drop it into the current Atlas offscreen and flush exactly like the 602 path did.
 void BrowserPageWPE::onFrame(void* ud, const uint8_t* argb, uint32_t w, uint32_t h, uint32_t stride)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
@@ -98,7 +98,7 @@ void BrowserPageWPE::keyEvent(int type, int keysym, int modifiers)
 {
     struct wpe_input_keyboard_event ev;
     memset(&ev, 0, sizeof(ev));
-    ev.key_code = keysym;                  // map Isis key → xkb keysym (wpe/keysyms.h)
+    ev.key_code = keysym;                  // map Atlas key → xkb keysym (wpe/keysyms.h)
     ev.modifiers = modifiers;
     ev.pressed = (type == /*down*/1);
     wpe_view_backend_dispatch_keyboard_event(m_viewBackend, &ev);
@@ -106,7 +106,7 @@ void BrowserPageWPE::keyEvent(int type, int keysym, int modifiers)
 
 /*
  * Status / next on-device steps:
- *  - The backend .so builds (libWPEBackend-isis.so). This glue is the BrowserServer integration
+ *  - The backend .so builds (libWPEBackend-atlas.so). This glue is the BrowserServer integration
  *    point; it slots into BrowserPage where the 602 QGraphicsView render used to live.
  *  - First device bring-up: confirm the Adreno EGL surface mode (target_get_native_window strategy).
  *    Run WPEWebProcess once, watch for "Cannot create EGL ... surface" — that decides surfaceless

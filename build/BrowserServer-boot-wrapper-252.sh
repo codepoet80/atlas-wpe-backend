@@ -1,7 +1,7 @@
 #!/bin/sh
-# WPE 2.52 BrowserServer BOOT wrapper. Deployed to /media/internal/isis/BrowserServer and exec'd by the
-# `isisbrowser` upstart job (which passes `-platform qbs`; we ignore it and force Minimal). This is the
-# file that must live at /media/internal/isis/BrowserServer — the real ELF is $D/BrowserServer-wpe.
+# WPE 2.52 BrowserServer BOOT wrapper. Deployed to /media/internal/atlas/BrowserServer and exec'd by the
+# `atlas` upstart job (which passes `-platform qbs`; we ignore it and force Minimal). This is the
+# file that must live at /media/internal/atlas/BrowserServer — the real ELF is $D/BrowserServer-wpe.
 #
 # Two things ONLY this wrapper does (both were lost when the raw ELF was mistakenly put over this path):
 #   1. GIO_MODULE_DIR + GIO_USE_TLS=openssl  -> the GnuTLS/OpenSSL GIO module (libgioopenssl.so) that
@@ -20,16 +20,16 @@ sleep 3
 mount -o remount,size=131072k /dev 2>/dev/null
 
 unset LD_PRELOAD
-D=/media/internal/wpe-252; ISIS=/media/internal/isis
-cp -f $D/lib/libWPEBackend-isis.so $D/lib/libWPEBackend-default.so 2>/dev/null
+D=/media/internal/wpe-252; ATLAS=/media/internal/atlas
+cp -f $D/lib/libWPEBackend-atlas.so $D/lib/libWPEBackend-default.so 2>/dev/null
 [ -f $D/fonts.conf ] || cp /media/internal/wpe-238/fonts.conf $D/fonts.conf 2>/dev/null
 
 export BPWPE_DEBUG=1
-export LD_LIBRARY_PATH=$D/lib:$ISIS:/usr/lib/ssl11:/usr/lib:/lib
-export WPE_BACKEND_LIBRARY=$D/lib/libWPEBackend-isis.so
+export LD_LIBRARY_PATH=$D/lib:$ATLAS:/usr/lib/ssl11:/usr/lib:/lib
+export WPE_BACKEND_LIBRARY=$D/lib/libWPEBackend-atlas.so
 export QT_QPA_PLATFORM=Minimal QT_QPA_PLATFORM_PLUGIN_PATH=/usr/plugins/platforms QT_PLUGIN_PATH=/usr/plugins
 export FONTCONFIG_FILE=$D/fonts.conf GIO_MODULE_DIR=$D/lib/gio/modules GIO_USE_TLS=openssl SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-cd $ISIS
-rm -f /tmp/yapserver.isisbrowser*
+cd $ATLAS
+rm -f /tmp/yapserver.atlas*
 exec $D/BrowserServer-wpe -platform Minimal >/tmp/bs.log 2>&1
