@@ -1,0 +1,158 @@
+WPE WebKit 2.52.4 — softfp JIT enablement for the HP TouchPad (Atlas browser)
+
+Cortex-A8 / softfp / Thumb2 target (webOS 3.0.5 system libs are softfp). Three changes:
+
+1. JavaScriptCore/jit/CCallHelpers.h — restore soft-float FP-call ABI marshalling (ported from
+   WebKit 2.34.6). Modern WebKit hardcodes the hardfp convention (doubles in d0/d1); on our softfp
+   build the C operations (fmod/floor/ceil/round/...) read GP register pairs, so JIT-emitted calls
+   returned garbage. Passes double args in even-aligned GP register pairs and reads double returns
+   from r0:r1. Guarded #if CPU(ARM_THUMB2) && !CPU(ARM_HARDFP) so hardfp builds are unaffected.
+   This is what makes DFG correct (modulo/Math were wrong before).
+
+2. JavaScriptCore/assembler/CPU.h — relax the prologueStackPointerDelta #error guard.
+3. WTF/wtf/PlatformEnable.h — JIT/DFG enablement gates.
+
+Apply from the WebKit source root with: patch -p1 < wpewebkit-2.52.4-softfp-jit.patch
+
+--- a/Source/JavaScriptCore/jit/CCallHelpers.h
++++ b/Source/JavaScriptCore/jit/CCallHelpers.h
+@@ -328,6 +328,20 @@
+         return result;
+     }
+ 
++#if CPU(ARM_THUMB2) && !CPU(ARM_HARDFP)
++    // ARM-softfp: move each double from its source FPR into the assigned GP register pair (dest, dest+1).
++    // Emitted after the GPR shuffle in the base case so it can't clobber an already-shuffled GPR argument.
++    template<unsigned NumCrossSources, unsigned NumberOfRegisters>
++    ALWAYS_INLINE void setupStubCrossArgs(std::array<GPRReg, NumberOfRegisters> destinations, std::array<FPRReg, NumberOfRegisters> sources)
++    {
++        for (unsigned i = 0; i < NumCrossSources; i++) {
++            GPRReg dest = destinations[i];
++            FPRReg source = sources[i];
++            moveDoubleToInts(source, dest, static_cast<GPRReg>(dest + 1));
++        }
++    }
++#endif
++
+     ALWAYS_INLINE unsigned calculatePokeOffset(unsigned currentGPRArgument, unsigned currentFPRArgument, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke)
+     {
+         // Clang claims that it cannot find the symbol for FPRReg/GPRReg::numberOfArgumentRegisters when they are passed directly to std::max... seems like a bug
+@@ -428,7 +442,34 @@
+     {
+         static_assert(std::is_same_v<CURRENT_ARGUMENT_TYPE, double>, "We should only be passing FPRRegs to a double. We use moveDouble / loadDouble / storeDouble exclusively");
+ 
+-        // ARM (hardfp, which we require) passes FP arguments in FP registers.
++#if !CPU(ARM_HARDFP)
++        // ARM-softfp (webOS 3.0.5 system libs are softfp): doubles are passed in GP register pairs
++        // (r0:r1, r2:r3, 8-byte aligned), then on the stack. Restored from WebKit 2.34; upstream dropped
++        // softfp FP-arg support assuming hardfp. Without this the JIT puts the double in d0/d1 while the
++        // softfp-compiled C operation (fmod/floor/ceil/round/...) reads r0:r1 -> garbage. The FPR->GPRpair
++        // move is deferred to setupStubCrossArgs (emitted after the GPR shuffle in the base case).
++        unsigned numberOfGPArgumentRegisters = GPRInfo::numberOfArgumentRegisters;
++        unsigned currentGPArgCount = argSourceRegs.argCount(GPRInfo::argumentGPR0);
++        unsigned alignedGPArgCount = roundUpToMultipleOf<2>(currentGPArgCount);
++
++        if (alignedGPArgCount + 1 < numberOfGPArgumentRegisters) {
++            auto updatedArgSourceRegs = argSourceRegs.pushRegArg(arg, GPRInfo::toArgumentRegister(alignedGPArgCount));
++
++            if (alignedGPArgCount > currentGPArgCount)
++                setupArgumentsImpl<OperationType>(updatedArgSourceRegs.addGPRExtraArg().addGPRExtraArg().addGPRExtraArg(), args...);
++            else
++                setupArgumentsImpl<OperationType>(updatedArgSourceRegs.addGPRExtraArg().addGPRExtraArg(), args...);
++
++            return;
++        }
++
++        if (currentGPArgCount < numberOfGPArgumentRegisters) {
++            pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs + 1, nonArgGPRs, extraPoke);
++            setupArgumentsImpl<OperationType>(argSourceRegs.addGPRExtraArg().addStackArg(arg).addPoke(), args...);
++            return;
++        }
++#else
++        // ARM (hardfp) passes FP arguments in FP registers.
+         unsigned numberOfFPArgumentRegisters = FPRInfo::numberOfArgumentRegisters;
+         unsigned currentFPArgCount = argSourceRegs.argCount(arg);
+ 
+@@ -437,6 +478,7 @@
+             setupArgumentsImpl<OperationType>(updatedArgSourceRegs, args...);
+             return;
+         }
++#endif
+ 
+         // Otherwise pass FP argument on stack.
+         if (stackAligned(numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke)) {
+@@ -659,7 +701,12 @@
+         static_assert(fprArgsCount<TraitsType>(std::make_index_sequence<TraitsType::arity>()) == numFPRArgs);
+ 
+         shuffleRegisters<GPRReg, numGPRSources>(clampArrayToSize<numGPRSources, GPRReg>(argSourceRegs.gprSources), clampArrayToSize<numGPRSources, GPRReg>(argSourceRegs.gprDestinations));
++#if CPU(ARM_THUMB2) && !CPU(ARM_HARDFP)
++        // ARM-softfp: emit the deferred FPR -> GP-register-pair moves for double arguments.
++        setupStubCrossArgs<numCrossSources>(argSourceRegs.crossDestinations, argSourceRegs.crossSources);
++#else
+         static_assert(!numCrossSources, "shouldn't be used on this architecture.");
++#endif
+ 
+         shuffleRegisters<FPRReg, numFPRSources>(clampArrayToSize<numFPRSources, FPRReg>(argSourceRegs.fprSources), clampArrayToSize<numFPRSources, FPRReg>(argSourceRegs.fprDestinations));
+     }
+@@ -740,8 +787,14 @@
+     
+     void setupResults(FPRReg destA)
+     {
+-        if (destA != InvalidFPRReg)
++        if (destA != InvalidFPRReg) {
++#if CPU(ARM_THUMB2) && !CPU(ARM_HARDFP)
++            // ARM-softfp: a double return comes back in the GP register pair r0:r1, not d0.
++            moveIntsToDouble(GPRInfo::returnValueGPR, GPRInfo::returnValueGPR2, destA);
++#else
+             moveDouble(FPRInfo::returnValueFPR, destA);
++#endif
++        }
+     }
+ 
+     void jumpToExceptionHandler(VM& vm)
+--- a/Source/JavaScriptCore/assembler/CPU.h
++++ b/Source/JavaScriptCore/assembler/CPU.h
+@@ -206,8 +206,11 @@
+ #elif CPU(X86_64)
+     // Prologue only saves the framePointerRegister
+     return sizeof(CPURegister);
+-#elif CPU(ARM_THUMB2) || CPU(ARM64) || CPU(RISCV64)
+-    // Prologue saves the framePointerRegister and linkRegister
++#elif CPU(ARM_THUMB2) || CPU(ARM64) || CPU(RISCV64) || CPU(ARM_TRADITIONAL)
++    // Prologue saves the framePointerRegister and linkRegister.
++    // ARM_TRADITIONAL added so TUs compiled -marm (WebsiteDataStore surgical arm-codegen
++    // workaround for the gcc-12.5 Thumb2 miscompile) can include this header; same layout as Thumb2,
++    // and these TUs never run the JIT prologue so the value is inert for them.
+     return 2 * sizeof(CPURegister);
+ #else
+ #error unsupported architectures
+--- a/Source/WTF/wtf/PlatformEnable.h
++++ b/Source/WTF/wtf/PlatformEnable.h
+@@ -725,17 +725,24 @@
+ #endif
+ 
+ #if USE(JSVALUE32_64)
+-#if CPU(ARM_THUMB2) && CPU(ARM_HARDFP) && OS(LINUX)
++/* ISIS: dropped the CPU(ARM_HARDFP) requirement — JSC's JIT/assembler has NO hard-float-specific codegen
++ * (CPU(ARM_HARDFP) is referenced only in its own definition), so the hard-float gate is a conservative policy,
++ * not a codegen dependency. The TouchPad runtime is softfp; enabling the Thumb2 JIT here (was C_LOOP). */
++#if CPU(ARM_THUMB2) && OS(LINUX)
+ /* On ARMv7 Linux the JIT is enabled unless explicitly disabled. */
+ #if !defined(ENABLE_JIT)
+ #define ENABLE_JIT 1
+ #endif
+ #else
+-/* Disable JIT on all other 32bit architectures. */
+-#undef ENABLE_JIT
++/* Disable JIT on other 32-bit archs — but ONLY if cmakeconfig didn't already set it. The ISIS split build
++ * compiles WebCore/WebKit as -marm (CPU(ARM_THUMB2) false there) while JSC stays Thumb2; ENABLE_JIT must be
++ * CONSISTENTLY 1 across all TUs (the JIT lives in JSC; other frameworks only use JIT-aware code paths), so
++ * don't clobber the cmakeconfig-defined value here. */
++#if !defined(ENABLE_JIT)
+ #define ENABLE_JIT 0
+ #endif
+ #endif
++#endif
+ 
+ #if CPU(RISCV64)
+ #undef ENABLE_WEBASSEMBLY

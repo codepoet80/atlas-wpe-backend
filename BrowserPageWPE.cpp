@@ -1586,7 +1586,7 @@ void BrowserPageWPE::hitTestAsync(int32_t queryNum, int32_t cx, int32_t cy)
         /* link: nearest ancestor A[href] of anything in the stack */
         "var lk=null;for(var i=0;i<st.length&&!lk;i++){var p=st[i];while(p){if(p.tagName==='A'&&p.getAttribute('href')){lk=p;break;}p=p.parentElement;}}"
         /* image: an IMG in the stack (or a descendant), else the first CSS background-image up the tree */
-        "var im=null,bg='';for(var j=0;j<st.length&&!im;j++){var s=st[j];if(s.tagName==='IMG'){im=s;break;}var qq=s.querySelector&&s.querySelector('img');if(qq){im=qq;break;}}"
+        "var im=null,bg='';for(var j=0;j<st.length&&!im;j++){if(st[j].tagName==='IMG'){im=st[j];break;}}"
         "if(!im){for(var k=0;k<st.length&&!bg;k++){var d=st[k];while(d&&d.nodeType===1){var cs=getComputedStyle(d);var bi=cs&&cs.backgroundImage;if(bi&&bi.indexOf('url(')>-1){var m=bi.match(/url\\((\"|')?([^\"')]+)/);if(m){bg=m[2];break;}}d=d.parentElement;}}}"
         "var ed=false,c=e;while(c){var t=c.tagName;if(t==='INPUT'||t==='TEXTAREA'||c.isContentEditable){ed=true;break;}c=c.parentElement;}"
         "var r={isNull:false,isLink:!!lk,isImage:!!(im||bg),element:(e.tagName||'').toUpperCase(),editable:ed,x:%d,y:%d};"
