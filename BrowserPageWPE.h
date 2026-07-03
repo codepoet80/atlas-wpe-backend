@@ -206,6 +206,8 @@ private:
 
     // WPE WebKit signal handlers
     static void onLoadChanged(WebKitWebView*, WebKitLoadEvent, gpointer);
+    static gboolean perfTimingTimeout(gpointer);                     // 1.2s after finish -> dump Navigation Timing
+    static void onPerfTiming(GObject*, GAsyncResult*, gpointer);     // timing result -> WLOG("PERF ...")
     static void onLoadFailed(WebKitWebView*, WebKitLoadEvent, const char* uri, GError*, gpointer);
     static void onTitleChanged(GObject*, GParamSpec*, gpointer);
     static void onUriChanged(GObject*, GParamSpec*, gpointer);

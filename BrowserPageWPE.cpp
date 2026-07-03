@@ -1947,6 +1947,40 @@ void BrowserPageWPE::clearToWhite()
     flushBuffer(buf);
     WLOG("clearToWhite: blanked buffer on navigation (%dx%d)", m_renderWidth, m_renderHeight);
 }
+/* ---- page-load timing instrumentation: 1.2s after LOAD_FINISHED, dump the Navigation Timing +
+ * resource summary to bpwpe.log ("PERF ...") so we can see where the wall-clock goes. ------------- */
+void BrowserPageWPE::onPerfTiming(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (!v) { if (err) g_error_free(err); return; }
+    char* s = jsc_value_to_string(v);
+    if (s) { if (g_livePages.find(self) != g_livePages.end()) WLOG("PERF %s", s); g_free(s); }
+    g_object_unref(v);
+}
+gboolean BrowserPageWPE::perfTimingTimeout(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (g_livePages.find(self) == g_livePages.end() || !self->m_webView) return G_SOURCE_REMOVE;
+    const char* js =
+        "(function(){try{var t=performance.timing,n=t.navigationStart;"
+        "var res=performance.getEntriesByType?performance.getEntriesByType('resource'):[];"
+        "var loc=location.hostname.split('.').slice(-2).join('.');"
+        "var sz=0,byType={},tp={},tpN=0,tpScript=0,tpKB=0;"
+        "for(var i=0;i<res.length;i++){var r=res[i];sz+=(r.transferSize||0);"
+        "var it=r.initiatorType||'other';byType[it]=(byType[it]||0)+1;"
+        "var host=(r.name||'').split('/')[2]||'';var dom=host.split('.').slice(-2).join('.');"
+        "if(dom&&dom!==loc){tpN++;tp[dom]=(tp[dom]||0)+1;tpKB+=(r.transferSize||0);if(it==='script')tpScript++;}}"
+        "var tpArr=Object.keys(tp).map(function(d){return tp[d]+':'+d;}).sort(function(a,b){return parseInt(b)-parseInt(a);}).slice(0,10);"
+        "return JSON.stringify({ttfb:t.responseStart-n,domInt:t.domInteractive-n,dcl:t.domContentLoadedEventEnd-n,"
+        "domComplete:t.domComplete-n,load:t.loadEventEnd-n,nres:res.length,kb:Math.round(sz/1024),byType:byType,"
+        "tpN:tpN,tpScript:tpScript,tpKB:Math.round(tpKB/1024),tp:tpArr});"
+        "}catch(e){return 'perf-err:'+e;}})()";
+    webkit_web_view_evaluate_javascript(self->m_webView, js, -1, nullptr, nullptr, nullptr,
+                                        &BrowserPageWPE::onPerfTiming, self);
+    return G_SOURCE_REMOVE;
+}
 void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointer ud)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
@@ -2005,6 +2039,7 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
             self->updateContentsSize();   /* report the REAL page height for scrolling */
             self->m_server->msgDidFinishDocumentLoad(self->m_proxy);
             self->m_server->msgLoadStopped(self->m_proxy);
+            g_timeout_add(1200, &BrowserPageWPE::perfTimingTimeout, self);   /* dump Navigation Timing -> "PERF ..." */
             break;
         }
         default: break;
