@@ -440,6 +440,10 @@ void BrowserPageWPE::ensureWebView()
      * framebuffer; keep the virtual (buffer) height for scroll room. Set m_virtualWindowWidth to
      * match so onFrame's size check + the offscreen header agree with what we actually render. */
     int renderW = m_virtualWindowWidth, renderH = m_virtualWindowHeight;
+    /* Rotation (option B): when the window size is known it reflects the CURRENT orientation, so use its
+     * width as the layout width — this is what makes the page re-flow after a rotate (ensureWebView is
+     * re-run by recreateForResize). Overrides the adapter's fixed first-load seed. */
+    if (m_windowWidth > 0) renderW = m_windowWidth;
     /* Screen dims from webOS config (luna.conf), falling back to the framebuffer — never hardcoded. */
     int screenW = lunaConfInt("DisplayWidth");
     int screenH = lunaConfInt("DisplayHeight");
@@ -451,6 +455,7 @@ void BrowserPageWPE::ensureWebView()
                 if (screenH <= 0) screenH = (int)vi.yres;
             }
             close(fbfd); } }
+    if (m_windowWidth > 0) screenW = m_windowWidth;   /* rotation: the live window width wins over the panel config */
     if (screenW < renderW) screenW = renderW;   /* never narrower than the adapter's layout width */
     m_screenWidth  = screenW;
     m_screenHeight = screenH;                    /* 0 if unknown → setScrollPosition uses the safe path */
@@ -1121,8 +1126,30 @@ void BrowserPageWPE::clearHistory()             { /* TODO: WebKit2/WPE has no ba
 void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
 {
     WLOG("setWindowSize %ux%u (was win=%dx%d virt=%dx%d webView=%p)", w, h, m_windowWidth, m_windowHeight, m_virtualWindowWidth, m_virtualWindowHeight, (void*)m_webView);
+    int oldW = m_windowWidth;
     m_windowWidth = (int)w; m_windowHeight = (int)h;
-    if (m_viewBackend) wpe_atlas_view_backend_resize(m_viewBackend, w, h);
+    /* The VISIBLE viewport height is the window height (portrait ~942/1024, landscape ~686, minus the VKB) —
+     * NOT the framebuffer height set at view creation. Track it so the scroll clamp / visible-region math use
+     * the real height (fixes portrait staying at the landscape 768). */
+    if ((int)h > 0) m_screenHeight = (int)h;
+    /* Rotation: a WIDTH change means the device rotated (a VKB show/hide only changes height). Re-flow IN
+     * PLACE via the view-backend resize (dispatch_set_size); update the reported geometry so onFrame accepts
+     * the new width and contentZoom stays 1.0, and re-derive the scroll/pan state + re-query the page height
+     * so panning after the rotate doesn't stall. */
+    if (m_webView && m_viewBackend && oldW > 0 && (int)w != oldW && m_renderHeight > 0) {
+        int newLayoutW = (int)w;
+        m_virtualWindowWidth = newLayoutW;   // layout / document coordinate space
+        m_renderWidth  = newLayoutW;         // onFrame validates against this (1:1, no fit-to-screen scaling)
+        m_screenWidth  = newLayoutW;
+        WLOG("rotation resize -> layout %dx%d (visible h=%d)", newLayoutW, m_renderHeight, m_screenHeight);
+        wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)newLayoutW, (uint32_t)m_renderHeight);
+        /* the re-flow changes the page height at the new width — re-query it so the adapter's scroll clamp
+         * is right, and reset the pan bookkeeping so the next setScrollPosition isn't gated as "in flight". */
+        m_renderPending = false;
+        updateContentsSize();
+        return;
+    }
+    if (m_viewBackend && !m_webView) wpe_atlas_view_backend_resize(m_viewBackend, w, h);
 }
 void BrowserPageWPE::setVirtualWindowSize(uint32_t w, uint32_t h)
 {

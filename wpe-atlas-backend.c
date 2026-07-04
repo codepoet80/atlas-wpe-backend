@@ -249,9 +249,20 @@ struct wpe_view_backend* wpe_atlas_view_backend_create(uint32_t width, uint32_t 
 
 void wpe_atlas_view_backend_resize(struct wpe_view_backend* wpe, uint32_t width, uint32_t height)
 {
-    /* >>> TODO: realloc shm to the new size, MSG_RESIZE the WebProcess, then dispatch_set_size.
-     * For the first cut, size is fixed at create; resize re-allocs and re-sends SETUP. */
-    (void)wpe; (void)width; (void)height;
+    /* In-place resize (rotation): the shm SLOT is a fixed max-size region and the WebProcess already packs
+     * the ACTUAL frame size tightly at the front of the slot (the same path fit-to-screen downscaling uses),
+     * so we do NOT realloc or re-SETUP — we just tell WebKit the new layout size and it re-flows + repaints
+     * into the existing slot. Works as long as the new layout fits the allocated slot (it does when the app
+     * launched in the widest orientation, i.e. landscape on the TouchPad). */
+    struct atlas_view* v = g_atlas_views;
+    while (v && v->wpe != wpe) v = v->next;
+    if (!v || width == 0 || height == 0) return;
+    if (width > v->width || height > v->height) {
+        ATLAS_LOG("resize %ux%u exceeds slot %ux%u — ignored (caller should recreate)", width, height, v->width, v->height);
+        return;
+    }
+    ATLAS_LOG("resize -> layout %ux%u (slot %ux%u)", width, height, v->width, v->height);
+    wpe_view_backend_dispatch_set_size(wpe, width, height);
 }
 
 void wpe_atlas_view_backend_set_visible(struct wpe_view_backend* wpe, bool visible)
@@ -410,8 +421,14 @@ static EGLNativeWindowType target_get_native_window(void* d)
 static void target_resize(void* d, uint32_t width, uint32_t height)
 {
     struct atlas_target* t = (struct atlas_target*)d;
+    if (width == t->width && height == t->height) return;
+    ATLAS_LOG("target_resize %ux%u -> %ux%u", t->width, t->height, width, height);
     t->width = width; t->height = height;
-    /* >>> TODO: re-attach larger shm if needed (UIProcess re-SETUPs on resize). */
+    /* The offscreen FBO and the lock-surface pbuffer both recreate themselves when they notice the size
+     * change (frame_will_render checks fbo_w/h; the lock path checks lock_w/h). The readback scratch/master
+     * are sized to the fixed, max-size shm slot which the UIProcess guards from shrinking, so they stay big
+     * enough. Just reset the fit-to-screen downscale so it rebuilds at the new layout size. */
+    t->ds_state = -1;
 }
 /* WebKit's surfaceless GL context has no default framebuffer (FB 0 is incomplete), so we provide a
  * real offscreen FBO and bind it here. TextureMapperGL::beginPainting() captures GL_FRAMEBUFFER_BINDING
