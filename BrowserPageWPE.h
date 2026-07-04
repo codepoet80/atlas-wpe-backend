@@ -269,6 +269,8 @@ private:
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     gint64              m_touchDownUs = 0;      // monotonic timestamp of the last touch-down, to tell a quick tap (dismiss selection) from a long-press (select)
+    int                 m_lastSelDocX = -100000, m_lastSelDocY = -100000;  // last selectWordAt point
+    gint64              m_lastSelMs = 0;        // when — so clickAt can swallow the long-press RELEASE click (same point, right after) instead of collapsing the fresh selection
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
     double              m_uiZoom = 1.0;                 // adapter's pinch/content zoom (mZoomLevel). Used to convert the (zoomed) scroll the adapter sends into document space.
     double              m_webkitZoom = 1.0;             // the webkit_web_view zoom level we render the buffer at (= m_uiZoom/fit, clamped >=1). onFrame reports contentZoom = fit*m_webkitZoom so the adapter blit divides back to a SHARP 1:1 after the crisp re-render.

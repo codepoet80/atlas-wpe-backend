@@ -1749,11 +1749,24 @@ void BrowserPageWPE::mouseEvent(int type, int contentX, int contentY, int detail
 
 bool BrowserPageWPE::clickAt(uint32_t x, uint32_t y, uint32_t numClicks)
 {
+    // The long-press RELEASE arrives here as a click at the SAME point ~a second after selectWordAt. Its
+    // mousedown would collapse the fresh selection (and leave stale highlight). Swallow that one click so
+    // the selection survives; a genuine tap elsewhere/later still falls through and dismisses.
+    gint64 nowMs = g_get_monotonic_time() / 1000;
+    if ((nowMs - m_lastSelMs) < 1800 &&
+        (int)x - m_lastSelDocX < 40 && m_lastSelDocX - (int)x < 40 &&
+        (int)y - m_lastSelDocY < 40 && m_lastSelDocY - (int)y < 40) {
+        WLOG("clickAt swallowed (post-select release) at %u,%u", x, y);
+        m_lastSelMs = 0;   // one-shot: only the immediate release is swallowed
+        return true;
+    }
     for (uint32_t i = 0; i < (numClicks ? numClicks : 1); ++i) {
         dispatchPointer((int)x, (int)y, 1, true);
         dispatchPointer((int)x, (int)y, 1, false);
     }
     checkEditorFocus();   // tap may have focused an editable element → raise/hide the VKB
+    // A genuine tap dismisses any active text selection + its overlay markers.
+    g_timeout_add(130, &BrowserPageWPE::onSelClearTimer, this);
     return true;
 }
 bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) { dispatchPointer((int)x, (int)y, 1, true); return true; }
@@ -1762,6 +1775,12 @@ bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) { dispatchPointer((int)x, (i
 void BrowserPageWPE::selectWordAt(int docX, int docY)
 {
     if (!m_webView) return;
+    // Force the view active/focused so WebKit paints the selection with the ACTIVE colour (our yellow) —
+    // otherwise WindowIsActive is false at render time (even when document.hasFocus() is true) and the
+    // highlight comes out grey. Re-asserted on every selection since the init-time state doesn't stick.
+    if (m_viewBackend) wpe_view_backend_add_activity_state(m_viewBackend,
+        wpe_view_activity_state_visible | wpe_view_activity_state_in_window | wpe_view_activity_state_focused);
+    m_lastSelDocX = docX; m_lastSelDocY = docY; m_lastSelMs = g_get_monotonic_time() / 1000;   // so clickAt can swallow the release
     WLOG("selectWordAt in=(%d,%d) scrollX=%d scrollY=%d renderedY=%d deliveredY=%d", docX, docY, m_scrollX, m_scrollY, m_renderedY, m_deliveredY);
     /* Three coordinate frames exist in the tall-buffer pan model and they DIVERGE:
      *   docX/docY   = true-document (the app already added the adapter pan to the screen tap)
@@ -1799,6 +1818,8 @@ void BrowserPageWPE::selectWordAt(int docX, int docY)
 void BrowserPageWPE::extendSelectionTo(int whichEnd, int docX, int docY)
 {
     if (!m_webView) return;
+    if (m_viewBackend) wpe_view_backend_add_activity_state(m_viewBackend,
+        wpe_view_activity_state_visible | wpe_view_activity_state_in_window | wpe_view_activity_state_focused);
     int vx = docX - m_scrollX, vy = docY - m_renderedY;
     int panY = m_renderedY - m_scrollY;
     WLOG("extendSelectionTo which=%d in=(%d,%d) scrollY=%d renderedY=%d", whichEnd, docX, docY, m_scrollY, m_renderedY);
