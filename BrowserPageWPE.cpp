@@ -330,10 +330,15 @@ static void applyContentBlocker(WebKitUserContentManager* ucm)
 {
     if (!ucm) return;
     /* webOS-style text selection: a warm yellow highlight with dark text (WebKit's default is iOS blue).
-     * User-level !important stylesheet so it wins over the page's own ::selection. */
+     * User-level !important stylesheet so it wins over the page's own ::selection. The :window-inactive
+     * variant is essential: without it WebKit dims the selection to grey whenever the view isn't the active
+     * window (which our offscreen WPE view usually is), so the highlight flickered yellow->grey. Forcing the
+     * inactive color to the same yellow keeps it stable until the selection is cleared. */
     WebKitUserStyleSheet* ss = webkit_user_style_sheet_new(
         "::selection{background-color:#ffe45c !important;color:#1a1a1a !important;}"
-        "::-webkit-selection{background-color:#ffe45c !important;color:#1a1a1a !important;}",
+        "::-webkit-selection{background-color:#ffe45c !important;color:#1a1a1a !important;}"
+        "::selection:window-inactive{background-color:#ffe45c !important;color:#1a1a1a !important;}"
+        "::-webkit-selection:window-inactive{background-color:#ffe45c !important;color:#1a1a1a !important;}",
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, nullptr, nullptr);
     webkit_user_content_manager_add_style_sheet(ucm, ss);
     webkit_user_style_sheet_unref(ss);
@@ -1754,18 +1759,29 @@ bool BrowserPageWPE::clickAt(uint32_t x, uint32_t y, uint32_t numClicks)
 bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) { dispatchPointer((int)x, (int)y, 1, true); return true; }
 
 /* ---- tap-to-select a word of web content; WebKit paints the selection highlight natively --------- */
-void BrowserPageWPE::selectWordAt(int viewX, int viewY)
+void BrowserPageWPE::selectWordAt(int docX, int docY)
 {
     if (!m_webView) return;
-    /* The app sends VIEWPORT coords (a screen tap minus the WebView's on-screen offset), NOT document coords.
-     * caretRangeFromPoint() and getClientRects() BOTH operate in viewport space, so we do NO scroll math here:
-     * the point goes straight in and the returned rects come straight back. (The previous code subtracted the
-     * scroll on the way in and added it back on the way out; those cancel only at scrollY==0, which is exactly
-     * why selection worked on the first screen and broke after any scroll.) The app pins the markers with
-     * position:fixed + the WebView's screen offset, so viewport coords are precisely what it needs. */
-    char js[900];
+    WLOG("selectWordAt in=(%d,%d) scrollX=%d scrollY=%d renderedY=%d deliveredY=%d", docX, docY, m_scrollX, m_scrollY, m_renderedY, m_deliveredY);
+    /* Three coordinate frames exist in the tall-buffer pan model and they DIVERGE:
+     *   docX/docY   = true-document (the app already added the adapter pan to the screen tap)
+     *   m_renderedY = WebKit's real scroll (window.scrollY) — where the tall buffer is painted from
+     *   m_scrollY   = the adapter's VISIBLE pan — where the user is actually looking
+     * Hit-test: convert document -> WebKit viewport by subtracting m_renderedY (NOT m_scrollY — same reason
+     * dispatchPointer uses m_renderedY). getClientRects() then returns rects in that WebKit-viewport space.
+     * Output: convert WebKit-viewport -> VISIBLE viewport (what the adapter shows at m_scrollY) by adding
+     * panY = m_renderedY - m_scrollY on Y. X has no pan buffer so a.left is already visible-relative. The app
+     * then only adds the WebView's on-screen offset. This lands markers on the word at ANY scroll; the old
+     * "subtract scroll both ways" and the "no scroll math" versions were both wrong off the first screen. */
+    int vx = docX - m_scrollX, vy = docY - m_renderedY;
+    int panY = m_renderedY - m_scrollY;
+    char js[1024];
     snprintf(js, sizeof js,
-        "(function(x,y){var s=window.getSelection();if(!s)return '';s.removeAllRanges();"
+        "(function(x,y,PY){var s=window.getSelection();if(!s)return '';"
+        /* A programmatic selection paints with the INACTIVE (grey) colour unless the document is focused,
+         * so grab window focus first — this is what keeps the yellow highlight from reverting to grey. */
+        "try{window.focus();}catch(e){}"
+        "s.removeAllRanges();"
         "var r=(document.caretRangeFromPoint?document.caretRangeFromPoint(x,y):null);"
         "if(r){s.addRange(r);try{s.modify('move','backward','word');s.modify('extend','forward','word');}catch(e){}"
         "if(!s.toString().trim().length)s.removeAllRanges();}"
@@ -1773,10 +1789,88 @@ void BrowserPageWPE::selectWordAt(int viewX, int viewY)
         "if(!s.rangeCount||!s.toString().length)return '';"
         "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return '';"
         "var a=rc[0],b=rc[rc.length-1];"
-        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom),len:s.toString().length});"
-        "})(%d,%d)",
-        viewX, viewY);
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length,hf:(document.hasFocus?document.hasFocus():-1)});"
+        "})(%d,%d,%d)",
+        vx, vy, panY);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
+}
+/* Drag a selection marker: keep the un-dragged end anchored and move the other end to the point. Same
+ * coord conversions as selectWordAt (document -> WebKit viewport in, WebKit -> visible viewport out). */
+void BrowserPageWPE::extendSelectionTo(int whichEnd, int docX, int docY)
+{
+    if (!m_webView) return;
+    int vx = docX - m_scrollX, vy = docY - m_renderedY;
+    int panY = m_renderedY - m_scrollY;
+    WLOG("extendSelectionTo which=%d in=(%d,%d) scrollY=%d renderedY=%d", whichEnd, docX, docY, m_scrollY, m_renderedY);
+    char js[1200];
+    snprintf(js, sizeof js,
+        "(function(x,y,W,PY){var s=window.getSelection();if(!s||!s.rangeCount)return '';"
+        "try{window.focus();}catch(e){}"
+        "var r=(document.caretRangeFromPoint?document.caretRangeFromPoint(x,y):null);if(!r)return '';"
+        "var rg=s.getRangeAt(0),aN,aO;"
+        /* W==1: dragging the END -> anchor at current start; else dragging the START -> anchor at current end */
+        "if(W==1){aN=rg.startContainer;aO=rg.startOffset;}else{aN=rg.endContainer;aO=rg.endOffset;}"
+        "try{s.setBaseAndExtent(aN,aO,r.startContainer,r.startOffset);}catch(e){return '';}"
+        "if(!s.rangeCount||!s.toString().length)return '';"
+        "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return '';"
+        "var a=rc[0],b=rc[rc.length-1];"
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length});"
+        "})(%d,%d,%d,%d)",
+        vx, vy, whichEnd, panY);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
+}
+/* Select the whole page body and report its rects (so "Select All" shows markers + keeps the highlight). */
+void BrowserPageWPE::selectAll()
+{
+    if (!m_webView) return;
+    int panY = m_renderedY - m_scrollY;
+    char js[900];
+    snprintf(js, sizeof js,
+        "(function(PY){var s=window.getSelection();if(!s)return JSON.stringify({len:0});"
+        "try{window.focus();s.removeAllRanges();var r=document.createRange();r.selectNodeContents(document.body||document.documentElement);s.addRange(r);}catch(e){return JSON.stringify({len:0});}"
+        "if(!s.rangeCount||!s.toString().length)return JSON.stringify({len:0});"
+        "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return JSON.stringify({len:0});"
+        "var a=rc[0],b=rc[rc.length-1];"
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length});"
+        "})(%d)", panY);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
+}
+/* Report the CURRENT selection's rects (or {len:0} if none) on "selectionBounds". Called shortly after a
+ * tap: the tap's mousedown natively collapses the selection, so this reports {len:0} and the app hides the
+ * markers/popover — which is how "tap outside to dismiss" works without the (disabled) single-tap event. */
+void BrowserPageWPE::reportCurrentSelection()
+{
+    if (!m_webView) return;
+    int panY = m_renderedY - m_scrollY;
+    char js[760];
+    snprintf(js, sizeof js,
+        "(function(PY){var s=window.getSelection();"
+        "if(!s||!s.rangeCount||!s.toString().length)return JSON.stringify({len:0});"
+        "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return JSON.stringify({len:0});"
+        "var a=rc[0],b=rc[rc.length-1];"
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length});"
+        "})(%d)", panY);
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
+}
+gboolean BrowserPageWPE::onSelReportTimer(gpointer ud)
+{
+    static_cast<BrowserPageWPE*>(ud)->reportCurrentSelection();
+    return G_SOURCE_REMOVE;
+}
+/* A quick tap outside the selection collapses it natively but leaves the app's overlay markers behind
+ * (there is no single-tap event to the app). So on a quick tap we explicitly clear the selection and
+ * report {len:0}, which dismisses the markers/popover. */
+void BrowserPageWPE::clearSelectionAndReport()
+{
+    if (!m_webView) return;
+    const char* js =
+        "(function(){var s=window.getSelection();if(s)s.removeAllRanges();return JSON.stringify({len:0});})()";
+    webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
+}
+gboolean BrowserPageWPE::onSelClearTimer(gpointer ud)
+{
+    static_cast<BrowserPageWPE*>(ud)->clearSelectionAndReport();
+    return G_SOURCE_REMOVE;
 }
 /* Selection-geometry result -> app via the "selectionBounds" channel (JSON start/end rects). */
 void BrowserPageWPE::onSelectResult(GObject* obj, GAsyncResult* res, gpointer ud)
@@ -1786,6 +1880,7 @@ void BrowserPageWPE::onSelectResult(GObject* obj, GAsyncResult* res, gpointer ud
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
     if (!v) { if (err) g_error_free(err); return; }
     char* s = jsc_value_to_string(v);
+    WLOG("selectWordAt result: %s", (s && s[0]) ? s : "(empty)");
     if (s && s[0] && self->m_server) self->m_server->msgActionData(self->m_proxy, "selectionBounds", s);
     if (s) g_free(s);
     g_object_unref(v);
@@ -1797,7 +1892,20 @@ void BrowserPageWPE::onCopyText(GObject* obj, GAsyncResult* res, gpointer ud)
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
     if (!v) { if (err) g_error_free(err); return; }
     char* s = jsc_value_to_string(v);
-    if (s && s[0] && self->m_server) self->m_server->msgActionData(self->m_proxy, "copiedText", s);
+    if (s && s[0] && self->m_server) {
+        /* The YAP message buffer is 16KB (kMaxMsgLen). A huge copy (e.g. Select All on a big page) blew past
+         * it — YapPacket's g_return_if_fail dropped the write, corrupting the stream and crashing the client
+         * (LunaSysMgr). Cap well under 16KB, backing off to a UTF-8 boundary so we don't split a sequence. */
+        size_t len = strlen(s);
+        const size_t CAP = 500000;   /* under the new dynamic YAP 512KB cap */
+        if (len > CAP) {
+            size_t cut = CAP;
+            while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) cut--;   /* don't cut mid-UTF-8 */
+            s[cut] = '\0';
+            WLOG("copiedText truncated %u -> %u (YAP 512KB cap)", (unsigned)len, (unsigned)cut);
+        }
+        self->m_server->msgActionData(self->m_proxy, "copiedText", s);
+    }
     if (s) g_free(s);
     g_object_unref(v);
 }
@@ -1834,6 +1942,8 @@ void BrowserPageWPE::gestureEvent(int type, int contentX, int contentY, double s
     if (m_viewBackend && scale == 1.0 && rotation == 0.0) {
         dispatchPointer(contentX, contentY, 1, true);
         dispatchPointer(contentX, contentY, 1, false);
+        // a single-tap gesture = a quick tap -> dismiss any active selection (markers + popover)
+        g_timeout_add(130, &BrowserPageWPE::onSelClearTimer, this);
     }
 }
 
@@ -1852,10 +1962,17 @@ void BrowserPageWPE::touchEvent(int type, int32_t touchCount, int32_t /*modifier
     /* webOS touch phase (type): 0=start 1=move 2=end (logged to confirm). Drive a pointer: down on
      * start, motion on move, up on end — a tap becomes down+up = a click. */
     switch (type) {
-        case 0: dispatchPointer(x, y, 1, true);  break;
+        case 0: m_touchDownUs = g_get_monotonic_time(); dispatchPointer(x, y, 1, true);  break;
         case 1: dispatchPointer(x, y, 0, false); break;
-        case 2: dispatchPointer(x, y, 1, false); break;
-        default: dispatchPointer(x, y, 1, true); dispatchPointer(x, y, 1, false); break;
+        case 2: {
+            dispatchPointer(x, y, 1, false);
+            gint64 durMs = m_touchDownUs ? (g_get_monotonic_time() - m_touchDownUs) / 1000 : 999;
+            // quick tap = dismiss any selection; long-press (the selecting gesture) or a drag = just resync
+            if (durMs >= 0 && durMs < 350) g_timeout_add(130, &BrowserPageWPE::onSelClearTimer, this);
+            else                           g_timeout_add(130, &BrowserPageWPE::onSelReportTimer, this);
+            break;
+        }
+        default: dispatchPointer(x, y, 1, true); dispatchPointer(x, y, 1, false); g_timeout_add(130, &BrowserPageWPE::onSelClearTimer, this); break;
     }
 }
 

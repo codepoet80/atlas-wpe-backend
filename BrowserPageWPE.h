@@ -150,7 +150,7 @@ public:
     int renderToFile(const char* filename, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH);
     bool saveImageAtPoint(uint32_t x, uint32_t y, QString& filepath) { return {}; }
     void scrollLayer(int id, int deltaX, int deltaY) {}
-    void selectAll() { if (m_webView) webkit_web_view_execute_editing_command(m_webView, "SelectAll"); }
+    void selectAll();   // JS select-all of the page body, then report the selection rects for the markers
     void setDNSServers(const char *servers) {}
     void setIgnoreMetaRefreshTags(bool ignore) {}
     void setIgnoreMetaViewport(bool ignore) {}
@@ -161,6 +161,10 @@ public:
     /* Feature: tap-to-select a word of web content at (docX,docY); WebKit paints the highlight natively.
      * Reports the selection's start/end rects back on the "selectionBounds" channel for the drag markers. */
     void selectWordAt(int docX, int docY);
+    /* Drag a selection marker: extend the current selection to (docX,docY). whichEnd==1 keeps the current
+     * start fixed and moves the end; whichEnd==0 keeps the end fixed and moves the start. Re-reports the
+     * selection rects on "selectionBounds" so the markers/popover follow. */
+    void extendSelectionTo(int whichEnd, int docX, int docY);
     void setShowClickedLink(bool enable) {}
     void settingsJavaScriptEnabled(bool enable) { if (m_webView) webkit_settings_set_enable_javascript(webkit_web_view_get_settings(m_webView), enable); }
     void settingsPopupsEnabled(bool enable) { if (m_webView) webkit_settings_set_javascript_can_open_windows_automatically(webkit_web_view_get_settings(m_webView), enable); }
@@ -238,6 +242,10 @@ private:
     static gboolean onLoginDeferTimeout(gpointer);                   // failsafe: resume a deferred login-snapshot navigation if the capture callback never fires
     static void onCopyText(GObject*, GAsyncResult*, gpointer);       // copy: selection text → msgActionData("copiedText")
     static void onSelectResult(GObject*, GAsyncResult*, gpointer);   // select: start/end rects → msgActionData("selectionBounds")
+    void reportCurrentSelection();                                   // eval current selection → "selectionBounds" (len:0 if none) so the app markers track it
+    static gboolean onSelReportTimer(gpointer ud);                  // deferred report after a long-press release (resync markers)
+    void clearSelectionAndReport();                                  // removeAllRanges + report {len:0} → app dismisses markers/popover
+    static gboolean onSelClearTimer(gpointer ud);                   // deferred clear+report after a QUICK tap (dismiss the selection)
     int m_dragX = 0, m_dragY = 0;            // web-content drag: tracked document-space pointer position
     std::string m_saveImgDir;                // Feature 9: dir to save the image into (/media/internal or /tmp)
     std::string m_saveImgInFlight;           // dest of an in-progress save — drop a duplicate so two downloads don't collide on one file
@@ -260,6 +268,7 @@ private:
     int                 m_screenHeight;         // real fb height (visible rows) — the pannable window height
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
+    gint64              m_touchDownUs = 0;      // monotonic timestamp of the last touch-down, to tell a quick tap (dismiss selection) from a long-press (select)
     int                 m_renderWidth, m_renderHeight;  // ACTUAL frame size the backend outputs (== screen size when downscaling; else == layout). onFrame validates against these; bufferWidth = m_renderWidth.
     double              m_uiZoom = 1.0;                 // adapter's pinch/content zoom (mZoomLevel). Used to convert the (zoomed) scroll the adapter sends into document space.
     double              m_webkitZoom = 1.0;             // the webkit_web_view zoom level we render the buffer at (= m_uiZoom/fit, clamped >=1). onFrame reports contentZoom = fit*m_webkitZoom so the adapter blit divides back to a SHARP 1:1 after the crisp re-render.
