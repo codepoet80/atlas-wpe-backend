@@ -329,6 +329,15 @@ static void cb_on_loaded(GObject* store, GAsyncResult* res, gpointer ud)
 static void applyContentBlocker(WebKitUserContentManager* ucm)
 {
     if (!ucm) return;
+    /* webOS-style text selection: a warm yellow highlight with dark text (WebKit's default is iOS blue).
+     * User-level !important stylesheet so it wins over the page's own ::selection. */
+    WebKitUserStyleSheet* ss = webkit_user_style_sheet_new(
+        "::selection{background-color:#ffe45c !important;color:#1a1a1a !important;}"
+        "::-webkit-selection{background-color:#ffe45c !important;color:#1a1a1a !important;}",
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, nullptr, nullptr);
+    webkit_user_content_manager_add_style_sheet(ucm, ss);
+    webkit_user_style_sheet_unref(ss);
+
     if (!s_cbStore) s_cbStore = webkit_user_content_filter_store_new(CB_STORE_DIR);
     webkit_user_content_filter_store_load(s_cbStore, CB_ID, nullptr, cb_on_loaded, g_object_ref(ucm));
 }
@@ -1745,16 +1754,18 @@ bool BrowserPageWPE::clickAt(uint32_t x, uint32_t y, uint32_t numClicks)
 bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) { dispatchPointer((int)x, (int)y, 1, true); return true; }
 
 /* ---- tap-to-select a word of web content; WebKit paints the selection highlight natively --------- */
-void BrowserPageWPE::selectWordAt(int docX, int docY)
+void BrowserPageWPE::selectWordAt(int viewX, int viewY)
 {
     if (!m_webView) return;
-    int vx = docX - m_scrollX, vy = docY - m_renderedY;
-    /* Select the word at the point, then return the selection's first+last client rects converted BACK to
-     * the app's coord space (+SX,+SY undo the viewport shift selectWordAt applied) so the app can pin the
-     * drag markers + Copy popover exactly over the highlight. Reported on the "selectionBounds" channel. */
+    /* The app sends VIEWPORT coords (a screen tap minus the WebView's on-screen offset), NOT document coords.
+     * caretRangeFromPoint() and getClientRects() BOTH operate in viewport space, so we do NO scroll math here:
+     * the point goes straight in and the returned rects come straight back. (The previous code subtracted the
+     * scroll on the way in and added it back on the way out; those cancel only at scrollY==0, which is exactly
+     * why selection worked on the first screen and broke after any scroll.) The app pins the markers with
+     * position:fixed + the WebView's screen offset, so viewport coords are precisely what it needs. */
     char js[900];
     snprintf(js, sizeof js,
-        "(function(x,y,SX,SY){var s=window.getSelection();if(!s)return '';s.removeAllRanges();"
+        "(function(x,y){var s=window.getSelection();if(!s)return '';s.removeAllRanges();"
         "var r=(document.caretRangeFromPoint?document.caretRangeFromPoint(x,y):null);"
         "if(r){s.addRange(r);try{s.modify('move','backward','word');s.modify('extend','forward','word');}catch(e){}"
         "if(!s.toString().trim().length)s.removeAllRanges();}"
@@ -1762,9 +1773,9 @@ void BrowserPageWPE::selectWordAt(int docX, int docY)
         "if(!s.rangeCount||!s.toString().length)return '';"
         "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return '';"
         "var a=rc[0],b=rc[rc.length-1];"
-        "return JSON.stringify({sx:Math.round(a.left+SX),sy:Math.round(a.top+SY),sh:Math.round(a.height),ex:Math.round(b.right+SX),ey:Math.round(b.bottom+SY),len:s.toString().length});"
-        "})(%d,%d,%d,%d)",
-        vx, vy, m_scrollX, m_renderedY);
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom),len:s.toString().length});"
+        "})(%d,%d)",
+        viewX, viewY);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
 }
 /* Selection-geometry result -> app via the "selectionBounds" channel (JSON start/end rects). */
