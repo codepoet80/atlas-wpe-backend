@@ -556,6 +556,10 @@ void BrowserPageWPE::ensureWebView()
 
     WebKitSettings* s = webkit_web_view_get_settings(m_webView);
     webkit_settings_set_javascript_can_open_windows_automatically(s, TRUE);
+    /* Media (HTML5 <video>): allow playback (incl. muted autoplay) without a prior user gesture, so pages
+     * with autoplay work and tap-to-play isn't swallowed. No-op when the engine is built media-off. */
+    webkit_settings_set_media_playback_requires_user_gesture(s, FALSE);
+    webkit_settings_set_enable_media(s, TRUE);
     webkit_settings_set_enable_developer_extras(s, FALSE);
     webkit_settings_set_enable_page_cache(s, (access("/tmp/atlas_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/atlas_nocache */
     /* ALWAYS use a modern WebKit/Safari UA — the adapter otherwise sends the legacy
