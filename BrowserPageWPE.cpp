@@ -103,6 +103,10 @@ static void atlas_im_context_init(AtlasIMContext*) {}
  * this set so a stale frame on a freed page is dropped instead of dereferencing freed memory.
  * Everything (ctor/dtor/onFrame) runs on the glib main loop, so no locking is needed. */
 static std::set<BrowserPageWPE*> g_livePages;
+/* True if the page has already been destroyed. Async JS-result callbacks and g_timeout callbacks capture a
+ * raw BrowserPageWPE*; the WebView lingers and can deliver a pending probe/timer AFTER the card is freed, so
+ * every such callback must check this before touching the page. (Comparing the pointer never derefs it.) */
+static inline bool bpwpe_dead(BrowserPageWPE* p) { return g_livePages.find(p) == g_livePages.end(); }
 
 /* ===== autonomous scroll test ===== kick with `kill -USR1 <bs-pid>`. Drives setScrollPosition in a
  * timed top->bottom->top sweep (exactly the adapter's scroll stream) and logs a SCROLLTEST summary:
@@ -145,10 +149,18 @@ BrowserPageWPE::~BrowserPageWPE()
         webkit_web_view_terminate_web_process(m_webView);
         g_object_unref(m_webView);   // also destroys the backend + view backend
     }
+    /* Resolve + release a still-held login-form decision so the deferred navigation isn't leaked with the
+     * page (the failsafe timer is now guarded and won't touch a freed page). */
+    if (m_loginDecision) {
+        webkit_policy_decision_use(m_loginDecision);
+        g_object_unref(m_loginDecision);
+        m_loginDecision = nullptr;
+    }
     free(m_identifier);
     free(m_bufferLockName);
     delete m_offscreen0;
     delete m_offscreen1;
+    delete m_syncReplyPipe;   // Feature 7 SSL/auth sync pipe (leaked the object + its FIFO/fd otherwise)
 }
 
 /* ---- create the WPE view bound to the Atlas frame sink (once size is known) ----------------- */
@@ -256,6 +268,7 @@ void BrowserPageWPE::onLoginCapture(GObject* obj, GAsyncResult* res, gpointer ud
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }   // page torn down mid-eval (decision freed in dtor)
     if (v) {
         char* s = jsc_value_to_string(v);
         WLOG("saveLogin: capture -> %s", (s && s[0]) ? s : "(empty)");
@@ -280,6 +293,7 @@ void BrowserPageWPE::onLoginCapture(GObject* obj, GAsyncResult* res, gpointer ud
 gboolean BrowserPageWPE::onLoginDeferTimeout(gpointer ud)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (bpwpe_dead(self)) return G_SOURCE_REMOVE;   // page freed (dtor already resolved/released the decision)
     if (self->m_loginDecision) {
         WLOG("saveLogin: failsafe timer resuming deferred navigation");
         webkit_policy_decision_use(self->m_loginDecision);
@@ -771,6 +785,7 @@ static void atlas_favicon_dl_finished(WebKitDownload* dl, gpointer ud) {
     WLOG("favicon saved -> %s (via %s)", s->dest.c_str(), ATLAS_FAVICON_CANDIDATES[s->idx]);
     atlas_favicon_disconnect(dl, s);
     g_object_unref(dl);
+    g_object_unref(s->view);
     delete s;
 }
 static void atlas_favicon_dl_failed(WebKitDownload* dl, GError*, gpointer ud) {
@@ -781,10 +796,10 @@ static void atlas_favicon_dl_failed(WebKitDownload* dl, GError*, gpointer ud) {
     atlas_favicon_try_next(s);   /* advance to the next candidate path, or clean up when exhausted */
 }
 static void atlas_favicon_try_next(AtlasFaviconDl* s) {
-    if (!ATLAS_FAVICON_CANDIDATES[s->idx]) { delete s; return; }   /* exhausted — leave no file */
+    if (!ATLAS_FAVICON_CANDIDATES[s->idx]) { g_object_unref(s->view); delete s; return; }   /* exhausted — leave no file */
     std::string uri = s->origin + ATLAS_FAVICON_CANDIDATES[s->idx];
     WebKitDownload* dl = webkit_web_view_download_uri(s->view, uri.c_str());
-    if (!dl) { delete s; return; }
+    if (!dl) { g_object_unref(s->view); delete s; return; }
     webkit_download_set_destination(dl, s->dest.c_str());
     s->hDst  = g_signal_connect(dl, "decide-destination", G_CALLBACK(atlas_favicon_decide_dest), s);
     s->hFin  = g_signal_connect(dl, "finished", G_CALLBACK(atlas_favicon_dl_finished), s);
@@ -826,7 +841,10 @@ static void atlas_start_favicon_download(WebKitWebView* view, const char* pageUr
      * fail we correctly end up with no icon rather than a broken leftover. */
     unlink(dest.c_str());
     AtlasFaviconDl* s = new AtlasFaviconDl();
-    s->view = view;
+    /* Hold a ref for the download's lifetime: the page (and its dtor's unref) may go away mid-download, and
+     * atlas_favicon_try_next would otherwise call download_uri on a freed WebView. The object stays valid even
+     * after the web process is terminated; every terminal cleanup path unrefs it. */
+    s->view = WEBKIT_WEB_VIEW(g_object_ref(view));
     s->origin = origin;
     s->dest = dest;
     s->idx = 0;
@@ -1298,6 +1316,7 @@ void BrowserPageWPE::onContentHeight(GObject* obj, GAsyncResult* res, gpointer u
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     if (!v) { if (err) g_error_free(err); return; }
     int h = (int)jsc_value_to_double(v);
     g_object_unref(v);   /* 2.0: _finish returns an owned JSCValue (replaces WebKitJavascriptResult) */
@@ -1337,6 +1356,7 @@ void BrowserPageWPE::onReaderProbe(GObject* obj, GAsyncResult* res, gpointer ud)
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     if (!v) { if (err) g_error_free(err); return; }
     char* s = jsc_value_to_string(v);
     size_t n = s ? strlen(s) : 0;
@@ -1487,6 +1507,7 @@ void BrowserPageWPE::onEditorCheckResult(GObject* obj, GAsyncResult* res, gpoint
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     if (!v) { if (err) g_error_free(err); return; }
     int code = (int)jsc_value_to_int32(v);
     g_object_unref(v);
@@ -1575,6 +1596,7 @@ void BrowserPageWPE::onSmartZoomResult(GObject* obj, GAsyncResult* res, gpointer
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     if (!v) { if (err) g_error_free(err); return; }
     char* s = jsc_value_to_string(v);
     int l = 0, t = 0, r = 0, b = 0;
@@ -1616,6 +1638,7 @@ void BrowserPageWPE::onHitTestResult(GObject* obj, GAsyncResult* res, gpointer u
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     std::string json = "{\"isNull\":true,\"x\":0,\"y\":0}";
     if (v) { char* s = jsc_value_to_string(v); if (s) { json = s; g_free(s); } g_object_unref(v); }
     else if (err) { WLOG("hitTest JS error: %s", err->message ? err->message : "?"); g_error_free(err); }
@@ -1656,6 +1679,7 @@ void BrowserPageWPE::onSaveImgSrcResult(GObject* obj, GAsyncResult* res, gpointe
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     std::string src;
     if (v) { char* s = jsc_value_to_string(v); if (s) { src = s; g_free(s); } g_object_unref(v); }
     else if (err) g_error_free(err);
@@ -1699,7 +1723,7 @@ void BrowserPageWPE::respondSaveImage(int32_t query, bool ok, const char* path)
 static void atlas_img_dl_done(WebKitDownload* dl, AtlasImgDl* s, bool ok)
 {
     WLOG("saveImg done q=%d ok=%d dest=%s", s->query, ok, s->dest.c_str());
-    if (s->page) s->page->respondSaveImage(s->query, ok, s->dest.c_str());
+    if (s->page && !bpwpe_dead(s->page)) s->page->respondSaveImage(s->query, ok, s->dest.c_str());   // page may have closed mid-download
     g_signal_handler_disconnect(dl, s->hFin);
     g_signal_handler_disconnect(dl, s->hFail);
     g_object_unref(dl);
@@ -1769,7 +1793,13 @@ bool BrowserPageWPE::clickAt(uint32_t x, uint32_t y, uint32_t numClicks)
     g_timeout_add(130, &BrowserPageWPE::onSelClearTimer, this);
     return true;
 }
-bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) { dispatchPointer((int)x, (int)y, 1, true); return true; }
+bool BrowserPageWPE::holdAt(uint32_t x, uint32_t y) {
+    dispatchPointer((int)x, (int)y, 1, true);
+    // Arm the release-swallow: a long-press (word-select OR the editable menu) is followed by a click at
+    // this point on finger-up; record it so clickAt swallows that click instead of dismissing the popover.
+    m_lastSelDocX = (int)x; m_lastSelDocY = (int)y; m_lastSelMs = g_get_monotonic_time() / 1000;
+    return true;
+}
 
 /* ---- tap-to-select a word of web content; WebKit paints the selection highlight natively --------- */
 void BrowserPageWPE::selectWordAt(int docX, int docY)
@@ -1794,11 +1824,24 @@ void BrowserPageWPE::selectWordAt(int docX, int docY)
      * "subtract scroll both ways" and the "no scroll math" versions were both wrong off the first screen. */
     int vx = docX - m_scrollX, vy = docY - m_renderedY;
     int panY = m_renderedY - m_scrollY;
-    char js[1024];
+    char js[2200];
     snprintf(js, sizeof js,
-        "(function(x,y,PY){var s=window.getSelection();if(!s)return '';"
-        /* A programmatic selection paints with the INACTIVE (grey) colour unless the document is focused,
-         * so grab window focus first — this is what keeps the yellow highlight from reverting to grey. */
+        "(function(x,y,PY){"
+        /* form input/textarea: getSelection() is empty for these, so select the word around the caret with
+         * setSelectionRange and report the FIELD's rect (no per-char rects) with ed:1 (the app skips markers). */
+        "var ae=document.activeElement;"
+        /* Only treat this as an input selection when the PRESS is actually inside the focused field —
+         * otherwise (input focused earlier, user long-presses page text elsewhere) fall through to the
+         * page path so normal-page selection still lands at the finger. */
+        "var aer=(ae&&(ae.tagName=='INPUT'||ae.tagName=='TEXTAREA'))?ae.getBoundingClientRect():null;"
+        "if(aer&&x>=aer.left&&x<=aer.right&&y>=aer.top&&y<=aer.bottom){"
+        "ae.focus();var v=ae.value||'',p=ae.selectionStart;if(p==null)p=v.length;"
+        "var ss=p,ee=p;while(ss>0&&/\\S/.test(v.charAt(ss-1)))ss--;while(ee<v.length&&/\\S/.test(v.charAt(ee)))ee++;"
+        "if(ss>=ee)return JSON.stringify({len:0});"
+        "ae.setSelectionRange(ss,ee);var q=aer,h=Math.min(q.height,26);"
+        "return JSON.stringify({sx:Math.round(q.left),sy:Math.round(q.top+PY),sh:Math.round(h),ex:Math.round(q.right),ey:Math.round(q.top+h+PY),len:ee-ss,ed:1});}"
+        /* page / contenteditable text */
+        "var s=window.getSelection();if(!s)return '';"
         "try{window.focus();}catch(e){}"
         "s.removeAllRanges();"
         "var r=(document.caretRangeFromPoint?document.caretRangeFromPoint(x,y):null);"
@@ -1808,7 +1851,7 @@ void BrowserPageWPE::selectWordAt(int docX, int docY)
         "if(!s.rangeCount||!s.toString().length)return '';"
         "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return '';"
         "var a=rc[0],b=rc[rc.length-1];"
-        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length,hf:(document.hasFocus?document.hasFocus():-1)});"
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length,ed:(ae&&ae.isContentEditable?1:0),hf:(document.hasFocus?document.hasFocus():-1)});"
         "})(%d,%d,%d)",
         vx, vy, panY);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
@@ -1845,14 +1888,23 @@ void BrowserPageWPE::selectAll()
 {
     if (!m_webView) return;
     int panY = m_renderedY - m_scrollY;
-    char js[900];
+    char js[1700];
     snprintf(js, sizeof js,
-        "(function(PY){var s=window.getSelection();if(!s)return JSON.stringify({len:0});"
+        "(function(PY){"
+        /* form input/textarea: select the whole value, report the field rect with ed:1. The focused element
+         * is the reliable signal here (paste into it works, so it's focused when the popover is up); a page
+         * 'Select All' runs after a page-text selection, by which point window.focus() has blurred any input. */
+        "var ae=document.activeElement;"
+        "if(ae&&(ae.tagName=='INPUT'||ae.tagName=='TEXTAREA')){"
+        "ae.focus();var v=ae.value||'';if(!v.length)return JSON.stringify({len:0});ae.setSelectionRange(0,v.length);"
+        "var q=ae.getBoundingClientRect(),h=Math.min(q.height,26);"
+        "return JSON.stringify({sx:Math.round(q.left),sy:Math.round(q.top+PY),sh:Math.round(h),ex:Math.round(q.right),ey:Math.round(q.top+h+PY),len:v.length,ed:1});}"
+        "var s=window.getSelection();if(!s)return JSON.stringify({len:0});"
         "try{window.focus();s.removeAllRanges();var r=document.createRange();r.selectNodeContents(document.body||document.documentElement);s.addRange(r);}catch(e){return JSON.stringify({len:0});}"
         "if(!s.rangeCount||!s.toString().length)return JSON.stringify({len:0});"
         "var rc=s.getRangeAt(0).getClientRects();if(!rc.length)return JSON.stringify({len:0});"
         "var a=rc[0],b=rc[rc.length-1];"
-        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length});"
+        "return JSON.stringify({sx:Math.round(a.left),sy:Math.round(a.top+PY),sh:Math.round(a.height),ex:Math.round(b.right),ey:Math.round(b.bottom+PY),len:s.toString().length,ed:(ae&&ae.isContentEditable?1:0)});"
         "})(%d)", panY);
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
 }
@@ -1875,6 +1927,7 @@ void BrowserPageWPE::reportCurrentSelection()
 }
 gboolean BrowserPageWPE::onSelReportTimer(gpointer ud)
 {
+    if (bpwpe_dead(static_cast<BrowserPageWPE*>(ud))) return G_SOURCE_REMOVE;   // card closed before the timer fired
     static_cast<BrowserPageWPE*>(ud)->reportCurrentSelection();
     return G_SOURCE_REMOVE;
 }
@@ -1884,12 +1937,18 @@ gboolean BrowserPageWPE::onSelReportTimer(gpointer ud)
 void BrowserPageWPE::clearSelectionAndReport()
 {
     if (!m_webView) return;
+    // Do NOT removeAllRanges when an editable field is focused — that wipes the input's caret and breaks
+    // typing/paste. Only clear a document (non-editable) selection. Either way report {len:0} to hide markers.
     const char* js =
-        "(function(){var s=window.getSelection();if(s)s.removeAllRanges();return JSON.stringify({len:0});})()";
+        "(function(){var ae=document.activeElement,"
+        "ed=ae&&(ae.isContentEditable||ae.tagName=='INPUT'||ae.tagName=='TEXTAREA');"
+        "if(!ed){var s=window.getSelection();if(s)s.removeAllRanges();}"
+        "return JSON.stringify({len:0});})()";
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onSelectResult, this);
 }
 gboolean BrowserPageWPE::onSelClearTimer(gpointer ud)
 {
+    if (bpwpe_dead(static_cast<BrowserPageWPE*>(ud))) return G_SOURCE_REMOVE;   // card closed within ~130ms of the tap
     static_cast<BrowserPageWPE*>(ud)->clearSelectionAndReport();
     return G_SOURCE_REMOVE;
 }
@@ -1899,6 +1958,7 @@ void BrowserPageWPE::onSelectResult(GObject* obj, GAsyncResult* res, gpointer ud
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     if (!v) { if (err) g_error_free(err); return; }
     char* s = jsc_value_to_string(v);
     WLOG("selectWordAt result: %s", (s && s[0]) ? s : "(empty)");
@@ -1911,6 +1971,7 @@ void BrowserPageWPE::onCopyText(GObject* obj, GAsyncResult* res, gpointer ud)
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     GError* err = nullptr;
     JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
     if (!v) { if (err) g_error_free(err); return; }
     char* s = jsc_value_to_string(v);
     if (s && s[0] && self->m_server) {

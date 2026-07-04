@@ -193,7 +193,10 @@ public:
         if (m_webView) {
             webkit_web_view_execute_editing_command(m_webView, "Copy");
             webkit_web_view_evaluate_javascript(m_webView,
-                "(function(){return window.getSelection?window.getSelection().toString():'';})()",
+                "(function(){var a=document.activeElement;"
+                "if(a&&(a.tagName=='INPUT'||a.tagName=='TEXTAREA')&&a.selectionStart!=a.selectionEnd)"
+                "return a.value.substring(a.selectionStart,a.selectionEnd);"
+                "return window.getSelection?window.getSelection().toString():'';})()",
                 -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onCopyText, this);
         }
         return true;
@@ -233,7 +236,7 @@ private:
     void checkEditorFocus();                 // after a tap: poll document.activeElement → raise/hide the VKB
     static void onEditorCheckResult(GObject*, GAsyncResult*, gpointer);
     static void onSmartZoomResult(GObject*, GAsyncResult*, gpointer);   // double-tap zoom: block rect → response
-    int m_smartZoomX, m_smartZoomY;          // echoed back in the smart-zoom response
+    int m_smartZoomX = 0, m_smartZoomY = 0;          // echoed back in the smart-zoom response
     static void onHitTestResult(GObject*, GAsyncResult*, gpointer);      // Feature 9: JS elementFromPoint result → msgHitTestResponse
     static void onSaveImgSrcResult(GObject*, GAsyncResult*, gpointer);   // Feature 9: image src at point → start download
     int m_hitTestQuery = 0;                  // Feature 9: queryNum echoed in the hit-test/save-image response
@@ -289,7 +292,7 @@ private:
     long                m_renderPendingMs; // _wlog_ms() when m_renderPending was set — staleness timeout so a lost frame can't deadlock the pan
     unsigned int        m_settleTimer;   // settle-render: g_timeout id armed while a fast flick defers re-render; fires the settled re-render
     long                m_lastRenderMs;  // settle-render: _wlog_ms() of the last ISSUED re-render — max-defer safeguard so continuous motion never freezes
-    uint32_t            m_priority;
+    uint32_t            m_priority = 0;
 
     // ---- WPE members (replace m_graphicsView/m_scene/m_webView/m_webPage) ----
     struct wpe_view_backend* m_viewBackend;
