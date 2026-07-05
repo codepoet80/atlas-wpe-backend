@@ -1,0 +1,177 @@
+--- a/omx/gstomxvideodec.c	2022-02-03 20:53:32.000000000 +0100
++++ b/omx/gstomxvideodec.c	2026-07-05 14:28:02.991323734 +0200
+@@ -52,6 +52,7 @@
+ #include "gstomxvideo.h"
+ #include "gstomxvideodec.h"
+ 
++
+ GST_DEBUG_CATEGORY_STATIC (gst_omx_video_dec_debug_category);
+ #define GST_CAT_DEFAULT gst_omx_video_dec_debug_category
+ 
+@@ -796,6 +797,10 @@
+     } else {
+       min = max;
+     }
++    /* NOTE (Atlas/TouchPad): capping the output buffer count did NOT help the >320p reconfig — even 5
++     * buffers fail OMX_ErrorInsufficientResources because the component doesn't release the OLD output
++     * buffers at reconfig (deallocate hits "used buffer"), so their pmem is never reclaimed. That's the
++     * closed component's reconfig behavior; the count isn't the lever. Cap removed. */
+ 
+     add_videometa = gst_buffer_pool_config_has_option (config,
+         GST_BUFFER_POOL_OPTION_VIDEO_META);
+@@ -1754,22 +1759,41 @@
+     GST_DEBUG_OBJECT (self, "Port settings have changed, updating caps");
+ 
+     /* Reallocate all buffers */
+-    if (acq_return == GST_OMX_ACQUIRE_BUFFER_RECONFIGURE
+-        && gst_omx_port_is_enabled (port)) {
+-      err = gst_omx_port_set_enabled (port, FALSE);
+-      if (err != OMX_ErrorNone)
+-        goto reconfigure_error;
+-
+-      err = gst_omx_port_wait_buffers_released (port, 5 * GST_SECOND);
+-      if (err != OMX_ErrorNone)
+-        goto reconfigure_error;
++    if (acq_return == GST_OMX_ACQUIRE_BUFFER_RECONFIGURE) {
++      /* Atlas/TouchPad: ALWAYS tear down + free the old output buffers before reallocating for the new
++       * >320p config, and do the OMX waits BEST-EFFORT. The 2011 Qualcomm component may already have
++       * disabled the port and doesn't reliably signal buffer-release; the upstream code gated the whole
++       * teardown on gst_omx_port_is_enabled() and aborted (goto reconfigure_error) on any wait timeout,
++       * so the old buffers' pmem was never freed -> the realloc failed with OMX_ErrorInsufficientResources
++       * and no frames came out. Free unconditionally; the port-disable/dealloc reclaims the pmem so the
++       * realloc fits. */
++      if (gst_omx_port_is_enabled (port)) {
++        /* Native (libpalmvideodecoder, decompiled) reconfigure teardown for this 2011 Qualcomm
++         * component: SendCommand(PortDisable) -> usleep(10ms) -> then loop freeing each output
++         * buffer with usleep between passes UNTIL every buffer has actually been returned by the
++         * component and freed -> wait_for_event(disable-complete). The component only reclaims the
++         * old output pmem (the per-DPB buffers) once ALL its held buffers have come back after the
++         * disable; freeing eagerly before they return leaves the pmem allocated, so the subsequent
++         * realloc fails OMX_ErrorInsufficientResources at >320p. So we must WAIT for the component
++         * to release its buffers before deallocating, not fire-and-forget. */
++        gst_omx_port_set_enabled (port, FALSE);
++        g_usleep (10000);
++
++        /* native's retry-until-all-returned loop: block until the component hands every output
++         * buffer back after the PortDisable (this is what actually lets it free the DPB pmem). */
++        if (gst_omx_port_wait_buffers_released (port,
++                5 * GST_SECOND) != OMX_ErrorNone)
++          GST_WARNING_OBJECT (self,
++              "reconfig: not all output buffers released after PortDisable, proceeding");
++      }
+ 
+       if (!gst_omx_video_dec_deallocate_output_buffers (self))
+-        goto reconfigure_error;
++        GST_WARNING_OBJECT (self, "reconfig: deallocate reported failure, proceeding");
+ 
+-      err = gst_omx_port_wait_enabled (port, 1 * GST_SECOND);
+-      if (err != OMX_ErrorNone)
+-        goto reconfigure_error;
++      /* native: wait_for_event for the PortDisable to actually complete (buffers all freed, pmem
++       * reclaimed) before we enable+reallocate. Block generously rather than best-effort. */
++      if (gst_omx_port_wait_enabled (port, 5 * GST_SECOND) != OMX_ErrorNone)
++        GST_WARNING_OBJECT (self, "reconfig: port-disable not confirmed, proceeding");
+     }
+ 
+     if (acq_return == GST_OMX_ACQUIRE_BUFFER_RECONFIGURE) {
+@@ -3486,6 +3510,20 @@
+       gst_object_unref (pool);
+   }
+ 
++  /* Atlas/TouchPad: force copy-mode (OMX_AllocateBuffer + copy into downstream buffers) instead of
++   * OMX_UseBuffer. With UseBuffer the downstream sink (WPE's MediaPlayerPrivateGStreamer video sink)
++   * holds the decoder's OMX output buffers for compositing; at the post-SPS PortSettingsChanged
++   * reconfigure those held buffers can't be freed, so the 2011 Qualcomm component never reclaims its
++   * per-DPB pmem and the >320p realloc fails OMX_ErrorInsufficientResources. In copy-mode the sink
++   * only ever holds COPIES, so the OMX output buffers stay decoder-owned and are ALL freeable at
++   * reconfigure (the working filesink/AllocateBuffer path). Costs one memcpy per frame. Opt-in via
++   * env so it stays revertible. */
++  if (self->use_buffers && getenv ("GST_OMX_ATLAS_COPY_OUTPUT")) {
++    GST_INFO_OBJECT (self,
++        "Atlas: forcing copy-mode (no OMX_UseBuffer) for reconfigure-safe DPB pmem");
++    self->use_buffers = FALSE;
++  }
++
+   if (!GST_VIDEO_DECODER_CLASS
+       (gst_omx_video_dec_parent_class)->decide_allocation (bdec, query))
+     return FALSE;
+--- a/omx/gstomx.c	2022-02-03 20:53:32.000000000 +0100
++++ b/omx/gstomx.c	2026-07-05 12:25:12.618447010 +0200
+@@ -2204,15 +2204,17 @@
+    * we have to drop them... */
+   if (port->port_def.eDir == OMX_DirOutput &&
+       port->settings_cookie != port->configured_settings_cookie) {
+-    if (!g_queue_is_empty (&port->pending_buffers)) {
++    /* Atlas/TouchPad: the 2011 Qualcomm component keeps REFILLING output buffers after
++     * PortSettingsChanged instead of quiescing. The upstream drain-one-by-one path returns each
++     * pending buffer as OK, the loop re-queues it (FillThisBuffer), the component refills it -> the
++     * pending queue never empties -> reconfiguration deadlocks and 0 frames come out at >320p. The
++     * comment above already states these old-config buffers are to be DROPPED, so drop the whole
++     * pending queue and go straight to RECONFIGURE; the subsequent port-disable/deallocate frees the
++     * actual OMX buffers. This bounds the drain to a single pass. */
++    if (!g_queue_is_empty (&port->pending_buffers))
+       GST_DEBUG_OBJECT (comp->parent,
+-          "%s output port %u needs reconfiguration but has buffers pending",
+-          comp->name, port->index);
+-      _buf = g_queue_pop_head (&port->pending_buffers);
+-
+-      ret = GST_OMX_ACQUIRE_BUFFER_OK;
+-      goto done;
+-    }
++          "%s output port %u reconfig: %u pending old-config buffers (freed by dealloc)",
++          comp->name, port->index, g_queue_get_length (&port->pending_buffers));
+ 
+     GST_DEBUG_OBJECT (comp->parent, "Component %s port %d needs reconfiguring",
+         comp->name, port->index);
+--- a/omx/gstomxvideo.c	2022-02-03 20:53:32.000000000 +0100
++++ b/omx/gstomxvideo.c	2026-07-05 06:34:15.170452245 +0200
+@@ -94,6 +94,20 @@
+       break;
+ #pragma GCC diagnostic pop
+ #endif
++    /* Qualcomm (APQ8060/Venus) decoder output color formats. The 32m formats (0x7FA30C03/04) are the
++     * Adreno/Venus 64x32 Z-order TILED NV12 — represent them as GST_VIDEO_FORMAT_NV12_64Z32 so downstream
++     * videoconvert (or a GL sink) DE-TILES them to linear. Mapping them to plain NV12 (as before) made the
++     * pipeline run but rendered garbled/repeated tiles. 0x7FA30C00 is linear YVU (NV21). */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wswitch"
++    case 0x7FA30C00:  /* QOMX_COLOR_FormatYVU420SemiPlanar (linear, Y then VU) */
++      format = GST_VIDEO_FORMAT_NV21;
++      break;
++    case 0x7FA30C03:  /* QOMX_COLOR_FormatYUV420PackedSemiPlanar32m (tiled NV12) */
++    case 0x7FA30C04:  /* QOMX_COLOR_FormatYUV420PackedSemiPlanar32mMultiView */
++      format = GST_VIDEO_FORMAT_NV12_64Z32;
++      break;
++#pragma GCC diagnostic pop
+     default:
+       format = GST_VIDEO_FORMAT_UNKNOWN;
+       break;
+--- a/omx/gstomxvideo.h	2022-02-03 20:53:32.000000000 +0100
++++ b/omx/gstomxvideo.h	2026-07-05 06:42:21.572819948 +0200
+@@ -36,7 +36,7 @@
+ 
+ /* Keep synced with gst_omx_video_get_format_from_omx(). Sort by decreasing quality */
+ #define GST_OMX_VIDEO_DEC_SUPPORTED_FORMATS "{ NV16_10LE32, NV12_10LE32, " \
+-  "NV16, YUY2, YVYU, UYVY, NV12, I420, RGB16, BGR16, ABGR, ARGB, GRAY8 }"
++  "NV16, YUY2, YVYU, UYVY, NV12, NV12_64Z32, I420, RGB16, BGR16, ABGR, ARGB, GRAY8 }"
+ 
+ #define GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS "{ NV16_10LE32, NV12_10LE32, " \
+   "NV16, NV12, I420, GRAY8 }"
+--- a/omx/gstomxbufferpool.c	2022-02-03 20:53:32.000000000 +0100
++++ b/omx/gstomxbufferpool.c	2026-07-05 06:42:45.067295080 +0200
+@@ -373,6 +373,15 @@
+         stride[1] = nstride;
+         offset[1] = offset[0] + stride[0] * nslice;
+         break;
++      case GST_VIDEO_FORMAT_NV12_64Z32:
++        /* Qualcomm (APQ8060) tiled NV12. OMX nStride/nSliceHeight are the TILE-aligned width/height;
++         * GstVideoInfo already encodes the correct tile stride (GST_VIDEO_TILE_MAKE_STRIDE) and
++         * UV-plane offset for this format, so use those verbatim and let downstream (videoconvert)
++         * de-tile to linear. */
++        stride[0] = GST_VIDEO_INFO_PLANE_STRIDE (&pool->video_info, 0);
++        stride[1] = GST_VIDEO_INFO_PLANE_STRIDE (&pool->video_info, 1);
++        offset[1] = GST_VIDEO_INFO_PLANE_OFFSET (&pool->video_info, 1);
++        break;
+       default:
+         g_assert_not_reached ();
+         break;

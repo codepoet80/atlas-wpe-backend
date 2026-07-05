@@ -1,0 +1,43 @@
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp	2026-05-25 18:40:31.479039700 +0200
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp	2026-07-05 18:13:03.538431513 +0200
+@@ -4410,6 +4410,40 @@
+         }), this);
+     }
+ 
++    // Atlas/TouchPad: put the MDP4 rotator HW de-tiler (mdpdetile) in front of the sink so the
++    // decoder's tiled NV12 (NV12_64Z32) is de-tiled in hardware (~2.6ms/frame @640p) instead of by a
++    // CPU videoconvert that playsink would auto-plug (which drops frames / renders black at >320p).
++    // m_videoSink BECOMES the bin [mdpdetile ! innerSink] (consistent identity with the pipeline
++    // video-sink); the inner sink's repaint/caps signals were already connected above and stay wired.
++    // Env-gated for safe A/B.
++    if (m_videoSink && g_getenv("ATLAS_MDPDETILE")) {
++        GstElement* detile = gst_element_factory_make("mdpdetile", nullptr);
++        // The WebKit video sink only accepts { BGRx, BGRA }, so a lightweight videoconvert bridges
++        // mdpdetile's linear NV12 -> BGRA. mdpdetile does the EXPENSIVE part (tiled->linear de-tile,
++        // ~2.6ms in HW); the convert only does a straightforward linear NV12->BGRA (cheap vs the CPU
++        // videoconvert playsink would otherwise auto-plug to de-tile AND convert the tiled buffer).
++        GstElement* conv = gst_element_factory_make("videoconvert", nullptr);
++        if (detile && conv) {
++            GstElement* innerSink = m_videoSink.get();
++            GstElement* bin = gst_bin_new("atlas-detile-bin");
++            gst_bin_add_many(GST_BIN_CAST(bin), detile, conv, innerSink, nullptr);
++            if (gst_element_link_many(detile, conv, innerSink, nullptr)) {
++                GRefPtr<GstPad> detileSinkPad = adoptGRef(gst_element_get_static_pad(detile, "sink"));
++                gst_element_add_pad(bin, gst_ghost_pad_new("sink", detileSinkPad.get()));
++                m_videoSink = bin; // GRefPtr refs the floating bin; drops old innerSink ref (bin keeps it)
++                GST_INFO_OBJECT(m_pipeline.get(), "Atlas: mdpdetile HW de-tiler inserted [mdpdetile ! videoconvert ! sink]");
++            } else {
++                GST_WARNING_OBJECT(m_pipeline.get(), "Atlas: mdpdetile bin link failed, using plain sink");
++                gst_bin_remove(GST_BIN_CAST(bin), innerSink); // return innerSink to m_videoSink's sole ref
++                gst_object_unref(bin); // frees the (floating) bin and its remaining children
++            }
++        } else {
++            GST_WARNING_OBJECT(m_pipeline.get(), "Atlas: mdpdetile/videoconvert element not found, using plain sink");
++            if (detile) gst_object_unref(detile);
++            if (conv) gst_object_unref(conv);
++        }
++    }
++
+     return m_videoSink.get();
+ }
+ 
