@@ -1300,9 +1300,14 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
          * last issued re-render, DON'T defer — force a re-render now (force=true -> centered, no lead swing)
          * to keep tracking. A genuine single flick (motion then stop) still defers + settles via the timer. */
         long sinceRender = _wlog_ms() - m_lastRenderMs; if (sinceRender < 0) sinceRender += 10000000;
-        if (sinceRender < 450) {
+        /* Threshold must exceed a typical render (~0.6-1.8s here) — at the old 450ms a fast flick, whose
+         * renders each take longer than 450ms, ALWAYS tripped the force path and thrashed intermediate
+         * (wrong) positions -> "jumps to unexpected places". At 1800ms a normal flick defers cleanly to the
+         * settle timer (blank briefly, then land ONCE at the final spot); only genuinely continuous motion
+         * (> ~1.8s non-stop) still force-renders to avoid a frozen buffer. */
+        if (sinceRender < 1800) {
             if (m_settleTimer) g_source_remove(m_settleTimer);
-            m_settleTimer = g_timeout_add(160, (GSourceFunc)&BrowserPageWPE::onSettleTimer, this);
+            m_settleTimer = g_timeout_add(140, (GSourceFunc)&BrowserPageWPE::onSettleTimer, this);
             return false;                                  /* defer: settle timer renders when the flick stops */
         }
         force = true;   /* deferred too long during continuous motion -> render now, CENTERED, keep tracking */
