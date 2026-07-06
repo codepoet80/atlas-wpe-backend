@@ -1,0 +1,16 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gridtest</title><style>
+ html,body{margin:0;padding:0;background:#000}
+ #c{position:relative;width:100%;height:6400px}
+ .h{position:absolute;left:0;right:0;height:3px;background:#f00}
+ .v{position:absolute;top:0;bottom:0;width:3px;background:#0f0}
+ .lbl{position:absolute;left:6px;color:#fff;font:14px/1 monospace;background:#000}
+</style></head><body><div id="c"></div><script>
+// Deterministic grid: vertical gradient (BLUE channel encodes docY), red horizontal rules + green
+// vertical rules every STEP doc-px, Y labels. The host analyzer decodes scroll pos / width / tearing.
+var H=6400, STEP=128, c=document.getElementById('c'), h='';
+c.style.background='linear-gradient(to bottom, rgb(0,0,0), rgb(0,0,255))';
+for(var y=0;y<H;y+=STEP){ h+='<div class="h" style="top:'+y+'px"></div><div class="lbl" style="top:'+(y+3)+'px">Y'+y+'</div>'; }
+for(var x=0;x<2048;x+=STEP){ h+='<div class="v" style="left:'+x+'px"></div>'; }
+c.innerHTML=h; document.title='gridtest H='+H+' step='+STEP;
+</script></body></html>
