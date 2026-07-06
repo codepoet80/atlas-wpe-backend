@@ -456,7 +456,11 @@ void BrowserPageWPE::ensureWebView()
                 if (screenH <= 0) screenH = (int)vi.yres;
             }
             close(fbfd); } }
-    if (m_windowWidth > 0) screenW = m_windowWidth;   /* rotation: the live window width wins over the panel config */
+    /* rotation: the live window width wins over the panel config — but ONLY if it's a plausible orientation
+     * width. During launch the card flickers through tiny placeholder sizes (300x150); letting a 300px width
+     * size the shm SLOT permanently caps the buffer (300-wide) so every real 1024-wide frame is dropped as a
+     * size mismatch -> nothing delivered -> ~95% uncovered scroll. Fall back to the panel width for those. */
+    if (m_windowWidth >= 600) screenW = m_windowWidth;
     if (screenW < renderW) screenW = renderW;   /* never narrower than the adapter's layout width */
     m_screenWidth  = screenW;
     m_screenHeight = screenH;                    /* 0 if unknown → setScrollPosition uses the safe path */
@@ -1158,15 +1162,19 @@ void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
      * PLACE via the view-backend resize (dispatch_set_size); update the reported geometry so onFrame accepts
      * the new width and contentZoom stays 1.0, and re-derive the scroll/pan state + re-query the page height
      * so panning after the rotate doesn't stall. */
-    if (m_webView && m_viewBackend && oldW > 0 && (int)w != oldW && m_renderHeight > 0) {
+    /* Resize only to a PLAUSIBLE orientation width (>=600). During launch the card flickers through tiny
+     * placeholder sizes (300x150, 960x1400) — reacting to those, and area-preserving from their bogus areas,
+     * COLLAPSED the scroll buffer (300x3072 area / 1024 = layout 1024x900, slack ~214 -> ~95% uncovered). */
+    if (m_webView && m_viewBackend && oldW > 0 && (int)w != oldW && m_renderHeight > 0 && (int)w >= 600) {
         int newLayoutW = (int)w;
-        /* Rotation preserves the rendered pixel AREA (= the shm slot allocated for the launch
-         * orientation). The 4:3 panel's rotated layout has equal area, so the render height scales
-         * inversely with the new width. This fills the taller portrait viewport instead of clamping
-         * to the stale landscape height (which left a blank/garbage band at the bottom). 1:1 only
-         * (contentZoom==1); m_renderWidth*m_renderHeight stays constant across rotations. */
+        /* Rotation preserves the rendered pixel AREA (= the shm slot allocated for the launch orientation):
+         * the render height scales inversely with the new width. Guard the area: if the current one is
+         * implausibly small (a placeholder slipped through earlier), use the TouchPad tall-buffer slot
+         * (1024x3072) so we never area-preserve from garbage. */
         long area = (long)m_renderWidth * m_renderHeight;
-        int newLayoutH = newLayoutW > 0 ? (int)(area / newLayoutW) : m_renderHeight;
+        if (area < 2000000L) area = 3145728L;        /* 1024x3072 slot */
+        int newLayoutH = (int)(area / newLayoutW);
+        if (newLayoutH < 2048) newLayoutH = 2048;    /* never collapse the scroll buffer (safety clamp) */
         m_virtualWindowWidth = newLayoutW;   // layout / document coordinate space
         m_renderWidth  = newLayoutW;         // onFrame validates against this (1:1, no fit-to-screen scaling)
         m_renderHeight = newLayoutH;
@@ -1307,7 +1315,15 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
     }
     int lead = 0;
     bool sustained = (m_dirStreak >= 3 || m_dirStreak <= -3);   /* only lead when scrolling one way consistently */
-    if (!force && sustained && absVel > 700) { int L = slack / 2 - screenH / 3; if (L < 0) L = 0; lead = (m_scrollVel > 0) ? L : -L; }  /* settle/oscillation center on cy (no lead) */
+    if (!force && sustained && absVel > 700) {
+        /* Lead SCALES with speed instead of a fixed ~965px slug: a big fixed lead makes every moderate-scroll
+         * re-center visibly JUMP ~965px ahead, while moderate scroll (which keeps up fine) needs little lead.
+         * Full lead only kicks in for genuine fast flicks (where the buffer would otherwise be outrun). */
+        int Lmax = slack / 2 - screenH / 3; if (Lmax < 0) Lmax = 0;
+        int L = (absVel * (screenH > 0 ? screenH : 686)) / 4000;   /* ~screenH of lead per 4000 px/s */
+        if (L > Lmax) L = Lmax;
+        lead = (m_scrollVel > 0) ? L : -L;
+    }
     int newTop = cy - slack / 2 + lead; if (newTop < 0) newTop = 0;   /* bias the buffer toward the scroll direction */
     int maxTop = m_pageHeight - m_renderHeight;
     if (maxTop > 0 && newTop > maxTop) newTop = maxTop;
