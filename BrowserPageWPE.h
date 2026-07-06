@@ -273,6 +273,8 @@ private:
     int                 m_virtualWindowWidth, m_virtualWindowHeight;
     int                 m_screenWidth;          // real fb width; layout may be wider (fit-to-screen via contentZoom)
     int                 m_screenHeight;         // real fb height (visible rows) — the pannable window height
+    int                 m_fsFillH = 0;          // fullscreen: visible screen height to fill the video to (deferred CSS)
+    bool                m_fsPending = false;    // fullscreen: a deferred CSS-fill is queued (cleared on leave)
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     gint64              m_touchDownUs = 0;      // monotonic timestamp of the last touch-down, to tell a quick tap (dismiss selection) from a long-press (select)

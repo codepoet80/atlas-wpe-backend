@@ -565,6 +565,12 @@ void BrowserPageWPE::ensureWebView()
      * with autoplay work and tap-to-play isn't swallowed. No-op when the engine is built media-off. */
     webkit_settings_set_media_playback_requires_user_gesture(s, FALSE);
     webkit_settings_set_enable_media(s, TRUE);
+    /* WebKit DOM fullscreen ABORTS (SIGABRT) the moment it engages in our headless/no-window embedding —
+     * proven inherent to WebKit's async fullscreen continuation, NOT our enter-fullscreen handler (deferring
+     * all handler work out of the signal still crashed). So keep it OFF by default (requestFullscreen is
+     * rejected cleanly, fullscreen is a no-op) for stability; `touch /tmp/atlas_fs` re-enables it for debugging
+     * the crash. Proper fullscreen needs the system-media handoff (bypasses WebKit fullscreen) or a WebKit fix. */
+    webkit_settings_set_enable_fullscreen(s, access("/tmp/atlas_fs", F_OK) == 0 ? TRUE : FALSE);
     webkit_settings_set_enable_developer_extras(s, FALSE);
     webkit_settings_set_enable_page_cache(s, (access("/tmp/atlas_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/atlas_nocache */
     /* ALWAYS use a modern WebKit/Safari UA — the adapter otherwise sends the legacy
@@ -590,15 +596,52 @@ void BrowserPageWPE::ensureWebView()
     g_signal_connect(m_webView, "load-failed-with-tls-errors",  G_CALLBACK(onTlsErrors), this);
     /* Fullscreen: HANDLE it ourselves (return TRUE). The WPE default fullscreen path resizes the
      * view — a no-op on our fixed-size backend — and then blocks waiting for a resize/repaint that
-     * never arrives, hanging the page. By returning TRUE we take ownership: WebKit still enters DOM
-     * fullscreen (the video element gets :fullscreen and fills the viewport, which is already
-     * ~screen-sized), but skips the resize handshake, so no hang. leave-fullscreen likewise. */
+     * never arrives, hanging the page. Returning TRUE takes ownership (no hang), and WebKit still
+     * enters DOM fullscreen so the element gets :-webkit-full-screen.
+     *
+     * BUT our "viewport" is the TALL pan-buffer (1024x3072), not the screen, so the UA :fullscreen
+     * rule (height:100% -> 3072) put the video's letterbox strip mid-buffer, off the visible card
+     * (the "fullscreen does nothing" bug). Tier-1 fix (CSS): inject a style that caps the fullscreen
+     * element to the VISIBLE screen height (m_screenHeight) as a fixed overlay at buffer top, and
+     * align the pan so the adapter shows buffer top (m_renderedY = m_scrollY, same identity-blit trick
+     * the rotation path uses) so the overlay lands in the visible card. Nudge a repaint via scrollTo.
+     * leave-fullscreen removes the style. (Tier-2 later: screen-sized surface resize for higher fps.) */
     g_signal_connect(m_webView, "enter-fullscreen",
-        G_CALLBACK(+[](WebKitWebView*, gpointer) -> gboolean {
-            WLOG("enter-fullscreen (handled; element fills fixed viewport)"); return TRUE; }), this);
+        G_CALLBACK(+[](WebKitWebView* v, gpointer ud) -> gboolean {
+            BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+            int sh = self ? self->m_screenHeight : 0; if (sh < 500) sh = 768;
+            /* DIAGNOSTIC (crash isolation): do NOT touch WebKit synchronously here. Stash the fill params and
+             * inject the CSS on the NEXT main-loop turn, out of the fullscreen state machine. If the crash was
+             * my re-entrant evaluate_javascript, this fixes it; if it still crashes, WebKit's fullscreen
+             * engagement itself is the fault (deeper). */
+            if (self) { self->m_renderedY = self->m_scrollY;
+                self->m_fsFillH = sh; self->m_fsPending = true;
+                g_idle_add(+[](gpointer p) -> gboolean {
+                    BrowserPageWPE* s = static_cast<BrowserPageWPE*>(p);
+                    if (!s->m_fsPending || !s->m_webView) return G_SOURCE_REMOVE;
+                    s->m_fsPending = false;
+                    char js[720];
+                    snprintf(js, sizeof(js),
+                      "(function(){var e=document.fullscreenElement||document.webkitFullscreenElement;"
+                      "if(!e){var vs=document.getElementsByTagName('video'),b=null,ba=-1;"
+                      "for(var i=0;i<vs.length;i++){var r=vs[i].getBoundingClientRect();var a=r.width*r.height;if(a>ba){ba=a;b=vs[i];}}e=b;}"
+                      "if(!e)return;e.setAttribute('data-atlasfs','1');"
+                      "var st=document.getElementById('__atlasfs');if(!st){st=document.createElement('style');st.id='__atlasfs';(document.head||document.documentElement).appendChild(st);}"
+                      "st.textContent='[data-atlasfs]{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:%dpx!important;max-height:%dpx!important;margin:0!important;background:#000!important;object-fit:contain!important;z-index:2147483647!important}html,body{overflow:hidden!important}';"
+                      "try{window.scrollTo(0,0);}catch(e2){}})();", s->m_fsFillH, s->m_fsFillH);
+                    webkit_web_view_evaluate_javascript(s->m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+                    return G_SOURCE_REMOVE;
+                }, self);
+            }
+            WLOG("enter-fullscreen (deferred CSS fill, visible h=%d)", sh); return TRUE; }), this);
     g_signal_connect(m_webView, "leave-fullscreen",
-        G_CALLBACK(+[](WebKitWebView*, gpointer) -> gboolean {
-            WLOG("leave-fullscreen (handled)"); return TRUE; }), this);
+        G_CALLBACK(+[](WebKitWebView* v, gpointer ud) -> gboolean {
+            BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+            if (self) self->m_fsPending = false;   /* cancel any not-yet-run fill */
+            const char* js = "(function(){var s=document.getElementById('__atlasfs');if(s)s.textContent='';"
+                             "var e=document.querySelector('[data-atlasfs]');if(e)e.removeAttribute('data-atlasfs');})();";
+            webkit_web_view_evaluate_javascript(v, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+            WLOG("leave-fullscreen (atlas CSS cleared)"); return TRUE; }), this);
 
     applyContentBlocker(webkit_web_view_get_user_content_manager(m_webView));
 
