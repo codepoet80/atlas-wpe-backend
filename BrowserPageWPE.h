@@ -79,6 +79,7 @@ public:
     void startScrollTest();      // begin a top->bottom->top sweep on this page
     bool scrollTestStep();       // one timed step; returns false when the sweep finishes
     void reportScrollTest();     // log the SCROLLTEST summary line
+    void toggleRotationTest();   // simulate a rotate: toggle window portrait<->landscape (test harness)
 
     // ---- input ----
     void mouseEvent(int type, int contentX, int contentY, int detail);

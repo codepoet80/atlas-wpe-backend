@@ -1176,6 +1176,13 @@ void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
         /* the re-flow changes the page height at the new width — re-query it so the adapter's scroll clamp
          * is right, and reset the pan bookkeeping so the next setScrollPosition isn't gated as "in flight". */
         m_renderPending = false;
+        /* Force an immediate repaint at the new orientation. The backend resize re-lays-out WebKit but does
+         * not reliably schedule a composite, so without this the reflow only appears after the next scroll.
+         * Re-assert the current scroll (in document space) to trigger a paint; the backend's force_full then
+         * re-seeds the pan master at the new size. renderedY := scroll so the adapter blit is the identity. */
+        m_renderedY = m_scrollY;
+        { char js[96]; snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", m_scrollX, m_scrollY);
+          webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr); }
         updateContentsSize();
         return;
     }
@@ -1206,7 +1213,12 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
      * biased in the scroll direction — the ~1.4s composite then lands before we reach the buffer edge. */
     { long nowms = _wlog_ms(); long dt = nowms - m_lastScrollMs; if (dt < 0) dt += 10000000;
       int dy = cy - m_lastScrollY;
-      m_scrollVel = (m_lastScrollMs && dt > 0 && dt < 400) ? (int)((long)dy * 1000 / dt) : 0;
+      /* Require dt>=8ms: sub-frame gaps (adapter batching multiple positions in the same tick) otherwise
+       * divide by ~1ms and yield absurd velocities (vel=430000) that poison the guard/lead math -> jumping.
+       * Clamp to a human-plausible ±8000 px/s regardless. */
+      m_scrollVel = (m_lastScrollMs && dt >= 8 && dt < 400) ? (int)((long)dy * 1000 / dt) : 0;
+      if (m_scrollVel >  8000) m_scrollVel =  8000;
+      if (m_scrollVel < -8000) m_scrollVel = -8000;
       /* Direction streak: consecutive same-direction moves (signed). The predictive lead only kicks in for
        * SUSTAINED scrolling (|streak|>=3); on a direction flip it resets to ±1, so oscillation gets no lead
        * -> the buffer stops swinging ~1500px on every up/down flip. */
@@ -1504,7 +1516,23 @@ static gboolean scrolltest_poll(gpointer)
         else
             WLOG("scrolltest trigger: no testable page (or a test is already running)");
     }
+    /* Rotation test: `touch /tmp/atlas_rotatetest` toggles the window between landscape (1024x686) and
+     * portrait (768x942) — driving setWindowSize exactly like a real rotate, so the reflow/resize path
+     * can be exercised + framebuffer-checked autonomously. */
+    if (access("/tmp/atlas_rotatetest", F_OK) == 0) {
+        unlink("/tmp/atlas_rotatetest");
+        if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end())
+            g_testablePage->toggleRotationTest();
+    }
     return G_SOURCE_CONTINUE;
+}
+/* Simulate a device rotation by toggling the window size portrait<->landscape (drives setWindowSize). */
+void BrowserPageWPE::toggleRotationTest()
+{
+    bool wide = m_windowWidth >= 1000;
+    if (wide) setWindowSize(768, 942);
+    else      setWindowSize(1024, 686);
+    WLOG("rotatetest -> %s", wide ? "portrait 768x942" : "landscape 1024x686");
 }
 void BrowserPageWPE::startScrollTest()
 {

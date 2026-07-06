@@ -838,12 +838,15 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
     EGLSurface pDraw = eglGetCurrentSurface(EGL_DRAW), pRead = eglGetCurrentSurface(EGL_READ);
     if (dpy == EGL_NO_DISPLAY || webctx == EGL_NO_CONTEXT) return false;
 
-    if (!t->vlock_surf || t->vlock_w != (uint32_t)vw || t->vlock_h != (uint32_t)vh) {
+    /* Fixed FULL-size (rw x rh) lockable pbuffer, created ONCE and reused for any sub-rect — the strip
+     * height varies every scroll, so a per-rect pbuffer would churn EGL surfaces. Blit the sub-rect into
+     * its bottom-left corner (GL viewport origin); map + copy only that corner below. */
+    if (!t->vlock_surf || t->vlock_w != rw || t->vlock_h != rh) {
         if (t->vlock_surf) { eglDestroySurface(dpy, t->vlock_surf); t->vlock_surf = 0; }
-        EGLint sa[] = { EGL_WIDTH, vw, EGL_HEIGHT, vh, EGL_NONE };
+        EGLint sa[] = { EGL_WIDTH, (EGLint)rw, EGL_HEIGHT, (EGLint)rh, EGL_NONE };
         t->vlock_surf = eglCreatePbufferSurface(dpy, (EGLConfig)t->lock_cfg, sa);
         if (t->vlock_surf == EGL_NO_SURFACE) { t->vlock_surf = 0; return false; }
-        t->vlock_w = vw; t->vlock_h = vh;
+        t->vlock_w = rw; t->vlock_h = rh;
     }
 
     struct timeval a, b; gettimeofday(&a, NULL);
@@ -879,8 +882,11 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
         uint8_t* ptr = (uint8_t*)(uintptr_t)ptr_i;
         if (ptr && pitch > 0) {
             size_t stride = (size_t)rw * 4;
+            /* The sub-rect was blitted into the pbuffer's bottom-left corner (GL viewport 0,0,vw,vh). The
+             * pbuffer is full rh tall, so an UPPER_LEFT bitmap has its row 0 at the pbuffer TOP -> the
+             * blitted content's row y is at map row (rh-1-y). LOWER_LEFT: row 0 is the corner -> row y. */
             for (int y = 0; y < vh; y++) {
-                int sy = (origin == EGL_UPPER_LEFT_KHR) ? (vh - 1 - y) : y;
+                int sy = (origin == EGL_UPPER_LEFT_KHR) ? ((int)rh - 1 - y) : y;
                 memcpy(dst + (size_t)(vy + y) * stride + (size_t)vx * 4, ptr + (size_t)sy * pitch, (size_t)vw * 4);
             }
             ok = true;
@@ -930,7 +936,7 @@ static void target_frame_rendered(void* d)
          * (or a reflow beating the scroll frame) consumes the seq and falls through to the full read. */
         static int s_noStrip = -1;   /* isolate crashes: `touch /tmp/atlas_no_strip` disables the strip path */
         if (s_noStrip < 0) s_noStrip = (access("/tmp/atlas_no_strip", F_OK) == 0 || getenv("BPWPE_NO_STRIP")) ? 1 : 0;
-        if (!wantScale && s_bgra_readback >= 0 && !s_noStrip && !t->force_full) {   /* need the readback format probed first; force_full after a resize */
+        if (!wantScale && !s_noStrip && !t->force_full) {   /* NOTE: no s_bgra_readback gate — lock_surface is the default full path and never runs the probe, so it stays -1; the strip read below uses lock_readback_rect / RGBA+swizzle, neither of which needs it */
             if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));
             struct atlas_ctrl* ctrl = shm_ctrl(t->shm, t->width, t->height);
             uint32_t seq = ctrl->seq;
@@ -947,12 +953,21 @@ static void target_frame_rendered(void* d)
                         memmove(t->master, t->master + (size_t)delta * stride, (size_t)(rh - delta) * stride);
                     else                /* scrolled up:   keep old rows [0,rh-ad) at [ad,rh) */
                         memmove(t->master + (size_t)ad * stride, t->master, (size_t)(rh - ad) * stride);
-                    if (s_bgra_readback == 1) {
-                        glReadPixels(0, y0, (GLsizei)rw, (GLsizei)sh, 0x80E1 /*GL_BGRA_EXT*/, GL_UNSIGNED_BYTE,
-                                     t->master + (size_t)y0 * stride);
-                    } else {            /* swizzle path: read the strip RGBA, swizzle into master at y0 */
-                        glReadPixels(0, y0, (GLsizei)rw, (GLsizei)sh, GL_RGBA, GL_UNSIGNED_BYTE, t->scratch);
-                        swizzle_flip(t->scratch, t->master + (size_t)y0 * stride, rw, (uint32_t)sh);
+                    /* Fast strip: lock_surface sub-rect maps GPU mem (~sh rows) instead of paying
+                     * glReadPixels' ~300ms fixed stall (measured: a 133-row glReadPixels strip = 370ms!).
+                     * The lock pbuffer is now full-size + reused, so no per-strip surface churn. Falls back
+                     * to glReadPixels if the lock path isn't warmed up / is disabled (/tmp/atlas_no_vlock). */
+                    long _sus = 0;
+                    static int s_noVlockS = -1;
+                    if (s_noVlockS < 0) s_noVlockS = (access("/tmp/atlas_no_vlock", F_OK) == 0 || getenv("BPWPE_NO_VLOCK")) ? 1 : 0;
+                    if (s_noVlockS || !lock_readback_rect(t, t->master, rw, rh, 0, y0, (int)rw, sh, &_sus)) {
+                        if (s_bgra_readback == 1) {
+                            glReadPixels(0, y0, (GLsizei)rw, (GLsizei)sh, 0x80E1 /*GL_BGRA_EXT*/, GL_UNSIGNED_BYTE,
+                                         t->master + (size_t)y0 * stride);
+                        } else {        /* swizzle path: read the strip RGBA, swizzle into master at y0 */
+                            glReadPixels(0, y0, (GLsizei)rw, (GLsizei)sh, GL_RGBA, GL_UNSIGNED_BYTE, t->scratch);
+                            swizzle_flip(t->scratch, t->master + (size_t)y0 * stride, rw, (uint32_t)sh);
+                        }
                     }
                     memcpy(slot, t->master, (size_t)rh * stride);
                     gettimeofday(&_b, NULL);
