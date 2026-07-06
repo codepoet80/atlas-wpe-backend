@@ -65,9 +65,19 @@ static size_t slot_bytes(uint32_t w, uint32_t h) { return (size_t)w * h * 4; }
  * strip (glReadPixels sub-rect, ~50-100ms) after memmove'ing the overlap in its master buffer —
  * instead of the whole tall buffer (~1.2s). Coherent SysV shm + a seq handshake, no extra socket. */
 struct atlas_ctrl { volatile uint32_t seq; int32_t y0; int32_t stripH; int32_t delta; };
+/* Video damage-rect: while a <video> plays, the ONLY page region changing is its rect. BrowserPageWPE
+ * publishes it here (device px, top-origin, 1:1 — same space as glReadPixels/the master buffer); the
+ * WebProcess then reads back ONLY that sub-rect each frame and splices it into the master (rest of the
+ * page is static → comes from master), turning the full 1024x3072 readback into ~vw*vh. seq is a
+ * version guard (read seq, fields, seq again — retry-as-full on tear). active=0 → normal full readback. */
+struct atlas_vrect { volatile uint32_t seq; int32_t x, y, w, h; int32_t active; };
 static size_t shm_total_bytes(uint32_t w, uint32_t h) { return (size_t)SLOTS * slot_bytes(w, h) + 4096; }
 static struct atlas_ctrl* shm_ctrl(uint8_t* shm, uint32_t w, uint32_t h) {
     return (struct atlas_ctrl*)(shm + (size_t)SLOTS * slot_bytes(w, h));
+}
+/* placed 64B after atlas_ctrl in the SAME 4096B ctrl page (atlas_ctrl is 16B) */
+static struct atlas_vrect* shm_vrect(uint8_t* shm, uint32_t w, uint32_t h) {
+    return (struct atlas_vrect*)(shm + (size_t)SLOTS * slot_bytes(w, h) + 64);
 }
 
 /* =========================================================================================== *
@@ -315,6 +325,21 @@ void wpe_atlas_view_backend_scroll_hint(struct wpe_view_backend* wpe, int y0, in
     __sync_synchronize();
 }
 
+/* Publish the playing <video>'s damage rect (device px, top-origin, 1:1). BrowserPageWPE polls the DOM
+ * and calls this; the WebProcess reads it in target_frame_rendered for sub-rect readback. active=0 ends
+ * it (resume full readback). Cheap enough to call every poll even when unchanged (seq guards the read). */
+void wpe_atlas_view_backend_video_rect(struct wpe_view_backend* wpe, int x, int y, int w, int h, int active)
+{
+    struct atlas_view* v = g_atlas_views;
+    while (v && v->wpe != wpe) v = v->next;
+    if (!v || !v->shm || v->shm == (void*)-1) return;
+    struct atlas_vrect* r = shm_vrect(v->shm, v->width, v->height);
+    r->x = x; r->y = y; r->w = w; r->h = h; r->active = active;
+    __sync_synchronize();               /* fields visible before the seq bump */
+    r->seq = r->seq + 1;
+    __sync_synchronize();
+}
+
 /* =========================================================================================== *
  *  UIProcess side: renderer host (general WebProcess connection — display only, minimal)        *
  * =========================================================================================== */
@@ -374,6 +399,9 @@ struct atlas_target {
     uint8_t* scratch;       /* width*height*4 readback scratch (RGBA, pre-swizzle) */
     uint8_t* master;        /* P2: persistent BGRA copy of the whole tall buffer (1:1 only); strip readback + overlap memmove happen here */
     uint32_t last_seq;      /* P2: last consumed atlas_ctrl.seq (0 = none yet) */
+    uint8_t* vscratch;      /* video sub-rect readback scratch (RGBA/BGRA, up to one video rect) */
+    size_t   vscratch_sz;
+    uint32_t vframe;        /* video sub-rect frames since the last full readback (periodic full refresh) */
     GLuint   fbo, tex, depth;   /* offscreen render target WebKit composites into (surfaceless ctx) */
     uint32_t fbo_w, fbo_h;
     /* ---- fit-to-screen downscale (see wpe_atlas_view_backend_create) ---- */
@@ -388,6 +416,9 @@ struct atlas_target {
     EGLContext lock_ctx;        /* shares WebKit's context so it can sample t->tex */
     uint32_t   lock_w, lock_h;  /* current pbuffer size */
     int        lock_state;      /* -1 untried, 1 ready, 0 unavailable -> fall back to glReadPixels */
+    void*      lock_cfg;        /* EGLConfig chosen for the lockable pbuffer (reused by the vrect sub-rect) */
+    EGLSurface vlock_surf;      /* small lockable pbuffer for the video sub-rect (vrect fast path) */
+    uint32_t   vlock_w, vlock_h;
 };
 
 static bool target_read_setup(struct atlas_target* t)
@@ -717,6 +748,7 @@ static bool lock_readback(struct atlas_target* t, uint8_t* slot, uint32_t rw, ui
             t->lock_ctx = eglCreateContext(dpy, cfg, webctx, xa);   /* share WebKit's ctx -> sample t->tex */
             if (t->lock_ctx == EGL_NO_CONTEXT) { ATLAS_LOG("locksurf: ctx fail 0x%x", eglGetError()); t->lock_state = 0; return false; }
         }
+        t->lock_cfg = (void*)cfg;   /* reused by the vrect sub-rect pbuffer */
         t->lock_w = rw; t->lock_h = rh; t->lock_state = 1;
         ATLAS_LOG("locksurf: ready %ux%u", rw, rh);
     }
@@ -770,6 +802,86 @@ static bool lock_readback(struct atlas_target* t, uint8_t* slot, uint32_t rw, ui
         ok = true;
     }
     p_unlock(dpy, t->lock_surf);
+    eglMakeCurrent(dpy, pDraw, pRead, webctx);
+    gettimeofday(&b, NULL);
+    if (out_us) *out_us = (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_usec - a.tv_usec);
+    return ok;
+}
+
+/* Sub-rect variant of lock_readback for the video damage rect: blit ONLY [vx,vy,vw,vh] of t->tex into a
+ * small lockable pbuffer, map it, and copy into dst (the master buffer, stride rw*4) at (vx,vy). Reuses
+ * lock_ctx/lock_cfg warmed up by the full lock path (a seed/periodic-full frame runs it first). ~vw*vh
+ * work instead of the whole frame, and it maps GPU memory directly — skipping glReadPixels' ~200ms fixed
+ * GPU->CPU stall. Orientation matches the full path: slot(X,Y)=texture(X,Y) via the same v-texcoords +
+ * origin flip (derived over vh). The locked bitmap is BGRA already (like the full path) — no swizzle.
+ * Returns false on any failure so the caller falls back to the glReadPixels sub-rect. */
+static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw, uint32_t rh,
+                               int vx, int vy, int vw, int vh, long* out_us)
+{
+    static PFNEGLLOCKSURFACEKHRPROC   p_lock   = NULL;
+    static PFNEGLUNLOCKSURFACEKHRPROC p_unlock = NULL;
+    static int s_proc = 0;
+    if (!s_proc) { s_proc = 1;
+        p_lock   = (PFNEGLLOCKSURFACEKHRPROC)  eglGetProcAddress("eglLockSurfaceKHR");
+        p_unlock = (PFNEGLUNLOCKSURFACEKHRPROC)eglGetProcAddress("eglUnlockSurfaceKHR");
+    }
+    if (!p_lock || !p_unlock || !t->lock_ctx || !t->lock_cfg || !t->ds_prog) return false;  /* full path not warmed up yet */
+    if (vw <= 0 || vh <= 0) return false;
+
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLContext webctx = eglGetCurrentContext();
+    EGLSurface pDraw = eglGetCurrentSurface(EGL_DRAW), pRead = eglGetCurrentSurface(EGL_READ);
+    if (dpy == EGL_NO_DISPLAY || webctx == EGL_NO_CONTEXT) return false;
+
+    if (!t->vlock_surf || t->vlock_w != (uint32_t)vw || t->vlock_h != (uint32_t)vh) {
+        if (t->vlock_surf) { eglDestroySurface(dpy, t->vlock_surf); t->vlock_surf = 0; }
+        EGLint sa[] = { EGL_WIDTH, vw, EGL_HEIGHT, vh, EGL_NONE };
+        t->vlock_surf = eglCreatePbufferSurface(dpy, (EGLConfig)t->lock_cfg, sa);
+        if (t->vlock_surf == EGL_NO_SURFACE) { t->vlock_surf = 0; return false; }
+        t->vlock_w = vw; t->vlock_h = vh;
+    }
+
+    struct timeval a, b; gettimeofday(&a, NULL);
+    glFinish();   /* WebKit's render into t->tex must complete before the shared lock_ctx samples it */
+    if (!eglMakeCurrent(dpy, t->vlock_surf, t->vlock_surf, t->lock_ctx)) {
+        eglMakeCurrent(dpy, pDraw, pRead, webctx); return false;
+    }
+    float u0 = (float)vx / rw, u1 = (float)(vx + vw) / rw;
+    float v0 = (float)vy / rh, v1 = (float)(vy + vh) / rh;
+    const GLfloat quad[] = { -1.f,-1.f,u0,v0,  1.f,-1.f,u1,v0,  -1.f,1.f,u0,v1,  1.f,1.f,u1,v1 };
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, vw, vh);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    glUseProgram(t->ds_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    glUniform1i(t->ds_uSampler, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), quad);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), quad + 2);
+    glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glFinish();
+
+    EGLint la[] = { EGL_MAP_PRESERVE_PIXELS_KHR, EGL_TRUE, EGL_LOCK_USAGE_HINT_KHR, EGL_READ_SURFACE_BIT_KHR, EGL_NONE };
+    bool ok = false;
+    if (p_lock(dpy, t->vlock_surf, la)) {
+        EGLint ptr_i = 0, pitch = 0, origin = EGL_LOWER_LEFT_KHR;
+        eglQuerySurface(dpy, t->vlock_surf, EGL_BITMAP_POINTER_KHR, &ptr_i);
+        eglQuerySurface(dpy, t->vlock_surf, EGL_BITMAP_PITCH_KHR, &pitch);
+        eglQuerySurface(dpy, t->vlock_surf, EGL_BITMAP_ORIGIN_KHR, &origin);
+        uint8_t* ptr = (uint8_t*)(uintptr_t)ptr_i;
+        if (ptr && pitch > 0) {
+            size_t stride = (size_t)rw * 4;
+            for (int y = 0; y < vh; y++) {
+                int sy = (origin == EGL_UPPER_LEFT_KHR) ? (vh - 1 - y) : y;
+                memcpy(dst + (size_t)(vy + y) * stride + (size_t)vx * 4, ptr + (size_t)sy * pitch, (size_t)vw * 4);
+            }
+            ok = true;
+        }
+        p_unlock(dpy, t->vlock_surf);
+    }
     eglMakeCurrent(dpy, pDraw, pRead, webctx);
     gettimeofday(&b, NULL);
     if (out_us) *out_us = (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_usec - a.tv_usec);
@@ -843,6 +955,70 @@ static void target_frame_rendered(void* d)
                         y0, sh, delta, (_b.tv_sec-_a.tv_sec)*1000000L+(_b.tv_usec-_a.tv_usec), rw, rh, s_bgra_readback); }
                     goto sent;
                 }
+            }
+        }
+
+        /* Video damage-rect readback: while a <video> plays, only its rect changes, so read back ONLY
+         * that sub-rect and splice into master (static rest of page comes from master). Turns the full
+         * ~1024x3072 readback into ~vw*vh. A periodic FULL frame (every VFULL) refreshes non-video page
+         * changes; the first active frame also falls through to full to seed master. Gated /tmp/atlas_no_vrect. */
+        /* NOTE: do NOT gate on s_bgra_readback here — with lock_surface ON (the default full-readback
+         * path) the BGRA probe below never runs, so it stays -1 forever. The sub-rect read below falls
+         * back to RGBA+swizzle when bgra!=1, which needs no probe. */
+        static int s_noVrect = -1;
+        if (s_noVrect < 0) s_noVrect = (access("/tmp/atlas_no_vrect", F_OK) == 0 || getenv("BPWPE_NO_VRECT")) ? 1 : 0;
+        if (!wantScale && !s_noVrect) {
+            if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));   /* strip path is bgra-gated & may never alloc it; seeded by the full/lock readback on doFull frames */
+        }
+        if (!wantScale && !s_noVrect && t->master) {
+            const uint32_t VFULL = 30;
+            struct atlas_vrect* vr = shm_vrect(t->shm, t->width, t->height);
+            uint32_t vseq = vr->seq; __sync_synchronize();
+            int active = vr->active, vx = vr->x, vy = vr->y, vw = vr->w, vh = vr->h;
+            __sync_synchronize();
+            if (vr->seq == vseq && active) {                 /* consistent (no writer tear) + a video is playing */
+                if (vx < 0) { vw += vx; vx = 0; }            /* clamp rect to the buffer */
+                if (vy < 0) { vh += vy; vy = 0; }
+                if (vx + vw > (int)rw) vw = (int)rw - vx;
+                if (vy + vh > (int)rh) vh = (int)rh - vy;
+                bool doFull = (t->vframe == 0) || (t->vframe % VFULL == 0);   /* seed + periodic full refresh */
+                t->vframe++;
+                if (!doFull && vw > 0 && vh > 0) {
+                    size_t stride = (size_t)rw * 4;
+                    struct timeval _va, _vb; gettimeofday(&_va, NULL);
+                    long vus = 0; int used_lock = 0, got = 0;
+                    /* Fast path: lock_surface sub-rect (maps GPU mem, ~vw*vh) — skips glReadPixels' ~200ms
+                     * fixed stall. Falls back to glReadPixels if the lock path isn't warmed up / fails.
+                     * Gate /tmp/atlas_no_vlock. */
+                    static int s_noVlock = -1;
+                    if (s_noVlock < 0) s_noVlock = (access("/tmp/atlas_no_vlock", F_OK) == 0 || getenv("BPWPE_NO_VLOCK")) ? 1 : 0;
+                    if (!s_noVlock && lock_readback_rect(t, t->master, rw, rh, vx, vy, vw, vh, &vus)) { got = 1; used_lock = 1; }
+                    if (!got) {                              /* glReadPixels fallback (robust, ~200ms) */
+                        size_t need = (size_t)vw * vh * 4;
+                        if (t->vscratch_sz < need) { free(t->vscratch); t->vscratch = (uint8_t*)malloc(need); t->vscratch_sz = t->vscratch ? need : 0; }
+                        if (t->vscratch) {
+                            if (s_bgra_readback == 1) {
+                                glReadPixels(vx, vy, (GLsizei)vw, (GLsizei)vh, 0x80E1 /*GL_BGRA_EXT*/, GL_UNSIGNED_BYTE, t->vscratch);
+                                for (int ry = 0; ry < vh; ry++)
+                                    memcpy(t->master + (size_t)(vy+ry)*stride + (size_t)vx*4, t->vscratch + (size_t)ry*vw*4, (size_t)vw*4);
+                            } else {                         /* swizzle each row into the strided master */
+                                glReadPixels(vx, vy, (GLsizei)vw, (GLsizei)vh, GL_RGBA, GL_UNSIGNED_BYTE, t->vscratch);
+                                for (int ry = 0; ry < vh; ry++)
+                                    swizzle_flip(t->vscratch + (size_t)ry*vw*4, t->master + (size_t)(vy+ry)*stride + (size_t)vx*4, (uint32_t)vw, 1);
+                            }
+                            got = 1;
+                        }
+                    }
+                    if (got) {
+                        memcpy(slot, t->master, (size_t)rh * stride);
+                        gettimeofday(&_vb, NULL);
+                        { static int _vn = 0; if (_vn++ % 30 == 0) ATLAS_LOG("VRECT %d,%d %dx%d %ldus lock=%d (buf %ux%u)",
+                            vx, vy, vw, vh, (_vb.tv_sec-_va.tv_sec)*1000000L+(_vb.tv_usec-_va.tv_usec), used_lock, rw, rh); }
+                        goto sent;                           /* else fall through to a full readback (seed/periodic) */
+                    }
+                }
+            } else {
+                t->vframe = 0;                               /* no video → next active frame seeds master with a full read */
             }
         }
 

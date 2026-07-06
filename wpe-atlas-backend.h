@@ -68,6 +68,16 @@ WPE_ATLAS_EXPORT
 void wpe_atlas_view_backend_scroll_hint(struct wpe_view_backend*, int y0, int stripH, int delta);
 
 /*
+ * Video damage-rect: while a <video> plays, publish its on-screen rect (device px, top-origin, 1:1 —
+ * the same space as the readback/master buffer). The WebProcess then reads back ONLY that sub-rect each
+ * frame (splicing into the persistent master), instead of the whole 1024x3072 buffer — the difference
+ * between ~1 fps and playable video. active=0 ends it (resume full readback). Also covers fullscreen
+ * video (the rect simply becomes the whole viewport) and is the same rect a future MDP overlay will use.
+ */
+WPE_ATLAS_EXPORT
+void wpe_atlas_view_backend_video_rect(struct wpe_view_backend*, int x, int y, int w, int h, int active);
+
+/*
  * Input is dispatched with the stock libwpe entry points directly on the returned
  * wpe_view_backend, e.g. wpe_view_backend_dispatch_pointer_event(...). No wrappers needed —
  * the BrowserServer translates Yap adapter events into wpe_input_* structs and calls them.

@@ -70,6 +70,9 @@ public:
     bool recenterForScroll(int cx, int cy, bool force = false);   // P2: windowed pan re-center; also the onFrame catch-up. force=true bypasses the fast-flick defer (settle). Returns true if a re-render was issued.
     static int onSettleTimer(void* self);     // settle-render: fires ~160ms after the last scroll -> render the settled position
     static void onScrollConfirm(GObject*, GAsyncResult*, gpointer);  // label buffer with ACTUAL scrollY (fixes async-scrollTo mislabel jump)
+    static gboolean pollVideoRect(gpointer);                         // periodic: query playing <video> rect → onVideoRect
+    static void onVideoRect(GObject*, GAsyncResult*, gpointer);      // rect result → wpe_atlas_view_backend_video_rect (partial readback while a video plays)
+    guint               m_videoPollTimer = 0;                        // repeating timer id for pollVideoRect
     void setZoomAndScroll(double zoom, int cx, int cy);
 
     // ---- autonomous scroll test (kicked with SIGUSR1; drives setScrollPosition like the adapter) ----

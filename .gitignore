@@ -5,3 +5,7 @@ eglprobe-glibc
 frame-dump
 libWPEBackend-atlas.so
 gctest/*.o
+
+# video build artifacts
+gst-mdpdetile/libgstmdpdetile.so
+gst-mdpoverlay/mdp_overlay_test

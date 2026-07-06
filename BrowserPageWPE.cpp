@@ -141,6 +141,7 @@ BrowserPageWPE::~BrowserPageWPE()
 {
     g_livePages.erase(this);   // stop onFrame touching this page the moment we start tearing down
     if (m_settleTimer) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   // settle-render timer must not fire on a freed page
+    if (m_videoPollTimer) { g_source_remove(m_videoPollTimer); m_videoPollTimer = 0; }   // video-rect poll must not fire on a freed page
     if (m_webView) {
         /* Force-kill the WebProcess. Do NOT rely on WebView finalization to terminate it — the WebView
          * frequently lingers (stray refs; same reason the stale-frame UAF existed), so on card close the
@@ -601,6 +602,12 @@ void BrowserPageWPE::ensureWebView()
      * polls document.activeElement via evaluate_javascript — the same proven-safe path as the page-
      * height query. The script-message-received channel was tried but its signal value crashed the BS
      * (jsc_value_* on a non-JSCValue at the UIProcess), so it is intentionally not used. */
+
+    /* Partial-readback for video: poll the playing <video>'s rect every 300ms (cheap; the rect only
+     * changes on play/pause/scroll/fullscreen). While a video plays the backend reads back ONLY that
+     * rect instead of the full 1024x3072 buffer. Disable via /tmp/atlas_no_vrect (backend-side gate). */
+    if (!m_videoPollTimer)
+        m_videoPollTimer = g_timeout_add(300, (GSourceFunc)&BrowserPageWPE::pollVideoRect, this);
 }
 
 /* ---- Feature 6: atlas: internal scheme (atlas:about diagnostics page) ------------------------- */
@@ -1358,6 +1365,55 @@ void BrowserPageWPE::onScrollConfirm(GObject* obj, GAsyncResult* res, gpointer u
         wpe_atlas_view_backend_scroll_hint(self->m_viewBackend, y0, sh, delta);
     }
     self->m_renderedY = actual;
+}
+
+/* Partial-readback driver: periodically ask the DOM for the largest PLAYING <video>'s rect (viewport
+ * CSS px). The backend then reads back ONLY that rect each frame instead of the full 1024x3072 buffer —
+ * the difference between ~1 fps and playable video. Empty result → no video → active=0 (full readback).
+ * getBoundingClientRect returns the full viewport in fullscreen, so the same poll covers fullscreen too.
+ * evaluate_javascript-returns is the proven-safe ferry (the script-message channel crashes the BS). */
+gboolean BrowserPageWPE::pollVideoRect(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (bpwpe_dead(self)) return G_SOURCE_REMOVE;
+    if (!self->m_webView || !self->m_viewBackend) return G_SOURCE_CONTINUE;
+    static const char* kJs =
+        "(function(){var vs=document.getElementsByTagName('video'),b=null,ba=0,i,v,r,a;"
+        "for(i=0;i<vs.length;i++){v=vs[i];if(v.paused||v.ended||!v.videoWidth)continue;"
+        "r=v.getBoundingClientRect();if(r.width<=0||r.height<=0)continue;"
+        "if(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth)continue;"
+        "a=r.width*r.height;if(a>ba){ba=a;b=r;}}"
+        "if(!b)return '';return Math.round(b.left)+','+Math.round(b.top)+','+Math.round(b.width)+','+Math.round(b.height);})()";
+    webkit_web_view_evaluate_javascript(self->m_webView, kJs, -1, nullptr, nullptr, nullptr,
+                                        &BrowserPageWPE::onVideoRect, self);
+    return G_SOURCE_CONTINUE;
+}
+
+/* Result of pollVideoRect: "" → no playing video (active=0). Else "l,t,w,h" in CSS px → scale by
+ * cz=contentZoom*uiZoom to FBO/device px (same space setScrollPosition uses), clamp to the buffer,
+ * publish to the backend's damage-rect control block. */
+void BrowserPageWPE::onVideoRect(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
+    if (!v) { if (err) g_error_free(err); return; }
+    char* s = jsc_value_to_string(v);
+    g_object_unref(v);
+    int l=0, t=0, w=0, h=0;
+    bool active = (s && s[0] && sscanf(s, "%d,%d,%d,%d", &l, &t, &w, &h) == 4 && w > 0 && h > 0);
+    if (s) g_free(s);
+    if (!active) { wpe_atlas_view_backend_video_rect(self->m_viewBackend, 0,0,0,0, 0); return; }
+    double cz = self->contentZoom() * self->m_uiZoom; if (cz <= 0.0) cz = 1.0;
+    int x = (int)(l * cz), y = (int)(t * cz), rw = (int)(w * cz), rh = (int)(h * cz);
+    /* clamp to the FBO/buffer (m_renderWidth x m_renderHeight) */
+    if (x < 0) { rw += x; x = 0; }
+    if (y < 0) { rh += y; y = 0; }
+    if (self->m_renderWidth  > 0 && x + rw > self->m_renderWidth)  rw = self->m_renderWidth  - x;
+    if (self->m_renderHeight > 0 && y + rh > self->m_renderHeight) rh = self->m_renderHeight - y;
+    if (rw <= 0 || rh <= 0) { wpe_atlas_view_backend_video_rect(self->m_viewBackend, 0,0,0,0, 0); return; }
+    wpe_atlas_view_backend_video_rect(self->m_viewBackend, x, y, rw, rh, 1);
 }
 
 /* async JS: report the real page height so the adapter knows the scroll range */

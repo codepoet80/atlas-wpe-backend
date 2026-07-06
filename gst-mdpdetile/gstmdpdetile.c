@@ -53,6 +53,7 @@ struct _GstMdpDetile {
     void *src_map, *dst_map;
     uint32_t session_id;
     gboolean ready;
+    gboolean noswap;        /* ATLAS_MDP_NOSWAP=1: straight chroma copy (decoder already CbCr/NV12) */
 };
 G_DEFINE_TYPE (GstMdpDetile, gst_mdpdetile, GST_TYPE_BASE_TRANSFORM)
 
@@ -184,9 +185,13 @@ gst_mdpdetile_transform (GstBaseTransform *trans, GstBuffer *inbuf, GstBuffer *o
     for (gint y = 0; y < self->dh / 2; y++) {
         const guint8 *srow = sc + (gsize) y * self->cw;
         guint8 *orow = oc + (gsize) y * self->dw;
-        for (gint x = 0; x + 1 < self->dw; x += 2) {
-            orow[x]     = srow[x + 1];   /* Cb */
-            orow[x + 1] = srow[x];       /* Cr */
+        if (self->noswap) {
+            memcpy (orow, srow, self->dw);   /* rotator output already CbCr -> NV12, no swap */
+        } else {
+            for (gint x = 0; x + 1 < self->dw; x += 2) {
+                orow[x]     = srow[x + 1];   /* Cb */
+                orow[x + 1] = srow[x];       /* Cr */
+            }
         }
     }
     (void) dc;
@@ -211,6 +216,7 @@ static gboolean gst_mdpdetile_stop (GstBaseTransform *trans) {
 
 static void gst_mdpdetile_init (GstMdpDetile *self) {
     self->rot_fd = self->src_fd = self->dst_fd = -1;
+    self->noswap = (getenv ("ATLAS_MDP_NOSWAP") != NULL);
 }
 
 static void gst_mdpdetile_class_init (GstMdpDetileClass *klass) {
