@@ -77,7 +77,8 @@ struct atlas_view {
     struct wpe_view_backend* wpe;
     wpe_atlas_frame_handler   handler;
     void*                    userdata;
-    uint32_t                 width, height;      /* layout size (shm slot granularity) */
+    uint32_t                 width, height;      /* CURRENT layout size (shm slot granularity; changes on rotate) */
+    uint32_t                 alloc_w, alloc_h;   /* size the shm was allocated for (capacity bound for resize) */
     uint32_t                 swidth, sheight;    /* fit-to-screen output size (0 = 1:1, no downscale) */
 
     int   shmid;
@@ -129,11 +130,31 @@ static void view_destroy(void* data)
     free(v);
 }
 
+/* DOM Element.requestFullscreen() -> WebKit ViewLegacy::setFullScreen() ->
+ * wpe_view_backend_platform_set_fullscreen(), which returns the value of THIS handler. Without a
+ * handler libwpe returns false, so setFullScreen() bails BEFORE emitting enterFullScreen and
+ * PageClientImpl fires requestExitFullScreen() -> an enter/exit toggle that freezes the view (the
+ * "fullscreen hangs it" symptom). Our webview already fills the whole BrowserServer surface, so
+ * there is no OS window state to change: just accept the request (return true) and let WebKit lay
+ * the element out at the fixed viewport size. */
+static bool view_fullscreen_handler(void* data, bool enable)
+{
+    (void)data;
+    ATLAS_LOG("fullscreen %s (accepted; embedded viewport is already full-surface)",
+              enable ? "ENTER" : "EXIT");
+    return true;
+}
+
 static void view_initialize(void* data)
 {
     struct atlas_view* v = (struct atlas_view*)data;
 
     if (!atlas_view_alloc_shm(v)) return;
+
+    /* Accept DOM fullscreen requests (see view_fullscreen_handler). Registered here — after the
+     * backend is fully constructed and before content loads — so the very first requestFullscreen
+     * is handled. */
+    wpe_view_backend_set_fullscreen_handler(v->wpe, view_fullscreen_handler, v);
 
     /* The socketpair + SETUP + frame io_source are (re)created PER WebProcess in
      * view_get_renderer_host_fd() — WebKit swaps processes on cross-site navigation (PSON), and
@@ -232,6 +253,7 @@ struct wpe_view_backend* wpe_atlas_view_backend_create(uint32_t width, uint32_t 
     if (!v) return NULL;
     v->handler = handler; v->userdata = userdata;
     v->width = width ? width : 1; v->height = height ? height : 1;
+    v->alloc_w = v->width; v->alloc_h = v->height;   /* shm capacity = the launch-orientation slot size */
     /* Only downscale when a smaller-than-layout output was requested; otherwise 1:1 (0 = disabled). */
     if (scaledWidth && scaledHeight && scaledWidth < v->width) {
         v->swidth = scaledWidth; v->sheight = scaledHeight;
@@ -257,11 +279,18 @@ void wpe_atlas_view_backend_resize(struct wpe_view_backend* wpe, uint32_t width,
     struct atlas_view* v = g_atlas_views;
     while (v && v->wpe != wpe) v = v->next;
     if (!v || width == 0 || height == 0) return;
-    if (width > v->width || height > v->height) {
-        ATLAS_LOG("resize %ux%u exceeds slot %ux%u — ignored (caller should recreate)", width, height, v->width, v->height);
+    /* Rotation is an IN-PLACE relayout (no re-create). The shm slot was sized for the launch
+     * orientation; a rotated layout on the 4:3 panel has equal-or-fewer pixels, so it fits. Bound by
+     * CAPACITY (total pixels) rather than per-dimension — a per-dim check wrongly rejects the taller
+     * portrait height and clamps portrait to the landscape height (the "short content" band). Then
+     * UPDATE v->width/height so the host's slot + ctrl-block addressing tracks the target's (which
+     * resizes via target_resize) — otherwise slot-1 reads/pan-ctrl desync after a rotate. */
+    if ((size_t)width * height > (size_t)v->alloc_w * v->alloc_h) {
+        ATLAS_LOG("resize %ux%u exceeds slot capacity %ux%u — ignored", width, height, v->alloc_w, v->alloc_h);
         return;
     }
-    ATLAS_LOG("resize -> layout %ux%u (slot %ux%u)", width, height, v->width, v->height);
+    v->width = width; v->height = height;
+    ATLAS_LOG("resize -> layout %ux%u (cap %ux%u)", width, height, v->alloc_w, v->alloc_h);
     wpe_view_backend_dispatch_set_size(wpe, width, height);
 }
 

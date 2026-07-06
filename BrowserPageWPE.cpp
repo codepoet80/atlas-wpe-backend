@@ -583,6 +583,17 @@ void BrowserPageWPE::ensureWebView()
     /* Feature 7: HTTP auth + SSL cert dialogs — route through the app UI via the sync reply pipe. */
     g_signal_connect(m_webView, "authenticate",                 G_CALLBACK(onAuthenticate), this);
     g_signal_connect(m_webView, "load-failed-with-tls-errors",  G_CALLBACK(onTlsErrors), this);
+    /* Fullscreen: HANDLE it ourselves (return TRUE). The WPE default fullscreen path resizes the
+     * view — a no-op on our fixed-size backend — and then blocks waiting for a resize/repaint that
+     * never arrives, hanging the page. By returning TRUE we take ownership: WebKit still enters DOM
+     * fullscreen (the video element gets :fullscreen and fills the viewport, which is already
+     * ~screen-sized), but skips the resize handshake, so no hang. leave-fullscreen likewise. */
+    g_signal_connect(m_webView, "enter-fullscreen",
+        G_CALLBACK(+[](WebKitWebView*, gpointer) -> gboolean {
+            WLOG("enter-fullscreen (handled; element fills fixed viewport)"); return TRUE; }), this);
+    g_signal_connect(m_webView, "leave-fullscreen",
+        G_CALLBACK(+[](WebKitWebView*, gpointer) -> gboolean {
+            WLOG("leave-fullscreen (handled)"); return TRUE; }), this);
 
     applyContentBlocker(webkit_web_view_get_user_content_manager(m_webView));
 
@@ -1142,11 +1153,19 @@ void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
      * so panning after the rotate doesn't stall. */
     if (m_webView && m_viewBackend && oldW > 0 && (int)w != oldW && m_renderHeight > 0) {
         int newLayoutW = (int)w;
+        /* Rotation preserves the rendered pixel AREA (= the shm slot allocated for the launch
+         * orientation). The 4:3 panel's rotated layout has equal area, so the render height scales
+         * inversely with the new width. This fills the taller portrait viewport instead of clamping
+         * to the stale landscape height (which left a blank/garbage band at the bottom). 1:1 only
+         * (contentZoom==1); m_renderWidth*m_renderHeight stays constant across rotations. */
+        long area = (long)m_renderWidth * m_renderHeight;
+        int newLayoutH = newLayoutW > 0 ? (int)(area / newLayoutW) : m_renderHeight;
         m_virtualWindowWidth = newLayoutW;   // layout / document coordinate space
         m_renderWidth  = newLayoutW;         // onFrame validates against this (1:1, no fit-to-screen scaling)
+        m_renderHeight = newLayoutH;
         m_screenWidth  = newLayoutW;
-        WLOG("rotation resize -> layout %dx%d (visible h=%d)", newLayoutW, m_renderHeight, m_screenHeight);
-        wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)newLayoutW, (uint32_t)m_renderHeight);
+        WLOG("rotation resize -> layout %dx%d (area-preserving, visible h=%d)", newLayoutW, newLayoutH, m_screenHeight);
+        wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)newLayoutW, (uint32_t)newLayoutH);
         /* the re-flow changes the page height at the new width — re-query it so the adapter's scroll clamp
          * is right, and reset the pan bookkeeping so the next setScrollPosition isn't gated as "in flight". */
         m_renderPending = false;
