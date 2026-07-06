@@ -405,6 +405,9 @@ struct atlas_target {
     uint8_t* vscratch;      /* video sub-rect readback scratch (RGBA/BGRA, up to one video rect) */
     size_t   vscratch_sz;
     uint32_t vframe;        /* video sub-rect frames since the last full readback (periodic full refresh) */
+    int      slots_to_seed; /* video path: after a full/strip readback, this many upcoming vrect frames must
+                             * full-copy master->slot to seed each slot's static (non-video) content; once
+                             * both SLOTS are seeded we copy ONLY the changed video rows (~0.9MB vs 12.5MB). */
     GLuint   fbo, tex, depth;   /* offscreen render target WebKit composites into (surfaceless ctx) */
     uint32_t fbo_w, fbo_h;
     /* ---- fit-to-screen downscale (see wpe_atlas_view_backend_create) ---- */
@@ -838,19 +841,23 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
     EGLSurface pDraw = eglGetCurrentSurface(EGL_DRAW), pRead = eglGetCurrentSurface(EGL_READ);
     if (dpy == EGL_NO_DISPLAY || webctx == EGL_NO_CONTEXT) return false;
 
-    /* Fixed FULL-size (rw x rh) lockable pbuffer, created ONCE and reused for any sub-rect — the strip
-     * height varies every scroll, so a per-rect pbuffer would churn EGL surfaces. Blit the sub-rect into
-     * its bottom-left corner (GL viewport origin); map + copy only that corner below. */
-    if (!t->vlock_surf || t->vlock_w != rw || t->vlock_h != rh) {
+    /* Lockable pbuffer sized to the SUB-RECT (vw x vh), NOT the full buffer. eglLockSurfaceKHR maps/syncs
+     * the WHOLE surface, so a full 1024x3072 pbuffer cost ~150ms per lock even for a 640x360 read (measured:
+     * lock+copy=135-161ms). Sizing it to the actual rect shrinks the mapped area ~13x -> the lock drops to
+     * ~10-15ms. Cached; recreated only when the rect size changes (the video rect is stable -> created once;
+     * scroll strips vary in height -> occasional recreate, still a big net win vs the full-surface lock).
+     * The blit fills the whole pbuffer (viewport 0,0,vw,vh); map + copy all vh rows below. */
+    if (!t->vlock_surf || t->vlock_w != (uint32_t)vw || t->vlock_h != (uint32_t)vh) {
         if (t->vlock_surf) { eglDestroySurface(dpy, t->vlock_surf); t->vlock_surf = 0; }
-        EGLint sa[] = { EGL_WIDTH, (EGLint)rw, EGL_HEIGHT, (EGLint)rh, EGL_NONE };
+        EGLint sa[] = { EGL_WIDTH, vw, EGL_HEIGHT, vh, EGL_NONE };
         t->vlock_surf = eglCreatePbufferSurface(dpy, (EGLConfig)t->lock_cfg, sa);
         if (t->vlock_surf == EGL_NO_SURFACE) { t->vlock_surf = 0; return false; }
-        t->vlock_w = rw; t->vlock_h = rh;
+        t->vlock_w = (uint32_t)vw; t->vlock_h = (uint32_t)vh;
     }
 
-    struct timeval a, b; gettimeofday(&a, NULL);
+    struct timeval a, aF, aB, b; gettimeofday(&a, NULL);
     glFinish();   /* WebKit's render into t->tex must complete before the shared lock_ctx samples it */
+    gettimeofday(&aF, NULL);   /* SPLIT: time spent waiting on WebKit's composite (the suspected fps ceiling) */
     if (!eglMakeCurrent(dpy, t->vlock_surf, t->vlock_surf, t->lock_ctx)) {
         eglMakeCurrent(dpy, pDraw, pRead, webctx); return false;
     }
@@ -871,6 +878,7 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
     glFinish();
+    gettimeofday(&aB, NULL);   /* SPLIT: our sub-rect blit into the pbuffer */
 
     EGLint la[] = { EGL_MAP_PRESERVE_PIXELS_KHR, EGL_TRUE, EGL_LOCK_USAGE_HINT_KHR, EGL_READ_SURFACE_BIT_KHR, EGL_NONE };
     bool ok = false;
@@ -882,11 +890,11 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
         uint8_t* ptr = (uint8_t*)(uintptr_t)ptr_i;
         if (ptr && pitch > 0) {
             size_t stride = (size_t)rw * 4;
-            /* The sub-rect was blitted into the pbuffer's bottom-left corner (GL viewport 0,0,vw,vh). The
-             * pbuffer is full rh tall, so an UPPER_LEFT bitmap has its row 0 at the pbuffer TOP -> the
-             * blitted content's row y is at map row (rh-1-y). LOWER_LEFT: row 0 is the corner -> row y. */
+            /* The sub-rect was blitted to fill the whole vw x vh pbuffer (GL viewport 0,0,vw,vh). An
+             * UPPER_LEFT bitmap has its row 0 at the pbuffer TOP -> the blitted content's row y is at map
+             * row (vh-1-y). LOWER_LEFT: row 0 is the bottom corner -> row y. dst is the full-width master. */
             for (int y = 0; y < vh; y++) {
-                int sy = (origin == EGL_UPPER_LEFT_KHR) ? ((int)rh - 1 - y) : y;
+                int sy = (origin == EGL_UPPER_LEFT_KHR) ? (vh - 1 - y) : y;
                 memcpy(dst + (size_t)(vy + y) * stride + (size_t)vx * 4, ptr + (size_t)sy * pitch, (size_t)vw * 4);
             }
             ok = true;
@@ -895,14 +903,26 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
     }
     eglMakeCurrent(dpy, pDraw, pRead, webctx);
     gettimeofday(&b, NULL);
+    { static int _rn = 0; if (_rn++ % 30 == 0) ATLAS_LOG("LRR-SPLIT finish1(render-wait)=%ldus blit+finish2=%ldus lock+copy=%ldus (%dx%d)",
+        (aF.tv_sec-a.tv_sec)*1000000L+(aF.tv_usec-a.tv_usec),
+        (aB.tv_sec-aF.tv_sec)*1000000L+(aB.tv_usec-aF.tv_usec),
+        (b.tv_sec-aB.tv_sec)*1000000L+(b.tv_usec-aB.tv_usec), vw, vh); }
     if (out_us) *out_us = (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_usec - a.tv_usec);
     return ok;
 }
 
+/* DIAG: categorize why each frame took the fast (vrect) vs slow (full readback) path — dumped periodically
+ * so we can see if frequent full readbacks come from doFull, an inactive/torn vrect, or a lock failure. */
+static struct { unsigned vrect, dofull, gotfail, ina_active, ina_seq; } s_vstat;
+
 static void target_frame_rendered(void* d)
 {
     struct atlas_target* t = (struct atlas_target*)d;
-    { static int fr_n = 0; if (fr_n < 3 || fr_n % 30 == 0) ATLAS_LOG("frame_rendered #%d (%ux%u)", fr_n, t->width, t->height); fr_n++; }
+    { static int fr_n = 0; if (fr_n < 3 || fr_n % 30 == 0) {
+        ATLAS_LOG("frame_rendered #%d (%ux%u)", fr_n, t->width, t->height);
+        if (fr_n % 60 == 0) ATLAS_LOG("VSTAT vrect=%u dofull=%u gotfail=%u inactive(active0=%u seqtear=%u)",
+            s_vstat.vrect, s_vstat.dofull, s_vstat.gotfail, s_vstat.ina_active, s_vstat.ina_seq);
+      } fr_n++; }
     struct timeval _pt0, _pt1; gettimeofday(&_pt0, NULL);
     static struct timeval _plast = {0, 0};
     if (t->shm) {
@@ -970,6 +990,7 @@ static void target_frame_rendered(void* d)
                         }
                     }
                     memcpy(slot, t->master, (size_t)rh * stride);
+                    t->slots_to_seed = SLOTS - 1;   /* other slot(s) must re-seed static content before rect-only video copies */
                     gettimeofday(&_b, NULL);
                     { static int _sn = 0; if (_sn++ % 8 == 0) ATLAS_LOG("STRIP y0=%d h=%d delta=%d %ldus (%ux%u bgra=%d)",
                         y0, sh, delta, (_b.tv_sec-_a.tv_sec)*1000000L+(_b.tv_usec-_a.tv_usec), rw, rh, s_bgra_readback); }
@@ -991,7 +1012,11 @@ static void target_frame_rendered(void* d)
             if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));   /* strip path is bgra-gated & may never alloc it; seeded by the full/lock readback on doFull frames */
         }
         if (!wantScale && !s_noVrect && t->master && !t->force_full) {   /* force_full after a resize: re-seed master first */
-            const uint32_t VFULL = 30;
+            /* Periodic FULL readback to refresh non-video page content. During video the non-video area is
+             * essentially static, and a full 1024x3072 readback costs ~300ms (a visible hitch), so keep this
+             * rare — every VFULL frames. Env BPWPE_VFULL overrides for tuning. */
+            static uint32_t VFULL = 0;
+            if (!VFULL) { const char* e = getenv("BPWPE_VFULL"); VFULL = e ? (uint32_t)atoi(e) : 150; if (!VFULL) VFULL = 150; }
             struct atlas_vrect* vr = shm_vrect(t->shm, t->width, t->height);
             uint32_t vseq = vr->seq; __sync_synchronize();
             int active = vr->active, vx = vr->x, vy = vr->y, vw = vr->w, vh = vr->h;
@@ -1003,6 +1028,7 @@ static void target_frame_rendered(void* d)
                 if (vy + vh > (int)rh) vh = (int)rh - vy;
                 bool doFull = (t->vframe == 0) || (t->vframe % VFULL == 0);   /* seed + periodic full refresh */
                 t->vframe++;
+                if (doFull) s_vstat.dofull++;
                 if (!doFull && vw > 0 && vh > 0) {
                     size_t stride = (size_t)rw * 4;
                     struct timeval _va, _vb; gettimeofday(&_va, NULL);
@@ -1030,14 +1056,27 @@ static void target_frame_rendered(void* d)
                         }
                     }
                     if (got) {
-                        memcpy(slot, t->master, (size_t)rh * stride);
+                        /* Publish master -> slot. The full 12.5MB copy is only needed to seed a slot's STATIC
+                         * (non-video) content; once both SLOTS carry it, copy ONLY the changed video rows
+                         * (~0.9MB) — non-video refreshes on doFull frames anyway, which re-arm slots_to_seed. */
+                        if (t->slots_to_seed > 0) {
+                            memcpy(slot, t->master, (size_t)rh * stride);
+                            t->slots_to_seed--;
+                        } else {
+                            for (int ry = 0; ry < vh; ry++)
+                                memcpy(slot   + (size_t)(vy+ry)*stride + (size_t)vx*4,
+                                       t->master + (size_t)(vy+ry)*stride + (size_t)vx*4, (size_t)vw*4);
+                        }
+                        s_vstat.vrect++;
                         gettimeofday(&_vb, NULL);
-                        { static int _vn = 0; if (_vn++ % 30 == 0) ATLAS_LOG("VRECT %d,%d %dx%d %ldus lock=%d (buf %ux%u)",
-                            vx, vy, vw, vh, (_vb.tv_sec-_va.tv_sec)*1000000L+(_vb.tv_usec-_va.tv_usec), used_lock, rw, rh); }
+                        { static int _vn = 0; if (_vn++ % 30 == 0) ATLAS_LOG("VRECT %d,%d %dx%d %ldus lock=%d seed=%d (buf %ux%u)",
+                            vx, vy, vw, vh, (_vb.tv_sec-_va.tv_sec)*1000000L+(_vb.tv_usec-_va.tv_usec), used_lock, t->slots_to_seed, rw, rh); }
                         goto sent;                           /* else fall through to a full readback (seed/periodic) */
                     }
+                    if (!got) s_vstat.gotfail++;
                 }
             } else {
+                if (!active) s_vstat.ina_active++; else s_vstat.ina_seq++;   /* categorize the fall-through */
                 t->vframe = 0;                               /* no video → next active frame seeds master with a full read */
             }
         }
@@ -1051,6 +1090,7 @@ static void target_frame_rendered(void* d)
             if (lock_readback(t, slot, rw, rh, &us)) {
                 { static int _ln = 0; if (_ln++ % 12 == 0) ATLAS_LOG("LOCKSURF readback %ldus (%ux%u) [glReadPixels was ~1.3s]", us, rw, rh); }
                 if (t->master) { memcpy(t->master, slot, (size_t)rw * rh * 4); t->force_full = 0; }   /* master re-seeded at the new size */
+                t->slots_to_seed = SLOTS - 1;   /* other slot(s) re-seed static content before rect-only video copies */
                 goto sent;
             }
         }
@@ -1096,7 +1136,7 @@ static void target_frame_rendered(void* d)
         /* P2: a full 1:1 readback just refreshed the slot — mirror it into the master buffer so the
          * NEXT pan re-center can strip-update from a correct base (covers loads/reflows/resizes too).
          * The strip path above did goto sent, skipping this; wantScale never uses master. */
-        if (!wantScale && t->master) { memcpy(t->master, slot, (size_t)rw * rh * 4); t->force_full = 0; }   /* master re-seeded at the new size */
+        if (!wantScale && t->master) { memcpy(t->master, slot, (size_t)rw * rh * 4); t->force_full = 0; t->slots_to_seed = SLOTS - 1; }   /* master re-seeded; other slot(s) re-seed before rect-only video copies */
 
     sent:;
         gettimeofday(&_pt1, NULL);
