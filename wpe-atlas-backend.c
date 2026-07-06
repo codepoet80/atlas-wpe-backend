@@ -399,6 +399,9 @@ struct atlas_target {
     uint8_t* scratch;       /* width*height*4 readback scratch (RGBA, pre-swizzle) */
     uint8_t* master;        /* P2: persistent BGRA copy of the whole tall buffer (1:1 only); strip readback + overlap memmove happen here */
     uint32_t last_seq;      /* P2: last consumed atlas_ctrl.seq (0 = none yet) */
+    int      force_full;    /* set on resize/rotation: master holds the OLD-orientation frame, so skip the
+                             * strip/vrect (which memmove/splice stale content -> tearing) until a full
+                             * readback re-seeds master at the new size. Cleared once master is re-seeded. */
     uint8_t* vscratch;      /* video sub-rect readback scratch (RGBA/BGRA, up to one video rect) */
     size_t   vscratch_sz;
     uint32_t vframe;        /* video sub-rect frames since the last full readback (periodic full refresh) */
@@ -484,6 +487,8 @@ static void target_resize(void* d, uint32_t width, uint32_t height)
     if (width == t->width && height == t->height) return;
     ATLAS_LOG("target_resize %ux%u -> %ux%u", t->width, t->height, width, height);
     t->width = width; t->height = height;
+    t->force_full = 1;   /* master now holds the old-orientation frame; force a full re-seed before any strip/vrect */
+    t->vframe = 0;       /* video seed too */
     /* The offscreen FBO and the lock-surface pbuffer both recreate themselves when they notice the size
      * change (frame_will_render checks fbo_w/h; the lock path checks lock_w/h). The readback scratch/master
      * are sized to the fixed, max-size shm slot which the UIProcess guards from shrinking, so they stay big
@@ -925,7 +930,7 @@ static void target_frame_rendered(void* d)
          * (or a reflow beating the scroll frame) consumes the seq and falls through to the full read. */
         static int s_noStrip = -1;   /* isolate crashes: `touch /tmp/atlas_no_strip` disables the strip path */
         if (s_noStrip < 0) s_noStrip = (access("/tmp/atlas_no_strip", F_OK) == 0 || getenv("BPWPE_NO_STRIP")) ? 1 : 0;
-        if (!wantScale && s_bgra_readback >= 0 && !s_noStrip) {   /* need the readback format probed first */
+        if (!wantScale && s_bgra_readback >= 0 && !s_noStrip && !t->force_full) {   /* need the readback format probed first; force_full after a resize */
             if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));
             struct atlas_ctrl* ctrl = shm_ctrl(t->shm, t->width, t->height);
             uint32_t seq = ctrl->seq;
@@ -970,7 +975,7 @@ static void target_frame_rendered(void* d)
         if (!wantScale && !s_noVrect) {
             if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));   /* strip path is bgra-gated & may never alloc it; seeded by the full/lock readback on doFull frames */
         }
-        if (!wantScale && !s_noVrect && t->master) {
+        if (!wantScale && !s_noVrect && t->master && !t->force_full) {   /* force_full after a resize: re-seed master first */
             const uint32_t VFULL = 30;
             struct atlas_vrect* vr = shm_vrect(t->shm, t->width, t->height);
             uint32_t vseq = vr->seq; __sync_synchronize();
@@ -1030,7 +1035,7 @@ static void target_frame_rendered(void* d)
             long us = 0;
             if (lock_readback(t, slot, rw, rh, &us)) {
                 { static int _ln = 0; if (_ln++ % 12 == 0) ATLAS_LOG("LOCKSURF readback %ldus (%ux%u) [glReadPixels was ~1.3s]", us, rw, rh); }
-                if (t->master) memcpy(t->master, slot, (size_t)rw * rh * 4);
+                if (t->master) { memcpy(t->master, slot, (size_t)rw * rh * 4); t->force_full = 0; }   /* master re-seeded at the new size */
                 goto sent;
             }
         }
@@ -1076,7 +1081,7 @@ static void target_frame_rendered(void* d)
         /* P2: a full 1:1 readback just refreshed the slot — mirror it into the master buffer so the
          * NEXT pan re-center can strip-update from a correct base (covers loads/reflows/resizes too).
          * The strip path above did goto sent, skipping this; wantScale never uses master. */
-        if (!wantScale && t->master) memcpy(t->master, slot, (size_t)rw * rh * 4);
+        if (!wantScale && t->master) { memcpy(t->master, slot, (size_t)rw * rh * 4); t->force_full = 0; }   /* master re-seeded at the new size */
 
     sent:;
         gettimeofday(&_pt1, NULL);
