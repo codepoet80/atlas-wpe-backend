@@ -32,6 +32,10 @@ static inline long _wlog_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); 
 static inline bool _wlog_on(void) { static int on = -1; if (on < 0) on = getenv("BPWPE_DEBUG") ? 1 : 0; return on; }
 #define WLOG(fmt, ...) do { if (_wlog_on()) { FILE* _f = fopen("/tmp/bpwpe.log", "a"); \
     if (_f) { fprintf(_f, "[%08ld] " fmt "\n", _wlog_ms(), ##__VA_ARGS__); fclose(_f); } } } while (0)
+/* Always-on trace for the mediad handoff — routes to syslog (→ /var/log/messages, tagged BrowserServer-atlas)
+ * so it is visible without BPWPE_DEBUG, plus the WLOG file when debugging. */
+#include <syslog.h>
+#define MLOG(fmt, ...) do { syslog(LOG_NOTICE, "MEDIAD " fmt, ##__VA_ARGS__); WLOG(fmt, ##__VA_ARGS__); } while (0)
 
 /* ---- Crash capture: on a fatal signal log a backtrace to /tmp/bpwpe.log so an abrupt BS death
  * (the heavy-page interaction segfault) leaves the fault + call stack to resolve offline. ---- */
@@ -103,6 +107,7 @@ static void atlas_im_context_init(AtlasIMContext*) {}
  * this set so a stale frame on a freed page is dropped instead of dereferencing freed memory.
  * Everything (ctor/dtor/onFrame) runs on the glib main loop, so no locking is needed. */
 static std::set<BrowserPageWPE*> g_livePages;
+static bool g_mediadBusy = false;   // only ONE mediad handoff at a time (single HW VIDC decoder)
 /* True if the page has already been destroyed. Async JS-result callbacks and g_timeout callbacks capture a
  * raw BrowserPageWPE*; the WebView lingers and can deliver a pending probe/timer AFTER the card is freed, so
  * every such callback must check this before touching the page. (Comparing the pointer never derefs it.) */
@@ -609,6 +614,19 @@ void BrowserPageWPE::ensureWebView()
     g_signal_connect(m_webView, "enter-fullscreen",
         G_CALLBACK(+[](WebKitWebView*, gpointer ud) -> gboolean {
             BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+            /* Preferred path (opt-in /tmp/atlas_mediad): hand the video to the system media server for a
+             * true HW MDP overlay (fills the card, HW-decoded ~30fps) — see mediadBegin(). Falls back to the
+             * Tier-2 surface-resize WIP otherwise. */
+            if (self && access("/tmp/atlas_mediad", F_OK) == 0) {
+                self->m_fsPending = true;
+                g_timeout_add(300, +[](gpointer p) -> gboolean {
+                    BrowserPageWPE* s = static_cast<BrowserPageWPE*>(p);
+                    if (!s->m_fsPending || !s->m_webView) return G_SOURCE_REMOVE;
+                    s->m_fsPending = false; s->mediadBegin();
+                    return G_SOURCE_REMOVE;
+                }, self);
+                WLOG("enter-fullscreen (mediad handoff queued)"); return TRUE;
+            }
             /* Tier-2: shrink the WPE surface to the visible screen so the fullscreen video fills the card
              * (author CSS can't beat the UA :fullscreen !important rule; only the viewport size can). Defer
              * out of the fullscreen state machine (a synchronous WebKit call here crashed before) — run after
@@ -627,8 +645,9 @@ void BrowserPageWPE::ensureWebView()
         G_CALLBACK(+[](WebKitWebView*, gpointer ud) -> gboolean {
             BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
             if (self) { self->m_fsPending = false;   /* cancel any not-yet-run resize */
-                self->exitFsResize(); }
-            WLOG("leave-fullscreen (Tier-2 restore)"); return TRUE; }), this);
+                if (self->m_mediadActive) self->mediadEnd();
+                else self->exitFsResize(); }
+            WLOG("leave-fullscreen (restore)"); return TRUE; }), this);
 
     applyContentBlocker(webkit_web_view_get_user_content_manager(m_webView));
 
@@ -1271,6 +1290,185 @@ void BrowserPageWPE::exitFsResize()
     webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
     updateContentsSize();
 }
+/* ================= mediad system-video handoff (fullscreen HW MDP overlay) =================
+ * mediad HW-decodes on the VIDC and owns the MDP/V4L2 overlay a plain app can't get. We open a
+ * MEDIA_PLAYER session as the Atlas app (LSCallFromApplication so mediad binds the overlay to the
+ * app's card), load the video URL, set the fullscreen bounds/fit, and play; the in-browser <video>
+ * is paused meanwhile. On leave-fullscreen we unload, drop the subscription (frees the session), and
+ * resume the <video> at its saved time. Direct http/file URLs only — blob:/MSE have no URL to hand off. */
+
+/* enter-fullscreen: read the fullscreen <video>'s currentSrc + currentTime (and pause it) via JS, then
+ * onFsVideoInfo opens the session. */
+void BrowserPageWPE::mediadBegin()
+{
+    MLOG("mediadBegin: active=%d busy=%d webView=%p", m_mediadActive, g_mediadBusy, (void*)m_webView);
+    if (m_mediadActive || g_mediadBusy || !m_webView) return;
+    g_mediadBusy = true;   /* claim the single decoder synchronously so a sibling page won't also start */
+    static const char* kJs =
+        "(function(){var e=document.webkitFullscreenElement||document.fullscreenElement,v=null,i,vs,x,r,a,ba=0;"
+        "if(e&&e.tagName=='VIDEO')v=e;else{vs=document.getElementsByTagName('video');"
+        "for(i=0;i<vs.length;i++){x=vs[i];if(!x.currentSrc)continue;r=x.getBoundingClientRect();"
+        "a=r.width*r.height;if(a>=ba){ba=a;v=x;}}}"
+        "if(!v||!v.currentSrc)return '';var u=v.currentSrc,t=v.currentTime||0;"
+        /* Fully RELEASE our in-browser HW decoder so mediad can acquire the single VIDC instance:
+         * pause + drop the src + load() tears down the media element's gst pipeline. Restored on exit. */
+        "try{v.pause();v.removeAttribute('src');v.load();}catch(e){}"
+        "return u+'|'+t;})()";
+    webkit_web_view_evaluate_javascript(m_webView, kJs, -1, nullptr, nullptr, nullptr,
+                                        &BrowserPageWPE::onFsVideoInfo, this);
+}
+
+void BrowserPageWPE::onFsVideoInfo(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
+    if (!v) { if (err) { MLOG("mediad: video-info JS failed: %s", err->message); g_error_free(err); } return; }
+    char* s = jsc_value_to_string(v);
+    g_object_unref(v);
+    if (!s || !s[0]) { if (s) g_free(s); g_mediadBusy = false; MLOG("mediad: no fullscreen video src (blob/MSE or none) — abort handoff"); return; }
+    /* split "src|time" on the LAST '|' (URLs can't contain a bare '|' but be safe) */
+    char* bar = strrchr(s, '|');
+    double t = 0; std::string src;
+    if (bar) { *bar = '\0'; t = atof(bar + 1); src = s; }
+    else src = s;
+    g_free(s);
+    if (src.compare(0, 5, "blob:") == 0 || src.compare(0, 11, "mediasource") == 0) {
+        g_mediadBusy = false; MLOG("mediad: src is %s — cannot hand off (no direct URL)", src.c_str()); return; }
+    self->m_mediadSrc = src;
+    self->m_mediadResumeTime = t;
+    self->m_mediadActive = true;   /* claim the handoff now so a second trigger no-ops */
+    /* Defer the mediad session-open so our in-browser gst pipeline finishes releasing the single HW VIDC
+     * decoder (the src-drop above is async) before mediad tries to acquire it. */
+    MLOG("mediad: video released; opening session in 700ms for src=%s t=%.1f", src.c_str(), t);
+    g_timeout_add(700, &BrowserPageWPE::mediadOpenSession, self);
+}
+
+gboolean BrowserPageWPE::mediadOpenSession(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (bpwpe_dead(self) || !self->m_mediadActive) return G_SOURCE_REMOVE;
+    LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getServiceHandle() : nullptr;
+    if (!h) { MLOG("mediad: no LSHandle — abort"); self->m_mediadActive = false; g_mediadBusy = false; return G_SOURCE_REMOVE; }
+    LSError e; LSErrorInit(&e);
+    /* appId forge (LSCallFromApplication) needs a privileged role; opt in via /tmp/atlas_mediad_appid.
+     * Default: plain LSCall — the session opens either way; mediad may still punch the HW overlay at the
+     * absolute setVideoBounds screen coords without the app-card association. */
+    bool ok;
+    if (access("/tmp/atlas_mediad_appid", F_OK) == 0)
+        ok = LSCallFromApplication(h, "luna://com.palm.mediad/service/playback", "{}",
+                                   "org.webosports.app.atlas",
+                                   &BrowserPageWPE::onMediadPlayback, self, &self->m_mediadSubToken, &e);
+    else
+        ok = LSCall(h, "luna://com.palm.mediad/service/playback", "{}",
+                    &BrowserPageWPE::onMediadPlayback, self, &self->m_mediadSubToken, &e);
+    if (!ok) { MLOG("mediad: playback LSCall failed: %s", e.message ? e.message : "?"); LSErrorFree(&e); self->m_mediadActive = false; g_mediadBusy = false; }
+    return G_SOURCE_REMOVE;
+}
+
+/* /service/playback reply: {"returnValue":true,"location":"palm://com.palm.mediad.MediaPlayer_N/"} */
+bool BrowserPageWPE::onMediadPlayback(LSHandle* /*sh*/, LSMessage* msg, void* ctx)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ctx);
+    const char* p = LSMessageGetPayload(msg);
+    if (bpwpe_dead(self) || !p) return true;
+    /* extract the per-session service name between "palm://" and the trailing "/" */
+    const char* loc = strstr(p, "palm://");
+    if (!loc) { MLOG("mediad: playback reply had no location: %s", p); return true; }
+    loc += 7;
+    const char* end = strchr(loc, '/'); if (!end) end = loc + strlen(loc);
+    std::string svc(loc, end - loc);
+    if (svc.empty()) { MLOG("mediad: empty location"); return true; }
+    if (!self->m_mediadLoc.empty()) return true;   /* already handled the first reply */
+    self->m_mediadLoc = svc;
+    MLOG("mediad: session service = %s", svc.c_str());
+    /* Fire load NOW (held subscription); defer bounds/fit/play until load has had time to build the pipeline
+     * (mediad load is async — commands sent before it settles are dropped). */
+    char pl[1024];
+    snprintf(pl, sizeof(pl), "{\"source\":\"%s\",\"audioClass\":\"kAudioStreamMedia\"}", self->m_mediadSrc.c_str());
+    self->mediadCall("load", pl);
+    g_timeout_add(1000, &BrowserPageWPE::mediadFirePlay, self);
+    return true;
+}
+
+gboolean BrowserPageWPE::mediadFirePlay(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (bpwpe_dead(self) || !self->m_mediadActive || self->m_mediadLoc.empty()) return G_SOURCE_REMOVE;
+    /* now that load has built the pipeline: place the overlay, fill it, seek, and play */
+    char pl[256];
+    int vx=0, vy=0, vw = self->m_windowWidth >= 320 ? self->m_windowWidth : 1024, vh = 768;
+    FILE* f = fopen("/tmp/atlas_vbounds", "r");
+    if (f) { if (fscanf(f, "%d,%d,%d,%d", &vx,&vy,&vw,&vh) != 4) { vx=0;vy=0; } fclose(f); }
+    snprintf(pl, sizeof(pl), "{\"videoBounds\":{\"x\":%d,\"y\":%d,\"width\":%d,\"height\":%d}}", vx,vy,vw,vh);
+    self->mediadCall("setVideoBounds", pl);
+    self->mediadCall("setFitMode", "{\"fitMode\":\"VIDEO_FILL\"}");
+    if (self->m_mediadResumeTime > 1.0) {
+        snprintf(pl, sizeof(pl), "{\"position\":%d}", (int)(self->m_mediadResumeTime * 1000));
+        self->mediadCall("seek", pl);
+    }
+    self->mediadCall("play", "{}");
+    return G_SOURCE_REMOVE;
+}
+
+/* fire a per-session control method (one-reply) as the Atlas app */
+void BrowserPageWPE::mediadCall(const char* method, const char* payload)
+{
+    if (m_mediadLoc.empty()) return;
+    LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getServiceHandle() : nullptr;
+    if (!h) return;
+    char uri[256]; snprintf(uri, sizeof(uri), "luna://%s/%s", m_mediadLoc.c_str(), method);
+    MLOG("mediad -> %s %s", uri, payload);
+    LSError e; LSErrorInit(&e);
+    /* HELD subscription (LSCall, not OneReply): mediad ties the media pipeline to the call's subscription —
+     * a OneReply auto-cancel tears the pipeline down before load progresses. Cancelled in mediadEnd. */
+    LSMessageToken tok = 0;
+    bool ok;
+    if (access("/tmp/atlas_mediad_appid", F_OK) == 0)
+        ok = LSCallFromApplication(h, uri, payload, "org.webosports.app.atlas",
+                                   &BrowserPageWPE::onMediadReply, this, &tok, &e);
+    else
+        ok = LSCall(h, uri, payload, &BrowserPageWPE::onMediadReply, this, &tok, &e);
+    if (!ok) { MLOG("mediad: %s LSCall failed: %s", method, e.message ? e.message : "?"); LSErrorFree(&e); }
+    else if (tok) m_mediadCallTokens.push_back(tok);
+}
+
+bool BrowserPageWPE::onMediadReply(LSHandle* /*sh*/, LSMessage* msg, void* ctx)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ctx);
+    const char* p = LSMessageGetPayload(msg);
+    if (!bpwpe_dead(self)) MLOG("mediad reply: %s", p ? p : "(null)");
+    return true;
+}
+
+/* leave-fullscreen: unload, drop the subscription (frees the session), resume the in-browser <video> */
+void BrowserPageWPE::mediadEnd()
+{
+    if (!m_mediadActive) return;
+    MLOG("mediad: ending handoff (resume t=%.1f)", m_mediadResumeTime);
+    if (!m_mediadLoc.empty()) mediadCall("unload", "{}");
+    LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getServiceHandle() : nullptr;
+    LSError e; LSErrorInit(&e);
+    /* cancel the held load/play/... subscriptions, then the /service/playback subscription (frees the session) */
+    for (LSMessageToken t : m_mediadCallTokens) if (h && t) LSCallCancel(h, t, &e);
+    m_mediadCallTokens.clear();
+    if (h && m_mediadSubToken) {
+        if (!LSCallCancel(h, m_mediadSubToken, &e)) { MLOG("mediad: cancel failed: %s", e.message?e.message:"?"); LSErrorFree(&e); }
+    }
+    m_mediadSubToken = 0; m_mediadLoc.clear(); m_mediadActive = false; g_mediadBusy = false;
+    /* restore the in-browser video (we dropped its src to free the decoder) at the saved time */
+    if (m_webView && !m_mediadSrc.empty()) {
+        char js[512];
+        snprintf(js, sizeof(js),
+            "(function(){var vs=document.getElementsByTagName('video'),i,v;for(i=0;i<vs.length;i++){v=vs[i];"
+            "if(!v.currentSrc){try{v.src='%s';v.load();v.currentTime=%.1f;v.play();}catch(e){}break;}}})()",
+            m_mediadSrc.c_str(), m_mediadResumeTime);
+        webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+    m_mediadSrc.clear();
+}
+
 void BrowserPageWPE::setVirtualWindowSize(uint32_t w, uint32_t h)
 {
     WLOG("setVirtualWindowSize %ux%u (was virt=%dx%d)", w, h, m_virtualWindowWidth, m_virtualWindowHeight);
@@ -1631,6 +1829,15 @@ static gboolean scrolltest_poll(gpointer)
         int n = 0;
         for (BrowserPageWPE* p : g_livePages) { p->clickAt(300, 500, 1); n++; }
         WLOG("fstest: injected click at 300,500 on %d live page(s)", n);
+    }
+    /* Direct mediad-handoff test: `touch /tmp/atlas_mediadgo` calls mediadBegin() on each live page WITHOUT
+     * needing a fullscreen gesture (requestFullscreen needs transient activation the synthetic tap can't give).
+     * Decouples testing the media handoff from the fullscreen-activation problem. */
+    if (access("/tmp/atlas_mediadgo", F_OK) == 0) {
+        unlink("/tmp/atlas_mediadgo");
+        int n = 0;
+        for (BrowserPageWPE* p : g_livePages) { p->mediadBegin(); n++; }
+        MLOG("mediadgo: triggered mediadBegin on %d live page(s)", n);
     }
     return G_SOURCE_CONTINUE;
 }

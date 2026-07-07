@@ -19,9 +19,11 @@
 #include "BrowserAdapterTypes.h"   // BATypes, UrlMatchType — interface types used by long-tail methods
 #include <QtWebKit/QtWebKit>       // QWebHitTestResult (interface type); compile-only — QtWebKit link TBD
 #include <wpe/webkit.h>
+#include <lunaservice.h>          // mediad system-video handoff: LSCallFromApplication on BrowserServer's handle
 #include <semaphore.h>
 #include <stdint.h>
 #include <string>
+#include <vector>
 #include <cstring>
 
 class BrowserServer;
@@ -65,6 +67,20 @@ public:
     void setWindowSize(uint32_t width, uint32_t height);
     void enterFsResize();   // fullscreen: resize the WPE surface to the visible screen (video fills it, faster readback)
     void exitFsResize();    // fullscreen: restore the tall pan-buffer + scroll
+
+    // ---- mediad system-video handoff (fullscreen HW MDP overlay + VIDC decode) ----
+    // On enter-fullscreen (opt-in: /tmp/atlas_mediad) hand the fullscreened <video> to com.palm.mediad,
+    // which owns the HW overlay a plain app can't get (see mediad-handoff-investigation memory). We drive
+    // it via BrowserServer's LSHandle using LSCallFromApplication(appId=org.webosports.app.atlas) so mediad
+    // punches the overlay into the Atlas app's card. Direct http/file URLs only (blob:/MSE have no URL).
+    void mediadBegin();     // read the fullscreen <video> currentSrc+currentTime via JS, then open the session
+    void mediadEnd();       // unload + drop the /service/playback subscription (frees session) + resume <video>
+    void mediadCall(const char* method, const char* payload);   // LSCallFromApplicationOneReply on m_mediadLoc
+    static void onFsVideoInfo(GObject*, GAsyncResult*, gpointer);   // JS finish: "src|time" (video paused in JS)
+    static gboolean mediadOpenSession(gpointer);                   // deferred /service/playback open (after decoder frees)
+    static bool onMediadPlayback(LSHandle*, LSMessage*, void*);     // /service/playback reply -> per-session location
+    static bool onMediadReply(LSHandle*, LSMessage*, void*);        // load/setVideoBounds/play reply logger
+    static gboolean mediadFirePlay(gpointer);                      // deferred play (after load settles)
     void setVirtualWindowSize(uint32_t width, uint32_t height);
     void getWindowSize(int& width, int& height);
     void getVirtualWindowSize(int& width, int& height);
@@ -280,6 +296,13 @@ private:
     bool                m_fsActive = false;     // fullscreen: screen-sized surface resize is active
     int                 m_fsRestoreH = 0;       // tall renderHeight to restore on fullscreen exit
     int                 m_fsRestoreScrollY = 0; // scroll pos to restore on fullscreen exit
+    // mediad handoff state
+    bool                m_mediadActive = false; // a system-media session is live for this page's fullscreen
+    LSMessageToken      m_mediadSubToken = 0;   // /service/playback subscription token (open == session alive)
+    std::string         m_mediadLoc;            // per-session service, e.g. com.palm.mediad.MediaPlayer_1234
+    std::string         m_mediadSrc;            // the video URL handed off (for the load payload)
+    double              m_mediadResumeTime = 0; // in-browser <video>.currentTime to restore on exit
+    std::vector<LSMessageToken> m_mediadCallTokens;  // held load/play/... subscriptions (mediad ties pipeline to them)
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     gint64              m_touchDownUs = 0;      // monotonic timestamp of the last touch-down, to tell a quick tap (dismiss selection) from a long-press (select)
