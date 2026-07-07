@@ -75,6 +75,8 @@ public:
     // punches the overlay into the Atlas app's card. Direct http/file URLs only (blob:/MSE have no URL).
     void mediadBegin();     // read the fullscreen <video> currentSrc+currentTime via JS, then open the session
     void mediadEnd();       // unload + drop the /service/playback subscription (frees session) + resume <video>
+    void mediadFreeSurface();    // shrink the WPE GL FBO to free pmem_smipool for mediad's decode+overlay
+    void mediadRestoreSurface(); // restore the full render surface on handoff exit
     void mediadCall(const char* method, const char* payload);   // LSCallFromApplicationOneReply on m_mediadLoc
     static void onFsVideoInfo(GObject*, GAsyncResult*, gpointer);   // JS finish: "src|time" (video paused in JS)
     static gboolean mediadOpenSession(gpointer);                   // deferred /service/playback open (after decoder frees)
@@ -303,6 +305,7 @@ private:
     std::string         m_mediadSrc;            // the video URL handed off (for the load payload)
     double              m_mediadResumeTime = 0; // in-browser <video>.currentTime to restore on exit
     std::vector<LSMessageToken> m_mediadCallTokens;  // held load/play/... subscriptions (mediad ties pipeline to them)
+    int                 m_mediadSavedW = 0, m_mediadSavedH = 0;  // render size to restore after freeing the surface
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     gint64              m_touchDownUs = 0;      // monotonic timestamp of the last touch-down, to tell a quick tap (dismiss selection) from a long-press (select)

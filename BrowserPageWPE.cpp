@@ -1318,6 +1318,43 @@ void BrowserPageWPE::mediadBegin()
                                         &BrowserPageWPE::onFsVideoInfo, this);
 }
 
+/* Shrink our WebProcess GL FBO + lock-pbuffer (the pmem_smipool holders) to a small size so mediad's VIDC
+ * decoder output buffers + MDP overlay can allocate from the SMI pool. We don't render the page while mediad
+ * owns the screen, so the tiny surface is fine; restored on exit. Nudge a repaint so the WebProcess actually
+ * recreates (and frees) the big FBO. Tunable target via /tmp/atlas_mediad_shrink "WxH" (default 256x256). */
+void BrowserPageWPE::mediadFreeSurface()
+{
+    if (!m_viewBackend || !m_webView) return;
+    if (m_mediadSavedW == 0) { m_mediadSavedW = m_renderWidth > 0 ? m_renderWidth : 1024;
+                               m_mediadSavedH = m_renderHeight > 0 ? m_renderHeight : 3072; }
+    int sw = 256, sh = 256;
+    FILE* f = fopen("/tmp/atlas_mediad_shrink", "r");
+    if (f) { if (fscanf(f, "%dx%d", &sw, &sh) != 2) { sw = 256; sh = 256; } fclose(f); }
+    if (sw < 16) sw = 16; if (sh < 16) sh = 16;
+    MLOG("mediad: freeing render surface %dx%d -> %dx%d (release pmem_smipool)", m_mediadSavedW, m_mediadSavedH, sw, sh);
+    wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)sw, (uint32_t)sh);
+    m_virtualWindowWidth = sw; m_virtualWindowHeight = sh;
+    m_renderWidth = sw; m_renderHeight = sh; m_screenWidth = sw;
+    m_renderedY = 0; m_scrollY = 0; m_renderPending = false;
+    /* force the compositor to re-render at the new (small) size so the old big FBO is destroyed -> pmem freed */
+    webkit_web_view_evaluate_javascript(m_webView, "window.scrollTo(0,1);window.scrollTo(0,0);", -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    updateContentsSize();
+}
+
+void BrowserPageWPE::mediadRestoreSurface()
+{
+    if (!m_viewBackend || m_mediadSavedW == 0) return;
+    int rw = m_mediadSavedW, rh = m_mediadSavedH;
+    MLOG("mediad: restoring render surface -> %dx%d", rw, rh);
+    wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)rw, (uint32_t)rh);
+    m_virtualWindowWidth = rw; m_virtualWindowHeight = rh;
+    m_renderWidth = rw; m_renderHeight = rh; m_screenWidth = rw;
+    m_renderPending = false;
+    m_mediadSavedW = m_mediadSavedH = 0;
+    if (m_webView) webkit_web_view_evaluate_javascript(m_webView, "window.scrollTo(0,0)", -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    updateContentsSize();
+}
+
 void BrowserPageWPE::onFsVideoInfo(GObject* obj, GAsyncResult* res, gpointer ud)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
@@ -1339,10 +1376,12 @@ void BrowserPageWPE::onFsVideoInfo(GObject* obj, GAsyncResult* res, gpointer ud)
     self->m_mediadSrc = src;
     self->m_mediadResumeTime = t;
     self->m_mediadActive = true;   /* claim the handoff now so a second trigger no-ops */
+    /* Free our GL FBO's pmem_smipool so mediad's decoder+overlay can allocate from the SMI pool. */
+    self->mediadFreeSurface();
     /* Defer the mediad session-open so our in-browser gst pipeline finishes releasing the single HW VIDC
-     * decoder (the src-drop above is async) before mediad tries to acquire it. */
-    MLOG("mediad: video released; opening session in 700ms for src=%s t=%.1f", src.c_str(), t);
-    g_timeout_add(700, &BrowserPageWPE::mediadOpenSession, self);
+     * decoder AND the WebProcess frees the shrunken FBO's pmem before mediad tries to acquire them. */
+    MLOG("mediad: video+surface released; opening session in 900ms for src=%s t=%.1f", src.c_str(), t);
+    g_timeout_add(900, &BrowserPageWPE::mediadOpenSession, self);
 }
 
 /* the appId to forge via LSCallFromApplication — default our app; overridable by writing an appId into
@@ -1475,6 +1514,7 @@ void BrowserPageWPE::mediadEnd()
         if (!LSCallCancel(sess, m_mediadSubToken, &e)) { MLOG("mediad: cancel failed: %s", e.message?e.message:"?"); LSErrorFree(&e); }
     }
     m_mediadSubToken = 0; m_mediadLoc.clear(); m_mediadActive = false; g_mediadBusy = false;
+    mediadRestoreSurface();   /* bring our render surface back to full size */
     /* restore the in-browser video (we dropped its src to free the decoder) at the saved time */
     if (m_webView && !m_mediadSrc.empty()) {
         char js[512];
