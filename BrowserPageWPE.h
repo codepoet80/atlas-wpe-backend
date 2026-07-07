@@ -20,7 +20,6 @@
 #include <QtWebKit/QtWebKit>       // QWebHitTestResult (interface type); compile-only — QtWebKit link TBD
 #include <wpe/webkit.h>
 #include <lunaservice.h>          // mediad system-video handoff: LSCallFromApplication on BrowserServer's handle
-#include <semaphore.h>
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -287,13 +286,10 @@ private:
     BrowserOffscreenQt* m_offscreen1;
     bool                m_ownOffscreen0;
     bool                m_ownOffscreen1;
-    sem_t*              m_bufferLock;
-    char*               m_bufferLockName;
     int                 m_windowWidth, m_windowHeight;
     int                 m_virtualWindowWidth, m_virtualWindowHeight;
     int                 m_screenWidth;          // real fb width; layout may be wider (fit-to-screen via contentZoom)
     int                 m_screenHeight;         // real fb height (visible rows) — the pannable window height
-    int                 m_fsFillH = 0;          // fullscreen: visible screen height to fill the video to (deferred CSS)
     bool                m_fsPending = false;    // fullscreen: a deferred fill/resize is queued (cleared on leave)
     bool                m_fsActive = false;     // fullscreen: screen-sized surface resize is active
     int                 m_fsRestoreH = 0;       // tall renderHeight to restore on fullscreen exit

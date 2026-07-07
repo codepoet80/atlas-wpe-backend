@@ -129,7 +129,6 @@ static gboolean scrolltest_poll(gpointer);         // fwd — file trigger (app-
 BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     : m_server(server), m_proxy(proxy), m_identifier(0)
     , m_offscreen0(0), m_offscreen1(0), m_ownOffscreen0(false), m_ownOffscreen1(false)
-    , m_bufferLock(0), m_bufferLockName(0)
     , m_windowWidth(1024), m_windowHeight(768)
     , m_virtualWindowWidth(0), m_virtualWindowHeight(0)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
@@ -163,7 +162,6 @@ BrowserPageWPE::~BrowserPageWPE()
         m_loginDecision = nullptr;
     }
     free(m_identifier);
-    free(m_bufferLockName);
     delete m_offscreen0;
     delete m_offscreen1;
     delete m_syncReplyPipe;   // Feature 7 SSL/auth sync pipe (leaked the object + its FIFO/fd otherwise)
