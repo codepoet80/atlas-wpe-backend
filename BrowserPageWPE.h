@@ -63,6 +63,8 @@ public:
 
     // ---- sizing / zoom ----
     void setWindowSize(uint32_t width, uint32_t height);
+    void enterFsResize();   // fullscreen: resize the WPE surface to the visible screen (video fills it, faster readback)
+    void exitFsResize();    // fullscreen: restore the tall pan-buffer + scroll
     void setVirtualWindowSize(uint32_t width, uint32_t height);
     void getWindowSize(int& width, int& height);
     void getVirtualWindowSize(int& width, int& height);
@@ -274,7 +276,10 @@ private:
     int                 m_screenWidth;          // real fb width; layout may be wider (fit-to-screen via contentZoom)
     int                 m_screenHeight;         // real fb height (visible rows) — the pannable window height
     int                 m_fsFillH = 0;          // fullscreen: visible screen height to fill the video to (deferred CSS)
-    bool                m_fsPending = false;    // fullscreen: a deferred CSS-fill is queued (cleared on leave)
+    bool                m_fsPending = false;    // fullscreen: a deferred fill/resize is queued (cleared on leave)
+    bool                m_fsActive = false;     // fullscreen: screen-sized surface resize is active
+    int                 m_fsRestoreH = 0;       // tall renderHeight to restore on fullscreen exit
+    int                 m_fsRestoreScrollY = 0; // scroll pos to restore on fullscreen exit
     int                 m_renderedY;            // pan model: content-Y of the buffer's top; buffer holds [m_renderedY, +m_renderHeight]
     int                 m_deliveredY;           // renderedY of the LAST delivered frame (what the adapter is actually showing) — scroll-test coverage metric
     gint64              m_touchDownUs = 0;      // monotonic timestamp of the last touch-down, to tell a quick tap (dismiss selection) from a long-press (select)
