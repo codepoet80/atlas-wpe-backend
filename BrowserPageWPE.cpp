@@ -1588,6 +1588,18 @@ static gboolean scrolltest_poll(gpointer)
         if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end())
             g_testablePage->toggleRotationTest();
     }
+    /* Fullscreen test: `touch /tmp/atlas_fstest` injects a synthetic click on the page body. That click is a
+     * real user gesture from WebKit's view (dispatched via dispatchPointer), so Element.requestFullscreen()
+     * is accepted (transient activation) — lets us trigger fullscreen for crash-testing WITHOUT a physical
+     * tap. The test page (vidfs2.html) has a full-page body click handler that requests fullscreen. */
+    if (access("/tmp/atlas_fstest", F_OK) == 0) {
+        unlink("/tmp/atlas_fstest");
+        // Click ALL live pages (the app launches a shell + the content page); the video page's body handler
+        // fires requestFullscreen. Clicking the shell is harmless.
+        int n = 0;
+        for (BrowserPageWPE* p : g_livePages) { p->clickAt(300, 500, 1); n++; }
+        WLOG("fstest: injected click at 300,500 on %d live page(s)", n);
+    }
     return G_SOURCE_CONTINUE;
 }
 /* Simulate a device rotation by toggling the window size portrait<->landscape (drives setWindowSize). */
