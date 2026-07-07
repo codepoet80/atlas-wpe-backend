@@ -44,6 +44,7 @@ struct msmfb_overlay_data { uint32_t id; struct msmfb_data data; };
 #define MSMFB_OVERLAY_PLAY  _IOW ('m', 137, struct msmfb_overlay_data)
 #define MSMFB_NEW_REQUEST   ((uint32_t)-1)
 #define MDP_Y_CBCR_H2V2     2      /* NV12 (Cb-first) — mdpdetile output */
+#define MDP_OV_PIPE_SHARE   0x00800000
 #define PMEM_ALLOCATE       _IOW('p', 5, unsigned int)
 
 #define GST_TYPE_MDPOVERLAY (gst_mdpoverlay_get_type())
@@ -117,6 +118,11 @@ static gboolean gst_mdpoverlay_set_caps (GstBaseSink *bsink, GstCaps *caps) {
     ov.dst_rect.w = self->dstw; ov.dst_rect.h = self->dsth;
     ov.z_order = 1;            /* above the UI base layer */
     ov.is_fg = 1; ov.alpha = 0xff; ov.transp_mask = 0xffffffff;
+    /* Request a SHAREABLE MDP pipe: LunaSysMgr is compositing the card and holds the dedicated VG pipes,
+     * so a req_share=0 alloc fails (mdp4_overlay_pipe_alloc ... FAILED, rc=-12). MDP_OV_PIPE_SHARE lets us
+     * share a video pipe. Overridable via ATLAS_OV_FLAGS. */
+    ov.flags = MDP_OV_PIPE_SHARE;
+    { const char *ef = getenv ("ATLAS_OV_FLAGS"); if (ef) ov.flags = (uint32_t) strtoul (ef, NULL, 0); }
     ov.id = MSMFB_NEW_REQUEST;
     if (ioctl (self->fb_fd, MSMFB_OVERLAY_SET, &ov) < 0) {
         GST_ERROR_OBJECT (self, "MSMFB_OVERLAY_SET failed: %s", g_strerror (errno));
