@@ -1,51 +1,38 @@
-/* gstmdpoverlay — GStreamer video sink: display linear NV12 straight to the panel via an MDP4 hardware
- * overlay plane (/dev/fb0 MSMFB_OVERLAY_SET/PLAY). Zero GPU readback, zero WPE compositing — the MDP
- * composites the video buffer over the UI base layer (hole-punch). For the Atlas/WPE FULLSCREEN video
- * fast path on the HP TouchPad (APQ8060). Recipe validated standalone (mdp_overlay_test.c).
+/* gstmdpoverlay — GStreamer video sink: display linear NV12 straight to the panel via the MSM **V4L2
+ * video-out overlay** (/dev/video0). This is the interface the LEGACY webOS video sink used
+ * (libPmMediaGstVideoSinkLib stage b) — it owns a RESERVED MDP VG (video) pipe (kernel msm_fb.c layout
+ * <VG1><VG2><RGB1>, fb0=RGB1), so it gets a video pipe WITHOUT contending for the fb0 MSMFB_OVERLAY pool
+ * that LunaSysMgr's compositor exhausts. Zero GPU readback, zero WPE compositing (hole-punch).
  *
  * Pipeline: omxh264dec ! mdpdetile ! mdpoverlaysink   (mdpdetile emits linear NV12 = MDP_Y_CBCR_H2V2).
- * The destination on-screen rect is set via properties dst-x/dst-y/dst-w/dst-h (WPE sets the fullscreen
- * rect); env ATLAS_OV_DST="x,y,w,h" overrides for standalone testing. Default = full 1024x768.
+ * Dest on-screen rect via props dst-x/dst-y/dst-w/dst-h; env ATLAS_OV_DST="x,y,w,h" overrides. NOTE the
+ * V4L2 fourcc naming is swapped vs MDP: V4L2_PIX_FMT_NV21 -> MDP_Y_CBCR_H2V2 (Cb-first, mdpdetile's
+ * output), so we pass NV21 (override via ATLAS_OV_FMT fourcc int).
  *
- * v1: one memcpy/frame into a pmem_adsp buffer, then OVERLAY_PLAY that fd (cheap vs the readback it
- * replaces). Zero-copy (PLAY mdpdetile's dst pmem directly) is a later optimization.
+ * v1: one memcpy/frame into a pmem_adsp buffer, then QBUF it (userptr = pmem vaddr, reserved = pmem fd,
+ * exactly as the driver's msmv4l2_fb_update expects). Zero-copy (QBUF mdpdetile's dst pmem) is later.
  */
 #include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/video/gstvideosink.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <linux/videodev2.h>
 
 GST_DEBUG_CATEGORY_STATIC (mdpoverlay_debug);
 #define GST_CAT_DEFAULT mdpoverlay_debug
 
-/* --- kernel ABI (include/linux/msm_mdp.h + android_pmem.h) --- */
-struct mdp_rect  { uint32_t x, y, w, h; };
-struct msmfb_img { uint32_t width, height, format; };
-struct mdp_overlay {
-    struct msmfb_img src;
-    struct mdp_rect  src_rect;
-    struct mdp_rect  dst_rect;
-    uint32_t z_order, is_fg, alpha, transp_mask, flags, id;
-    uint32_t user_data[8];
-};
-struct msmfb_data { uint32_t offset; int memory_id; int id; uint32_t flags; uint32_t priv; };
-struct msmfb_overlay_data { uint32_t id; struct msmfb_data data; };
-
-#define MSMFB_OVERLAY_SET   _IOWR('m', 135, struct mdp_overlay)
-#define MSMFB_OVERLAY_UNSET _IOW ('m', 136, unsigned int)
-#define MSMFB_OVERLAY_PLAY  _IOW ('m', 137, struct msmfb_overlay_data)
-#define MSMFB_NEW_REQUEST   ((uint32_t)-1)
-#define MDP_Y_CBCR_H2V2     2      /* NV12 (Cb-first) — mdpdetile output */
-#define MDP_OV_PIPE_SHARE   0x00800000
-#define PMEM_ALLOCATE       _IOW('p', 5, unsigned int)
+#define PMEM_ALLOCATE _IOW('p', 5, unsigned int)
+#ifndef V4L2_PIX_FMT_NV21
+#define V4L2_PIX_FMT_NV21 v4l2_fourcc('N','V','2','1')
+#endif
 
 #define GST_TYPE_MDPOVERLAY (gst_mdpoverlay_get_type())
 G_DECLARE_FINAL_TYPE (GstMdpOverlay, gst_mdpoverlay, GST, MDPOVERLAY, GstVideoSink)
@@ -54,11 +41,11 @@ struct _GstMdpOverlay {
     GstVideoSink parent;
     gint dstx, dsty, dstw, dsth;   /* on-screen destination rect (properties) */
     gint vw, vh;                   /* incoming video (source) width/height */
+    guint fourcc;                  /* V4L2 pixelformat (default NV21 -> MDP_Y_CBCR_H2V2) */
     gsize fsz;                     /* pmem frame size = vw*vh*3/2 */
-    gint fb_fd, pmem_fd;
+    gint vid_fd, pmem_fd;
     void *pmem_map;
-    uint32_t ov_id;
-    gboolean ov_set;
+    gboolean streaming;
 };
 G_DEFINE_TYPE (GstMdpOverlay, gst_mdpoverlay, GST_TYPE_VIDEO_SINK)
 
@@ -79,14 +66,14 @@ static int pmem_alloc (gsize sz, void **map) {
 }
 
 static void overlay_teardown (GstMdpOverlay *self) {
-    if (self->fb_fd >= 0 && self->ov_set) {
-        uint32_t id = self->ov_id;
-        ioctl (self->fb_fd, MSMFB_OVERLAY_UNSET, &id);
+    if (self->vid_fd >= 0 && self->streaming) {
+        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        ioctl (self->vid_fd, VIDIOC_STREAMOFF, &type);
     }
-    self->ov_set = FALSE;
+    self->streaming = FALSE;
     if (self->pmem_map) munmap (self->pmem_map, self->fsz), self->pmem_map = NULL;
     if (self->pmem_fd >= 0) close (self->pmem_fd), self->pmem_fd = -1;
-    if (self->fb_fd >= 0) close (self->fb_fd), self->fb_fd = -1;
+    if (self->vid_fd >= 0) close (self->vid_fd), self->vid_fd = -1;
 }
 
 static gboolean gst_mdpoverlay_set_caps (GstBaseSink *bsink, GstCaps *caps) {
@@ -99,57 +86,67 @@ static gboolean gst_mdpoverlay_set_caps (GstBaseSink *bsink, GstCaps *caps) {
     self->vh = GST_VIDEO_INFO_HEIGHT (&info);
     self->fsz = (gsize) self->vw * self->vh * 3 / 2;
 
-    /* env override for standalone testing: ATLAS_OV_DST="x,y,w,h" */
     const char *e = getenv ("ATLAS_OV_DST");
     if (e) { int x,y,w,h; if (sscanf (e, "%d,%d,%d,%d", &x,&y,&w,&h) == 4) {
         self->dstx=x; self->dsty=y; self->dstw=w; self->dsth=h; } }
+    { const char *ef = getenv ("ATLAS_OV_FMT"); if (ef) self->fourcc = (guint) strtoul (ef, NULL, 0); }
 
     self->pmem_fd = pmem_alloc (self->fsz, &self->pmem_map);
-    self->fb_fd = open ("/dev/fb0", O_RDWR);
-    if (self->pmem_fd < 0 || self->fb_fd < 0) {
-        GST_ERROR_OBJECT (self, "pmem/fb0 open failed (pmem=%d fb=%d)", self->pmem_fd, self->fb_fd);
+    self->vid_fd = open ("/dev/video0", O_RDWR);
+    if (self->pmem_fd < 0 || self->vid_fd < 0) {
+        GST_ERROR_OBJECT (self, "pmem/video0 open failed (pmem=%d vid=%d): %s",
+            self->pmem_fd, self->vid_fd, g_strerror (errno));
         overlay_teardown (self); return FALSE;
     }
 
-    struct mdp_overlay ov; memset (&ov, 0, sizeof ov);
-    ov.src.width = self->vw; ov.src.height = self->vh; ov.src.format = MDP_Y_CBCR_H2V2;
-    ov.src_rect.x = 0; ov.src_rect.y = 0; ov.src_rect.w = self->vw; ov.src_rect.h = self->vh;
-    ov.dst_rect.x = self->dstx; ov.dst_rect.y = self->dsty;
-    ov.dst_rect.w = self->dstw; ov.dst_rect.h = self->dsth;
-    ov.z_order = 1;            /* above the UI base layer */
-    ov.is_fg = 1; ov.alpha = 0xff; ov.transp_mask = 0xffffffff;
-    /* Request a SHAREABLE MDP pipe: LunaSysMgr is compositing the card and holds the dedicated VG pipes,
-     * so a req_share=0 alloc fails (mdp4_overlay_pipe_alloc ... FAILED, rc=-12). MDP_OV_PIPE_SHARE lets us
-     * share a video pipe. Overridable via ATLAS_OV_FLAGS. */
-    ov.flags = MDP_OV_PIPE_SHARE;
-    { const char *ef = getenv ("ATLAS_OV_FLAGS"); if (ef) ov.flags = (uint32_t) strtoul (ef, NULL, 0); }
-    ov.id = MSMFB_NEW_REQUEST;
-    if (ioctl (self->fb_fd, MSMFB_OVERLAY_SET, &ov) < 0) {
-        GST_ERROR_OBJECT (self, "MSMFB_OVERLAY_SET failed: %s", g_strerror (errno));
-        overlay_teardown (self); return FALSE;
-    }
-    self->ov_id = ov.id; self->ov_set = TRUE;
-    GST_INFO_OBJECT (self, "overlay id=%u  src %dx%d NV12 -> dst %d,%d %dx%d",
-        self->ov_id, self->vw, self->vh, self->dstx, self->dsty, self->dstw, self->dsth);
+    /* source pixel format (V4L2_BUF_TYPE_VIDEO_OUTPUT) */
+    struct v4l2_format fmt; memset (&fmt, 0, sizeof fmt);
+    fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    fmt.fmt.pix.width = self->vw; fmt.fmt.pix.height = self->vh;
+    fmt.fmt.pix.pixelformat = self->fourcc;
+    if (ioctl (self->vid_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        GST_ERROR_OBJECT (self, "S_FMT(OUTPUT) failed: %s", g_strerror (errno)); overlay_teardown (self); return FALSE; }
+
+    /* source crop = whole frame */
+    struct v4l2_crop crop; memset (&crop, 0, sizeof crop);
+    crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    crop.c.left = 0; crop.c.top = 0; crop.c.width = self->vw; crop.c.height = self->vh;
+    if (ioctl (self->vid_fd, VIDIOC_S_CROP, &crop) < 0)
+        GST_WARNING_OBJECT (self, "S_CROP failed: %s", g_strerror (errno));   /* non-fatal */
+
+    /* destination on-screen window (V4L2_BUF_TYPE_VIDEO_OVERLAY) */
+    struct v4l2_format win; memset (&win, 0, sizeof win);
+    win.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
+    win.fmt.win.w.left = self->dstx; win.fmt.win.w.top = self->dsty;
+    win.fmt.win.w.width = self->dstw; win.fmt.win.w.height = self->dsth;
+    if (ioctl (self->vid_fd, VIDIOC_S_FMT, &win) < 0) {
+        GST_ERROR_OBJECT (self, "S_FMT(OVERLAY) failed: %s", g_strerror (errno)); overlay_teardown (self); return FALSE; }
+
+    int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    if (ioctl (self->vid_fd, VIDIOC_STREAMON, &type) < 0) {
+        GST_ERROR_OBJECT (self, "STREAMON failed: %s", g_strerror (errno)); overlay_teardown (self); return FALSE; }
+    self->streaming = TRUE;
+    GST_INFO_OBJECT (self, "V4L2 overlay: src %dx%d fourcc=0x%x -> win %d,%d %dx%d (/dev/video0)",
+        self->vw, self->vh, self->fourcc, self->dstx, self->dsty, self->dstw, self->dsth);
     return TRUE;
 }
 
 static GstFlowReturn gst_mdpoverlay_show_frame (GstVideoSink *vsink, GstBuffer *buf) {
     GstMdpOverlay *self = GST_MDPOVERLAY (vsink);
-    if (!self->ov_set) return GST_FLOW_OK;
+    if (!self->streaming) return GST_FLOW_OK;
     GstMapInfo m;
     if (!gst_buffer_map (buf, &m, GST_MAP_READ)) return GST_FLOW_ERROR;
     memcpy (self->pmem_map, m.data, MIN (m.size, self->fsz));   /* v1: copy into pmem */
     gst_buffer_unmap (buf, &m);
 
-    struct msmfb_overlay_data play; memset (&play, 0, sizeof play);
-    play.id = self->ov_id;
-    play.data.offset = 0;
-    play.data.memory_id = self->pmem_fd;
-    if (ioctl (self->fb_fd, MSMFB_OVERLAY_PLAY, &play) < 0) {
-        GST_WARNING_OBJECT (self, "OVERLAY_PLAY failed: %s", g_strerror (errno));
-        return GST_FLOW_OK;   /* non-fatal — keep streaming */
-    }
+    struct v4l2_buffer vb; memset (&vb, 0, sizeof vb);
+    vb.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    vb.memory = V4L2_MEMORY_USERPTR;
+    vb.m.userptr = (unsigned long) self->pmem_map;   /* pmem vaddr -> driver resolves offset via VMA */
+    vb.length = self->fsz;
+    vb.reserved = (uint32_t) self->pmem_fd;           /* msm driver: reserved = the pmem fd */
+    if (ioctl (self->vid_fd, VIDIOC_QBUF, &vb) < 0)
+        GST_WARNING_OBJECT (self, "QBUF failed: %s", g_strerror (errno));   /* non-fatal — keep streaming */
     return GST_FLOW_OK;
 }
 
@@ -180,8 +177,9 @@ static void gst_mdpoverlay_get_property (GObject *o, guint id, GValue *v, GParam
 }
 
 static void gst_mdpoverlay_init (GstMdpOverlay *self) {
-    self->fb_fd = self->pmem_fd = -1;
+    self->vid_fd = self->pmem_fd = -1;
     self->dstx = 0; self->dsty = 0; self->dstw = 1024; self->dsth = 768;   /* default fullscreen */
+    self->fourcc = V4L2_PIX_FMT_NV21;   /* -> MDP_Y_CBCR_H2V2 (Cb-first, mdpdetile output) */
 }
 
 static void gst_mdpoverlay_class_init (GstMdpOverlayClass *klass) {
@@ -200,18 +198,18 @@ static void gst_mdpoverlay_class_init (GstMdpOverlayClass *klass) {
     g_object_class_install_property (gc, PROP_DST_H,
         g_param_spec_int ("dst-h", "dst-h", "overlay height", 1, 4096, 768, G_PARAM_READWRITE));
     gst_element_class_add_static_pad_template (ec, &sink_tmpl);
-    gst_element_class_set_static_metadata (ec, "MDP4 HW overlay sink",
-        "Sink/Video", "Display linear NV12 via an MDP4 hardware overlay (hole-punch)", "Atlas TouchPad");
+    gst_element_class_set_static_metadata (ec, "MDP4 V4L2 HW overlay sink",
+        "Sink/Video", "Display linear NV12 via the MSM V4L2 video-out overlay (/dev/video0)", "Atlas TouchPad");
     bc->set_caps = gst_mdpoverlay_set_caps;
     bc->stop = gst_mdpoverlay_stop;
     vc->show_frame = gst_mdpoverlay_show_frame;
 }
 
 static gboolean plugin_init (GstPlugin *plugin) {
-    GST_DEBUG_CATEGORY_INIT (mdpoverlay_debug, "mdpoverlay", 0, "MDP4 HW overlay sink");
+    GST_DEBUG_CATEGORY_INIT (mdpoverlay_debug, "mdpoverlay", 0, "MDP4 V4L2 HW overlay sink");
     return gst_element_register (plugin, "mdpoverlaysink", GST_RANK_NONE, GST_TYPE_MDPOVERLAY);
 }
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR, GST_VERSION_MINOR, mdpoverlay,
-    "MDP4 HW overlay video sink for Atlas TouchPad",
+    "MDP4 V4L2 HW overlay video sink for Atlas TouchPad",
     plugin_init, "1.0", "LGPL", "atlas", "atlas")
