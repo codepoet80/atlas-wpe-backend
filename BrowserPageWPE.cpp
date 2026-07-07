@@ -2267,8 +2267,10 @@ void BrowserPageWPE::dispatchPointer(int x, int y, uint32_t button, bool down)
 
 void BrowserPageWPE::mouseEvent(int type, int contentX, int contentY, int detail)
 {
-    /* type: 0=move 1=down 2=up (Atlas BATypes). detail = button. TODO: map content→view coords
-     * (subtract scroll, apply zoom) once setScrollPosition is wired. */
+    /* type: 0=move 1=down 2=up (Atlas BATypes). detail = button. contentX/Y are passed straight to
+     * dispatchPointer — correct only while the page is unscrolled/unzoomed. Scroll tracking (m_scrollX/Y)
+     * is wired now, so TODO: apply the content→view map here (subtract m_scrollX/Y, apply zoom) for taps
+     * on scrolled/zoomed pages. */
     const uint32_t BTN_LEFT = 1;
     switch (type) {
         case 0: dispatchPointer(contentX, contentY, 0, false); break;
