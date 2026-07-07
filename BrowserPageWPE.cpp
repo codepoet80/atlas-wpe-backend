@@ -1345,10 +1345,24 @@ void BrowserPageWPE::onFsVideoInfo(GObject* obj, GAsyncResult* res, gpointer ud)
     g_timeout_add(700, &BrowserPageWPE::mediadOpenSession, self);
 }
 
+/* the appId to forge via LSCallFromApplication — default our app; overridable by writing an appId into
+ * /tmp/atlas_mediad_appid (empty file = use default; presence also enables the forge path). */
+static const char* mediad_appid()
+{
+    static char buf[128];
+    FILE* f = fopen("/tmp/atlas_mediad_appid", "r");
+    if (f) { size_t n = fread(buf, 1, sizeof(buf)-1, f); fclose(f); buf[n]=0;
+        char* nl = strpbrk(buf, "\r\n "); if (nl) *nl = 0;
+        if (buf[0]) return buf; }
+    return "org.webosports.app.atlas";
+}
+
 gboolean BrowserPageWPE::mediadOpenSession(gpointer ud)
 {
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     if (bpwpe_dead(self) || !self->m_mediadActive) return G_SOURCE_REMOVE;
+    /* Open the session on the NAMED handle; per-session control calls go on the ANON handle (mediadCall) —
+     * mimics luna-send's two separate connections (session-owner vs controller). */
     LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getServiceHandle() : nullptr;
     if (!h) { MLOG("mediad: no LSHandle — abort"); self->m_mediadActive = false; g_mediadBusy = false; return G_SOURCE_REMOVE; }
     LSError e; LSErrorInit(&e);
@@ -1358,7 +1372,7 @@ gboolean BrowserPageWPE::mediadOpenSession(gpointer ud)
     bool ok;
     if (access("/tmp/atlas_mediad_appid", F_OK) == 0)
         ok = LSCallFromApplication(h, "luna://com.palm.mediad/service/playback", "{}",
-                                   "org.webosports.app.atlas",
+                                   mediad_appid(),
                                    &BrowserPageWPE::onMediadPlayback, self, &self->m_mediadSubToken, &e);
     else
         ok = LSCall(h, "luna://com.palm.mediad/service/playback", "{}",
@@ -1388,6 +1402,8 @@ bool BrowserPageWPE::onMediadPlayback(LSHandle* /*sh*/, LSMessage* msg, void* ct
     char pl[1024];
     snprintf(pl, sizeof(pl), "{\"source\":\"%s\",\"audioClass\":\"kAudioStreamMedia\"}", self->m_mediadSrc.c_str());
     self->mediadCall("load", pl);
+    /* diag: /tmp/atlas_mediad_loadonly fires ONLY load (no bounds/fit/play) to check if load alone decodes */
+    if (access("/tmp/atlas_mediad_loadonly", F_OK) == 0) { MLOG("mediad: load-only mode (skipping bounds/fit/play)"); return true; }
     g_timeout_add(1000, &BrowserPageWPE::mediadFirePlay, self);
     return true;
 }
@@ -1416,7 +1432,7 @@ gboolean BrowserPageWPE::mediadFirePlay(gpointer ud)
 void BrowserPageWPE::mediadCall(const char* method, const char* payload)
 {
     if (m_mediadLoc.empty()) return;
-    LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getServiceHandle() : nullptr;
+    LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getMediaHandle() : nullptr;
     if (!h) return;
     char uri[256]; snprintf(uri, sizeof(uri), "luna://%s/%s", m_mediadLoc.c_str(), method);
     MLOG("mediad -> %s %s", uri, payload);
@@ -1426,7 +1442,7 @@ void BrowserPageWPE::mediadCall(const char* method, const char* payload)
     LSMessageToken tok = 0;
     bool ok;
     if (access("/tmp/atlas_mediad_appid", F_OK) == 0)
-        ok = LSCallFromApplication(h, uri, payload, "org.webosports.app.atlas",
+        ok = LSCallFromApplication(h, uri, payload, mediad_appid(),
                                    &BrowserPageWPE::onMediadReply, this, &tok, &e);
     else
         ok = LSCall(h, uri, payload, &BrowserPageWPE::onMediadReply, this, &tok, &e);
@@ -1448,13 +1464,15 @@ void BrowserPageWPE::mediadEnd()
     if (!m_mediadActive) return;
     MLOG("mediad: ending handoff (resume t=%.1f)", m_mediadResumeTime);
     if (!m_mediadLoc.empty()) mediadCall("unload", "{}");
-    LSHandle* h = BrowserServer::instance() ? BrowserServer::instance()->getServiceHandle() : nullptr;
+    BrowserServer* bs = BrowserServer::instance();
+    LSHandle* ctrl = bs ? bs->getMediaHandle()   : nullptr;  // control calls went out here
+    LSHandle* sess = bs ? bs->getServiceHandle() : nullptr;  // /service/playback subscription went out here
     LSError e; LSErrorInit(&e);
-    /* cancel the held load/play/... subscriptions, then the /service/playback subscription (frees the session) */
-    for (LSMessageToken t : m_mediadCallTokens) if (h && t) LSCallCancel(h, t, &e);
+    /* cancel the held control-call subscriptions (anon handle), then the session subscription (named handle) */
+    for (LSMessageToken t : m_mediadCallTokens) if (ctrl && t) LSCallCancel(ctrl, t, &e);
     m_mediadCallTokens.clear();
-    if (h && m_mediadSubToken) {
-        if (!LSCallCancel(h, m_mediadSubToken, &e)) { MLOG("mediad: cancel failed: %s", e.message?e.message:"?"); LSErrorFree(&e); }
+    if (sess && m_mediadSubToken) {
+        if (!LSCallCancel(sess, m_mediadSubToken, &e)) { MLOG("mediad: cancel failed: %s", e.message?e.message:"?"); LSErrorFree(&e); }
     }
     m_mediadSubToken = 0; m_mediadLoc.clear(); m_mediadActive = false; g_mediadBusy = false;
     /* restore the in-browser video (we dropped its src to free the decoder) at the saved time */
