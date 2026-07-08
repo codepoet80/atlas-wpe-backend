@@ -96,6 +96,7 @@ public:
 
     // ---- autonomous scroll test (kicked with SIGUSR1; drives setScrollPosition like the adapter) ----
     void startScrollTest();      // begin a top->bottom->top sweep on this page
+    void runScrape(const char* js);   // run JS in the page, result -> /tmp/atlas_scrape_out (see /tmp/atlas_scrape)
     bool scrollTestStep();       // one timed step; returns false when the sweep finishes
     void reportScrollTest();     // log the SCROLLTEST summary line
     void toggleRotationTest();   // simulate a rotate: toggle window portrait<->landscape (test harness)
@@ -275,6 +276,7 @@ private:
     int m_hitTestQuery = 0;                  // Feature 9: queryNum echoed in the hit-test/save-image response
     int m_saveImgQuery = 0;
     static void onLoginCapture(GObject*, GAsyncResult*, gpointer);   // save-login: form-submit snapshot → msgActionData("saveLogin")
+    static void onScrapeResult(GObject*, GAsyncResult*, gpointer);   // -> /tmp/atlas_scrape_out
     static gboolean onLoginDeferTimeout(gpointer);                   // failsafe: resume a deferred login-snapshot navigation if the capture callback never fires
     static void onCopyText(GObject*, GAsyncResult*, gpointer);       // copy: selection text → msgActionData("copiedText")
     static void onSelectResult(GObject*, GAsyncResult*, gpointer);   // select: start/end rects → msgActionData("selectionBounds")

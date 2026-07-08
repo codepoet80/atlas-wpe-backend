@@ -292,6 +292,31 @@ void BrowserPageWPE::onLoginCapture(GObject* obj, GAsyncResult* res, gpointer ud
     }
 }
 
+/* Page scrape (see scrolltest_poll /tmp/atlas_scrape): run arbitrary JS, write the result to a host-readable file. */
+void BrowserPageWPE::runScrape(const char* js)
+{
+    if (m_webView && js && js[0])
+        webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onScrapeResult, this);
+}
+
+void BrowserPageWPE::onScrapeResult(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
+    FILE* out = fopen("/tmp/atlas_scrape_out", "w");
+    if (v) {
+        char* s = jsc_value_to_string(v);
+        if (out) fputs(s ? s : "", out);
+        if (s) g_free(s);
+        g_object_unref(v);
+    } else if (out)
+        fprintf(out, "JSERROR: %s", err ? err->message : "?");
+    if (out) fclose(out);
+    if (err) g_error_free(err);
+}
+
 /* Failsafe: if the capture callback never fires (page torn down mid-eval), resume the deferred navigation
  * anyway so browsing can never permanently stall on a login-form snapshot. One-shot. */
 gboolean BrowserPageWPE::onLoginDeferTimeout(gpointer ud)
@@ -1886,6 +1911,20 @@ static gboolean scrolltest_poll(gpointer)
         int n = 0;
         for (BrowserPageWPE* p : g_livePages) { p->clickAt(300, 500, 1); n++; }
         WLOG("fstest: injected click at 300,500 on %d live page(s)", n);
+    }
+    /* Page scrape: `/tmp/atlas_scrape` holds a JS expression; run it in the live content page and write the
+     * (stringified) result to /tmp/atlas_scrape_out. General tool for scraping loaded pages (html5test,
+     * codec-probe results, etc.) from the host without a physical device. */
+    if (access("/tmp/atlas_scrape", F_OK) == 0) {
+        static char js[65536];
+        FILE* jf = fopen("/tmp/atlas_scrape", "r");
+        size_t jn = jf ? fread(js, 1, sizeof(js) - 1, jf) : 0; js[jn] = 0;
+        if (jf) fclose(jf);
+        unlink("/tmp/atlas_scrape");
+        BrowserPageWPE* target = nullptr;
+        for (BrowserPageWPE* p : g_livePages) target = p;   /* last live page = the content page */
+        if (target && js[0]) target->runScrape(js);
+        else WLOG("scrape: no live content page");
     }
     /* Direct mediad-handoff test: `touch /tmp/atlas_mediadgo` calls mediadBegin() on each live page WITHOUT
      * needing a fullscreen gesture (requestFullscreen needs transient activation the synthetic tap can't give).
