@@ -191,6 +191,16 @@ public:
     void setShowClickedLink(bool enable) {}
     void settingsJavaScriptEnabled(bool enable) { if (m_webView) webkit_settings_set_enable_javascript(webkit_web_view_get_settings(m_webView), enable); }
     void settingsPopupsEnabled(bool enable) { if (m_webView) webkit_settings_set_javascript_can_open_windows_automatically(webkit_web_view_get_settings(m_webView), enable); }
+    // Atlas: "Allow autoplay with sound" toggle. Routed db8 -> app -> adapter -> BrowserServer -> here (like
+    // the other content settings). enable=true -> unmuted audio may autoplay; default false -> tap-to-play.
+    // Toggles /tmp/atlas_autoplay, which HTMLMediaElement reads at media-element creation (a WebKit preference
+    // won't work: live preference changes don't propagate to the warm WebProcess in this port). Only affects
+    // unmuted audio; muted video autoplay is unchanged. We STORE the value and (re)assert the flag in
+    // ensureWebView() before each page load, so the state is enforced (default false -> flag removed) rather
+    // than relying on the app to clear it; the command is processed before openUrl.
+    void settingsAutoplayWithSound(bool enable) { m_autoplayWithSound = enable; applyAutoplayFlag(); }
+    void applyAutoplayFlag() { if (m_autoplayWithSound) { FILE* f = fopen("/tmp/atlas_autoplay", "w"); if (f) fclose(f); } else remove("/tmp/atlas_autoplay"); }
+    bool m_autoplayWithSound = false;
     void smartZoomCalculate( uint32_t pointX, uint32_t pointY );
     void touchEvent(int type, int32_t touchCount, int32_t modifiers, const char *touchesJson);
     int getPageX() { return m_windowWidth/2; }

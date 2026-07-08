@@ -568,6 +568,7 @@ void BrowserPageWPE::ensureWebView()
      * with autoplay work and tap-to-play isn't swallowed. No-op when the engine is built media-off. */
     webkit_settings_set_media_playback_requires_user_gesture(s, FALSE);
     webkit_settings_set_enable_media(s, TRUE);
+    applyAutoplayFlag();   /* enforce the "autoplay with sound" flag state before this page's media loads */
     /* WebKit DOM fullscreen ABORTS (SIGABRT) the moment it engages in our headless/no-window embedding —
      * proven inherent to WebKit's async fullscreen continuation, NOT our enter-fullscreen handler (deferring
      * all handler work out of the signal still crashed). So keep it OFF by default (requestFullscreen is
