@@ -1,0 +1,23 @@
+--- a/Source/WebCore/html/HTMLMediaElement.cpp	2026-07-08 11:03:48.318328688 +0200
++++ b/Source/WebCore/html/HTMLMediaElement.cpp	2026-07-08 11:03:48.283328092 +0200
+@@ -26,6 +26,7 @@
+ 
+ #include "config.h"
+ #include "HTMLMediaElement.h"
++#include <unistd.h> // Atlas: access() for the /tmp/atlas_autoplay toggle
+ 
+ #if ENABLE(VIDEO)
+ 
+@@ -668,7 +669,11 @@
+ #endif
+ {
+     RefPtr page = document.page();
+-    m_shouldAudioPlaybackRequireUserGesture = page && page->requiresUserGestureForAudioPlayback() && !processingUserGestureForMedia();
++    // Atlas: the browser's "Allow autoplay with sound" toggle writes /tmp/atlas_autoplay; when present it
++    // relaxes the unmuted-audio autoplay gesture requirement so pages autoplay with sound. Absent (default)
++    // = standard tap-to-play behavior. Only affects unmuted audio; muted video autoplay is unchanged.
++    bool atlasAllowAudioAutoplay = access("/tmp/atlas_autoplay", F_OK) == 0;
++    m_shouldAudioPlaybackRequireUserGesture = !atlasAllowAudioAutoplay && page && page->requiresUserGestureForAudioPlayback() && !processingUserGestureForMedia();
+     m_shouldVideoPlaybackRequireUserGesture = page && page->requiresUserGestureForVideoPlayback() && !processingUserGestureForMedia();
+ 
+     allMediaElements().add(*this);
