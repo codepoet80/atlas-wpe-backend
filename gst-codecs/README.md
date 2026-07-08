@@ -58,7 +58,16 @@ After deploying all three + `rm /tmp/atlas-gstreg.bin` + restart, `avdemux_asf`,
 `avdec_wmav2/wmapro`, `avdec_wmv3/wmv2/vc1` register and WMA + WMV both play. Verified
 via `luna-send … launch {params:{target:"file://…/codecplay.html"}}` + the scrape tool.
 
+## Ogg Theora video  (DONE)
+Mirror the Vorbis build: `libtheora-1.1.1` (autotools, `--host=$TARGET --build=x86_64-linux-gnu
+--with-ogg=$STAGING --disable-static`) + gst-plugins-base `ext/theora` (`meson configure _b
+-Dtheora=enabled && ninja -C _b ext/theora/libgsttheora.so`). Deploy `libgsttheora.so` +
+`libtheoradec.so.1` + `libtheoraenc.so.1` (libogg already on-device), `rm /tmp/atlas-gstreg.bin`,
+rescan. The WPE scanner already has a `video/x-theora`→`video/ogg` branch, so NO WebKit change is
+needed. Verified: theora.ogv decodes 320x240.
+
 ## Definitive on-device codec support
 Audio WORKS: mp3, aac, opus (webm+ogg), vorbis (webm+ogg), flac (raw+ogg), wav,
 ac3, alac, **wma**.
-Video WORKS (HW): h264, mpeg4, h263; vp8 (SW); **wmv/vc-1 (SW)**. Video FAILS: vp9, theora.
+Video WORKS (HW): h264, mpeg4, h263; vp8 (SW); **wmv/vc-1 (SW)**, **theora (SW)**. Video FAILS: vp9.
+Images: WebP works (libwebp deployed).
