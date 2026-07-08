@@ -1,0 +1,8 @@
+--- a/ext/libav/gstavdemux.c
++++ b/ext/libav/gstavdemux.c
+@@ demuxer rank whitelist (~2151): anything NOT listed hits `else { rank=NONE; continue; }` = unregistered.
+@@ ffmpeg's asf demuxer was missing from this list, so avdemux_asf never registered (WMA/WMV had no container).
+         !strcmp (in_plugin->name, "dsf") || !strcmp (in_plugin->name, "iff") ||
++        !strcmp (in_plugin->name, "asf") ||   /* Atlas: register avdemux_asf (WMA/WMV container) */
+         )
+       rank = GST_RANK_MARGINAL;

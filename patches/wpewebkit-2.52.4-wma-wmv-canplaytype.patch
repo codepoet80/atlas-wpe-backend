@@ -1,0 +1,28 @@
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+@@ ogg block closing brace, before "if (matroskaSupported)" @@
+         if (auto result = factories.hasElementForMediaType(ElementFactories::Type::VideoDecoder, "video/x-theora"_s)) {
+             m_decoderMimeTypeSet.add("video/ogg"_s);
+             m_decoderCodecMap.add("theora"_s, result);
+         }
+     }
+ 
++    // Windows Media (ASF container). Needs the gst-libav ASF demuxer (un-blacklisted in gstavdemux.c for
++    // Atlas) plus the WMA/WMV avdec_* decoders. Like the Ogg case, the container MIME must be registered
++    // explicitly or canPlayType() returns "" even though the decode chain exists.
++    if (factories.hasElementForMediaType(ElementFactories::Type::Demuxer, "video/x-ms-asf"_s)) {
++        m_decoderMimeTypeSet.add("video/x-ms-asf"_s);
++        if (auto wmaSupported = factories.hasElementForMediaType(ElementFactories::Type::AudioDecoder, "audio/x-wma"_s)) {
++            m_decoderMimeTypeSet.add("audio/x-ms-wma"_s);
++            m_decoderMimeTypeSet.add("audio/x-ms-asf"_s);
++            m_decoderCodecMap.add("wma"_s, wmaSupported);
++            m_decoderCodecMap.add("wmav2"_s, wmaSupported);
++        }
++        if (auto wmvSupported = factories.hasElementForMediaType(ElementFactories::Type::VideoDecoder, "video/x-wmv"_s)) {
++            m_decoderMimeTypeSet.add("video/x-ms-wmv"_s);
++            m_decoderCodecMap.add("wmv"_s, wmvSupported);
++            m_decoderCodecMap.add("wmv3"_s, wmvSupported);
++        }
++    }
++
+     if (matroskaSupported) {
