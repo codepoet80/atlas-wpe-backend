@@ -602,6 +602,23 @@ void BrowserPageWPE::ensureWebView()
     webkit_settings_set_enable_fullscreen(s, access("/tmp/atlas_fs", F_OK) == 0 ? TRUE : FALSE);
     webkit_settings_set_enable_developer_extras(s, FALSE);
     webkit_settings_set_enable_page_cache(s, (access("/tmp/atlas_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/atlas_nocache */
+    /* Runtime double-gating: these ship as build flags in the engine but WPE defaults them OFF, so the
+     * embedder must flip them on. EME uses WebKit's built-in ClearKey CDM (no external DRM needed).
+     * requestIdleCallback + LinkPrefetch are widely-used modern-web APIs defaulted off on WPE — enable via
+     * the WebKitFeature list (no dedicated setter). Match by substring to be robust to the identifier suffix. */
+    webkit_settings_set_enable_encrypted_media(s, TRUE);
+    {
+        WebKitFeatureList* feats = webkit_settings_get_all_features();
+        if (feats) {
+            for (gsize i = 0, n = webkit_feature_list_get_length(feats); i < n; i++) {
+                WebKitFeature* f = webkit_feature_list_get(feats, i);
+                const char* id = webkit_feature_get_identifier(f);
+                if (id && (strstr(id, "RequestIdleCallback") || strstr(id, "LinkPrefetch")))
+                    webkit_settings_set_feature_enabled(s, f, TRUE);
+            }
+            webkit_feature_list_unref(feats);
+        }
+    }
     /* ALWAYS use a modern WebKit/Safari UA — the adapter otherwise sends the legacy
      * "HP TouchPad webOS 3.0.5" UA, making sites think we're the old engine.
      * WebKit 620 / Safari 18 = WPE 2.52 (was 612/15.0 = WPE 2.34-era). */
