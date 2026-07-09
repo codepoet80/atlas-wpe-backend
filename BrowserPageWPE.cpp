@@ -610,12 +610,24 @@ void BrowserPageWPE::ensureWebView()
     {
         WebKitFeatureList* feats = webkit_settings_get_all_features();
         if (feats) {
-            for (gsize i = 0, n = webkit_feature_list_get_length(feats); i < n; i++) {
+            gsize n = webkit_feature_list_get_length(feats);
+            int en = 0;
+            for (gsize i = 0; i < n; i++) {
                 WebKitFeature* f = webkit_feature_list_get(feats, i);
                 const char* id = webkit_feature_get_identifier(f);
-                if (id && (strstr(id, "RequestIdleCallback") || strstr(id, "LinkPrefetch")))
+                /* Forms input types (date/datetime-local/month/time/week/color): mature prefs, default ON for
+                 * GTK/Cocoa but OFF for WPE. Enabling makes input.type return the real type (html5test scores
+                 * it) even without a native picker UI. Batched with requestIdleCallback + LinkPrefetch. */
+                if (id && (strstr(id, "RequestIdleCallback") || strstr(id, "LinkPrefetch")
+                         || strstr(id, "InputTypeColor") || strstr(id, "InputTypeDate")
+                         || strstr(id, "InputTypeMonth") || strstr(id, "InputTypeTime")
+                         || strstr(id, "InputTypeWeek"))) {
                     webkit_settings_set_feature_enabled(s, f, TRUE);
+                    WLOG("feature-enable: %s", id);
+                    en++;
+                }
             }
+            WLOG("feature toggle: %d enabled of %zu total features", en, (size_t)n);
             webkit_feature_list_unref(feats);
         }
     }
