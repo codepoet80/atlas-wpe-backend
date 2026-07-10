@@ -260,6 +260,7 @@ private:
     // Feature 7: SSL cert + HTTP auth dialogs (round-trip to app UI via the sync reply pipe)
     static gboolean onAuthenticate(WebKitWebView*, WebKitAuthenticationRequest*, gpointer);
     static gboolean onTlsErrors(WebKitWebView*, const char* uri, GTlsCertificate*, GTlsCertificateFlags, gpointer);
+    static void onWebProcessTerminated(WebKitWebView*, WebKitWebProcessTerminationReason, gpointer);
 
     void ensureWebView();                    // create m_viewBackend + m_webView once size is known
     void dispatchPointer(int x, int y, uint32_t button, bool down);

@@ -608,6 +608,10 @@ void BrowserPageWPE::ensureWebView()
      * the crash. Proper fullscreen needs the system-media handoff (bypasses WebKit fullscreen) or a WebKit fix. */
     webkit_settings_set_enable_fullscreen(s, access("/tmp/atlas_fs", F_OK) == 0 ? TRUE : FALSE);
     webkit_settings_set_enable_developer_extras(s, FALSE);
+    /* Route page console.log/warn/error to BS stdout (/tmp/bs-atlas.log) when /tmp/atlas_console exists.
+     * A headless readout for on-device web-compat debugging (why site X rejects us / fails to load) with
+     * no inspector; off by default so production pays nothing. */
+    webkit_settings_set_enable_write_console_messages_to_stdout(s, access("/tmp/atlas_console", F_OK) == 0 ? TRUE : FALSE);
     webkit_settings_set_enable_page_cache(s, (access("/tmp/atlas_nocache", F_OK) != 0) ? TRUE : FALSE);   /* bf-cache = instant back/forward; /dev/shm + leak fixes made the OOM moot. Disable via /tmp/atlas_nocache */
     /* Runtime double-gating: these ship as build flags in the engine but WPE defaults them OFF, so the
      * embedder must flip them on. EME uses WebKit's built-in ClearKey CDM (no external DRM needed).
@@ -666,6 +670,10 @@ void BrowserPageWPE::ensureWebView()
     /* Feature 7: HTTP auth + SSL cert dialogs — route through the app UI via the sync reply pipe. */
     g_signal_connect(m_webView, "authenticate",                 G_CALLBACK(onAuthenticate), this);
     g_signal_connect(m_webView, "load-failed-with-tls-errors",  G_CALLBACK(onTlsErrors), this);
+    /* Diagnostics: log WHY the WebProcess died (crash vs memory-limit vs killed-by-API). Heavy SPAs
+     * (WhatsApp Web etc.) on the 1GB TouchPad can drive the WebProcess into memory exhaustion —
+     * EXCEEDED_MEMORY_LIMIT here distinguishes that from a real crash/assert (CRASHED). */
+    g_signal_connect(m_webView, "web-process-terminated", G_CALLBACK(onWebProcessTerminated), this);
     /* Fullscreen: HANDLE it ourselves (return TRUE). The WPE default fullscreen path resizes the
      * view — a no-op on our fixed-size backend — and then blocks waiting for a resize/repaint that
      * never arrives, hanging the page. Returning TRUE takes ownership (no hang), and WebKit still
@@ -2852,6 +2860,17 @@ void BrowserPageWPE::onLoadFailed(WebKitWebView*, WebKitLoadEvent, const char* u
     WLOG("load failed %s: domain=%s code=%d msg=%s", uri,
          err ? g_quark_to_string(err->domain) : "?", err ? err->code : 0, err ? err->message : "?");
     /* self->m_server->msgReportError(self->m_proxy, uri, err?err->code:0, err?err->message:""); */
+    (void)self;
+}
+void BrowserPageWPE::onWebProcessTerminated(WebKitWebView* v, WebKitWebProcessTerminationReason reason, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    const char* r = reason == WEBKIT_WEB_PROCESS_CRASHED               ? "CRASHED"
+                  : reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT ? "EXCEEDED_MEMORY_LIMIT"
+                  : reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API     ? "TERMINATED_BY_API"
+                  : "UNKNOWN";
+    const char* uri = webkit_web_view_get_uri(v);
+    WLOG("*** WEBPROCESS TERMINATED reason=%s uri=%s ***", r, uri ? uri : "?");
     (void)self;
 }
 void BrowserPageWPE::onTitleChanged(GObject*, GParamSpec*, gpointer ud)
