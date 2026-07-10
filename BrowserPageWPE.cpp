@@ -200,6 +200,39 @@ static gboolean bpwpe_on_permission(WebKitWebView*, WebKitPermissionRequest* req
  * msgDownloadStart. The adapter forwards it to the Atlas app (BrowserApp.js downloadResource),
  * which hands the URL to com.palm.downloadmanager — the webOS system download service. We do NOT
  * download in the BS; webOS owns the download queue/notifications/storage. */
+/* Default UA: modern WebKit/Safari on webOS. Drop the hp-tablet/hpwOS tokens (Google shows
+ * "Update your browser"); webOS/6.0 reads as a modern webOS engine. WebKit 620/Safari 18 = WPE 2.52. */
+const char* const BrowserPageWPE::kAtlasDefaultUA =
+    "Mozilla/5.0 (Linux; webOS/6.0; U; en-US) AppleWebKit/620.1.16 "
+    "(KHTML, like Gecko) Version/18.0 Safari/620.1.16";
+/* Teams-quirk UA: same real WebKit/Safari tokens, presented as macOS so Teams' allow-list accepts it. */
+const char* const BrowserPageWPE::kAtlasMacSafariUA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/620.1.16 "
+    "(KHTML, like Gecko) Version/18.0 Safari/620.1.16";
+
+/* Choose the UA for a navigation target and apply it if it differs from what's currently set. The
+ * Microsoft Teams cluster (teams host + its login redirects) sniffs UAs and rejects "Linux"; give it
+ * the macOS Safari UA. Everything else gets the default webOS UA. Only touches settings on a change. */
+void BrowserPageWPE::applyUserAgentQuirk(const char* url)
+{
+    static const char* kMsTeamsHosts[] = {
+        "teams.microsoft.com", "teams.live.com",
+        "login.microsoftonline.com", "login.microsoft.com", "login.live.com",
+    };
+    bool wantMac = false;
+    if (url) {
+        for (size_t i = 0; i < G_N_ELEMENTS(kMsTeamsHosts); ++i)
+            if (strstr(url, kMsTeamsHosts[i])) { wantMac = true; break; }
+    }
+    const char* want = wantMac ? kAtlasMacSafariUA : kAtlasDefaultUA;
+    WebKitSettings* s = webkit_web_view_get_settings(m_webView);
+    const char* cur = s ? webkit_settings_get_user_agent(s) : nullptr;
+    if (s && (!cur || strcmp(cur, want) != 0)) {
+        webkit_settings_set_user_agent(s, want);
+        WLOG("UA quirk: %s -> %s", wantMac ? "MS-Teams" : "default", want);
+    }
+}
+
 int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision,
                                    WebKitPolicyDecisionType type, gpointer ud)
 {
@@ -225,6 +258,18 @@ int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decisio
         WebKitNavigationType nt = act ? webkit_navigation_action_get_navigation_type(act)
                                       : WEBKIT_NAVIGATION_TYPE_OTHER;
         WLOG("decidePolicy NAVIGATION type=%d", (int)nt);
+        /* Per-site UA quirk: Microsoft Teams' client JS sniffs the UA and hard-redirects our
+         * "webOS/6.0 Safari" to /v2/unsupported-browser. We ARE WebKit 620/Safari 18, so present a
+         * macOS Safari UA for the Teams domain cluster (incl. its login redirects) — Teams accepts
+         * Safari-on-Mac and the code paths honestly match our engine. Applied at navigation time so
+         * the main document + subresources all use it; restored for any other host. */
+        {
+            BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+            WebKitURIRequest* rq = act ? webkit_navigation_action_get_request(act) : nullptr;
+            const char* nurl = rq ? webkit_uri_request_get_uri(rq) : nullptr;
+            if (self && self->m_webView && nurl)
+                self->applyUserAgentQuirk(nurl);
+        }
         /* Save-login trigger: real form POSTs report FORM_SUBMITTED/FORM_RESUBMITTED, but a page that
          * calls form.submit() from JS reports OTHER — cover all three. The snapshot JS runs on the main
          * frame and returns '' unless a password field is filled, so non-login navigations send nothing. */
@@ -654,9 +699,7 @@ void BrowserPageWPE::ensureWebView()
      * WebKit 620 / Safari 18 = WPE 2.52 (was 612/15.0 = WPE 2.34-era). */
     /* Drop the hp-tablet/hpwOS tokens — Google (search/suggest) blocks them with
      * "Update your browser". webOS/6.0 reads as a modern webOS engine. */
-    webkit_settings_set_user_agent(s,
-        "Mozilla/5.0 (Linux; webOS/6.0; U; en-US) AppleWebKit/620.1.16 "
-        "(KHTML, like Gecko) Version/18.0 Safari/620.1.16");
+    webkit_settings_set_user_agent(s, kAtlasDefaultUA);
     WLOG("UA set to: %s", webkit_settings_get_user_agent(s) ? webkit_settings_get_user_agent(s) : "?");
 
     g_signal_connect(m_webView, "load-changed",  G_CALLBACK(onLoadChanged), this);

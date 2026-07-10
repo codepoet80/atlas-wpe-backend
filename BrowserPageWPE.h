@@ -261,6 +261,9 @@ private:
     static gboolean onAuthenticate(WebKitWebView*, WebKitAuthenticationRequest*, gpointer);
     static gboolean onTlsErrors(WebKitWebView*, const char* uri, GTlsCertificate*, GTlsCertificateFlags, gpointer);
     static void onWebProcessTerminated(WebKitWebView*, WebKitWebProcessTerminationReason, gpointer);
+    void applyUserAgentQuirk(const char* url);   // per-site UA (MS Teams cluster gets macOS Safari)
+    static const char* const kAtlasDefaultUA;
+    static const char* const kAtlasMacSafariUA;
 
     void ensureWebView();                    // create m_viewBackend + m_webView once size is known
     void dispatchPointer(int x, int y, uint32_t button, bool down);
