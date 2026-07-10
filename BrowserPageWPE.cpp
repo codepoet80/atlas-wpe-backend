@@ -186,9 +186,13 @@ static gboolean bpwpe_on_permission(WebKitWebView*, WebKitPermissionRequest* req
 {
     const char* type = G_OBJECT_TYPE_NAME(req);
     bool isNotif = WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST(req);
-    WLOG("PERMISSION request type=%s -> %s", type ? type : "?", isNotif ? "allow" : "deny");
-    if (isNotif) webkit_permission_request_allow(req);
-    else         webkit_permission_request_deny(req);
+    /* getUserMedia camera/mic: the TouchPad front camera is exposed as a GStreamer capture device by
+     * libgstqcamsrc.so (backed by the qcamd HAL daemon). Grant so navigator.mediaDevices.getUserMedia works. */
+    bool isUserMedia = WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(req);
+    bool allow = isNotif || isUserMedia;
+    WLOG("PERMISSION request type=%s -> %s", type ? type : "?", allow ? "allow" : "deny");
+    if (allow) webkit_permission_request_allow(req);
+    else       webkit_permission_request_deny(req);
     return TRUE;
 }
 
@@ -593,6 +597,9 @@ void BrowserPageWPE::ensureWebView()
      * with autoplay work and tap-to-play isn't swallowed. No-op when the engine is built media-off. */
     webkit_settings_set_media_playback_requires_user_gesture(s, FALSE);
     webkit_settings_set_enable_media(s, TRUE);
+    /* MediaStream / getUserMedia (WPE defaults this OFF): exposes navigator.mediaDevices so pages can
+     * capture the TouchPad camera (surfaced as a GStreamer Video/Source device by libgstqcamsrc.so). */
+    webkit_settings_set_enable_media_stream(s, TRUE);
     applyAutoplayFlag();   /* enforce the "autoplay with sound" flag state before this page's media loads */
     /* WebKit DOM fullscreen ABORTS (SIGABRT) the moment it engages in our headless/no-window embedding —
      * proven inherent to WebKit's async fullscreen continuation, NOT our enter-fullscreen handler (deferring
