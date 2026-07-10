@@ -625,7 +625,14 @@ void BrowserPageWPE::ensureWebView()
                 /* Forms input types (date/datetime-local/month/time/week/color): mature prefs, default ON for
                  * GTK/Cocoa but OFF for WPE. Enabling makes input.type return the real type (html5test scores
                  * it) even without a native picker UI. Batched with requestIdleCallback + LinkPrefetch. */
+                /* ExposeSpeakers[WithoutMicrophone]: without these, MediaDevices.enumerateDevices()
+                 * returns NO audiooutput entries (audio *destination* is empty in WebRTC device tests)
+                 * even though the ALSA sink devices exist -- see MediaDevices.cpp checkSpeakerAccess()
+                 * gating on settings().exposeSpeakersEnabled(). Internal prefs, default OFF off-Cocoa;
+                 * enable via the feature list (no dedicated setter). WithoutMicrophone lets the speaker
+                 * list populate even before mic permission is granted. */
                 if (id && (strstr(id, "RequestIdleCallback") || strstr(id, "LinkPrefetch")
+                         || strstr(id, "ExposeSpeakers")
                          || strstr(id, "InputTypeColor") || strstr(id, "InputTypeDate")
                          || strstr(id, "InputTypeMonth") || strstr(id, "InputTypeTime")
                          || strstr(id, "InputTypeWeek"))) {
