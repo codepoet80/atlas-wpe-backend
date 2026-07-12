@@ -134,7 +134,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_dirStreak(0), m_pendingOldY(0), m_pageHeight(0)
-    , m_navByHistory(false), m_focused(true), m_frozen(false), m_private(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
+    , m_navByHistory(false), m_focused(true), m_frozen(false), m_private(false), m_simpleMode(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
     , m_viewBackend(0), m_webView(0)
 {
     g_livePages.insert(this);
@@ -575,9 +575,17 @@ void BrowserPageWPE::ensureWebView()
          * LOSES to one full-buffer EGL lock_surface readback (A/B: strip OFF 26%/730ms vs ON 53%/1432ms).
          * The strip only wins for viewport-sized rendering (small deltas). */
         int mult = 4;
-        FILE* bf = fopen("/tmp/atlas_bufscreens", "r");
-        if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
-        else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
+        if (m_simpleMode) {
+            /* MODE 2: viewport-only render. No tall pan buffer -> no memory-pressure, no readback-per-scroll,
+             * no pan/recenter/settle machinery in play. For non-scrolling cards (OAuth, app-style SPAs). The
+             * explicit mode wins over the global bufscreens tuning knob. */
+            mult = 1;
+            WLOG("ensureWebView: SIMPLE mode -> viewport buffer (mult=1)");
+        } else {
+            FILE* bf = fopen("/tmp/atlas_bufscreens", "r");
+            if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
+            else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
+        }
         if (mult <= 1) {
             renderH = screenH;                       /* screen-sized: WebKit manages/discards tiles */
         } else {
@@ -1310,6 +1318,17 @@ void BrowserPageWPE::openUrl(const char* url)
             u = c.substr(14);
             if (u.empty() || u == "about:blank") u = "about:blank";
             WLOG("private marker -> ephemeral session; target='%s'", u.c_str());
+            c = u;   /* allow a second marker to follow, e.g. atlas-private:atlas-simple:URL */
+        }
+        /* MODE 2 marker (viewport-only, low-memory) — same transport as the private marker (the adapter
+         * doesn't forward a per-card mode signal). The app JS prepends "atlas-simple:" when launched with the
+         * optional mode=simple param. Detect BEFORE ensureWebView so it picks mult=1 instead of the tall pan
+         * buffer. Legacy com.palm.app.browser opens (plain URL, no marker) are unaffected -> default scroll mode. */
+        if (c.compare(0, 13, "atlas-simple:") == 0) {
+            m_simpleMode = true;
+            u = c.substr(13);
+            if (u.empty()) u = "about:blank";
+            WLOG("simple marker -> viewport mode (mult=1); target='%s'", u.c_str());
         }
     }
     /* A pre-warmed (about:blank, non-private) WebView can't serve a private card — tear it down so

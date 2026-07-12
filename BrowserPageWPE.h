@@ -95,7 +95,8 @@ public:
     void setZoomAndScroll(double zoom, int cx, int cy);
 
     // ---- autonomous scroll test (kicked with SIGUSR1; drives setScrollPosition like the adapter) ----
-    void startScrollTest();      // begin a top->bottom->top sweep on this page
+    void startScrollTest();      // query the REAL DOM height, then begin the sweep (via beginScrollTest)
+    void beginScrollTest();      // actual top->bottom->top sweep, using the freshly-measured page height
     void runScrape(const char* js);   // run JS in the page, result -> /tmp/atlas_scrape_out (see /tmp/atlas_scrape)
     bool scrollTestStep();       // one timed step; returns false when the sweep finishes
     void reportScrollTest();     // log the SCROLLTEST summary line
@@ -269,6 +270,7 @@ private:
     void dispatchPointer(int x, int y, uint32_t button, bool down);
     void updateContentsSize();               // async-query the real page height for scroll range
     static void onContentHeight(GObject*, GAsyncResult*, gpointer);
+    static void onScrollTestHeight(GObject*, GAsyncResult*, gpointer);  // scroll-test: real height -> beginScrollTest
     void extractReaderContent();                                   // extract current DOM's article, push to app via msgActionData (on-demand from reader-open)
     static void onReaderProbe(GObject*, GAsyncResult*, gpointer);  // extraction result -> msgActionData("readerContent")
     void checkEditorFocus();                 // after a tap: poll document.activeElement → raise/hide the VKB
@@ -336,6 +338,9 @@ private:
     bool                m_focused;
     bool                m_frozen;
     bool                m_private;     // ephemeral session (private browsing) — set by the openUrl marker
+    bool                m_simpleMode;  // MODE 2: viewport-only render (mult=1), no tall pan buffer — for non-scrolling
+                                       // cards (OAuth popups, app-style SPAs like web.whatsapp.com). Set by the
+                                       // "atlas-simple:" openUrl marker (app JS adds it from an optional launch param).
     bool                m_prewarmBlank; // BPWPE_PRESPAWN: WebView pre-warmed with about:blank (non-private)
     bool                m_renderPending; // pan re-render in flight; don't queue another (m_renderedY would race ahead of the delivered buffer)
     long                m_renderPendingMs; // _wlog_ms() when m_renderPending was set — staleness timeout so a lost frame can't deadlock the pan
