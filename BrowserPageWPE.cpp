@@ -559,14 +559,22 @@ void BrowserPageWPE::ensureWebView()
          * the BS wrapper: `mount -o remount,size=131072k /dev`), NOT the tile memory — so the tall buffer is
          * viable again. Paired with lock_surface (~3x readback) for fast edge re-renders. mult=1 = the
          * low-memory screen-sized fallback. Tunable: echo N > /tmp/atlas_bufscreens (or BPWPE_BUF_SCREENS). */
-        /* DEFAULT = 1 (viewport-sized): the tall pan buffer is memory-intensive — it lives in
-         * BrowserServer and cost ~74MB (BS RSS 117MB->43MB when dropped), and compositing the full
-         * 1024x3072 surface every frame under a continuously-rendering page (WebRTC/SPA rAF loop)
-         * pinned the BS main thread and tripped the YapServer deadlock watchdog -> SIGABRT (the
-         * "browser crashed later" report, 2026-07-12). Viewport-sized rendering lets WebKit manage/
-         * discard tiles normally; smooth scrolling is to be solved another way (not the tall buffer).
-         * Opt back into the tall pan buffer with `echo 4 > /tmp/atlas_bufscreens` (or BPWPE_BUF_SCREENS). */
-        int mult = 1;
+        /* DEFAULT = 4 (tall pan buffer): SMOOTH SCROLL fundamentally requires pre-rendering into a tall
+         * buffer and PANNING within it — the webOS display path has to GPU->CPU read back every delivered
+         * frame (~100ms+, and zero-copy EGLImage is dead on this Adreno driver, Phase-0-verified), so we
+         * CANNOT read back per scroll frame. Panning a pre-rendered buffer avoids the per-scroll readback
+         * entirely; measured tall+strip vs viewport: maxStall 177ms vs 1642ms, uncovered 60% vs 98%.
+         * (Viewport mult=1 was tried to stop the continuous-render OOM crash, but it destroyed scroll and
+         * damage/async can't fix scroll — only animations. The OOM crash is now CONTAINED by minicore
+         * [[atlas-minicore-lockup-containment]], respawn not lockup.) The scroll-strip fast-path (P2) must
+         * be ENABLED for this (do NOT set BPWPE_NO_STRIP). Tune with `echo N > /tmp/atlas_bufscreens`;
+         * mult=1 = viewport (low memory, laggy scroll). FUTURE: adaptive — tall for scroll pages, shrink
+         * to viewport on continuous-render detection, to keep scroll AND avoid the (contained) crash.
+         * NOTE: with the tall buffer KEEP the P2 scroll-strip OFF (wrapper BPWPE_NO_STRIP=1) — recenter
+         * jumps ~slack/2 (~1000px+), so the "strip" is a big slow sub-rect read + ~30MB memmove that
+         * LOSES to one full-buffer EGL lock_surface readback (A/B: strip OFF 26%/730ms vs ON 53%/1432ms).
+         * The strip only wins for viewport-sized rendering (small deltas). */
+        int mult = 4;
         FILE* bf = fopen("/tmp/atlas_bufscreens", "r");
         if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
         else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }

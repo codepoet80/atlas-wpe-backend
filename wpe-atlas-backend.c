@@ -1021,6 +1021,10 @@ static void target_frame_rendered(void* d)
          * (or a reflow beating the scroll frame) consumes the seq and falls through to the full read. */
         static int s_noStrip = -1;   /* isolate crashes: `touch /tmp/atlas_no_strip` disables the strip path */
         if (s_noStrip < 0) s_noStrip = (access("/tmp/atlas_no_strip", F_OK) == 0 || getenv("BPWPE_NO_STRIP")) ? 1 : 0;
+        { static int s_sd = -1; if (s_sd < 0) s_sd = getenv("BPWPE_STRIPDBG") ? 1 : 0;
+          if (s_sd) { struct atlas_ctrl* c = shm_ctrl(t->shm, t->width, t->height); static int _n = 0;
+            if (_n++ % 8 == 0) ATLAS_LOG("STRIPDBG wantScale=%d noStrip=%d force_full=%d seq=%u last=%u y0=%d sh=%d delta=%d rh=%u",
+                wantScale, s_noStrip, t->force_full, c->seq, t->last_seq, c->y0, c->stripH, c->delta, rh); } }
         if (!wantScale && !s_noStrip && !t->force_full) {   /* NOTE: no s_bgra_readback gate — lock_surface is the default full path and never runs the probe, so it stays -1; the strip read below uses lock_readback_rect / RGBA+swizzle, neither of which needs it */
             if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));
             struct atlas_ctrl* ctrl = shm_ctrl(t->shm, t->width, t->height);
