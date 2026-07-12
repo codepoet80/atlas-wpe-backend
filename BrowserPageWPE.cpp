@@ -1764,7 +1764,15 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
      * bypasses this to actually render the settled position. */
     static int s_settle = -1;
     if (s_settle < 0) s_settle = (access("/tmp/atlas_nosettle", F_OK) == 0) ? 0 : 1;   /* default ON; disable via /tmp/atlas_nosettle */
-    if (s_settle && !force && absVel > 2500) {
+    /* DEFER velocity threshold (px/s). Tunable via BPWPE_SETTLE_VEL. Measured a real fast flick on-device:
+     * the momentum COAST runs ~1500-2400 px/s — BELOW the old hardcoded 2500 — so the coast phase never
+     * deferred and instead CHAINED 6-8 sequential ~1200ms renders walking down the page (~7s to "settle").
+     * A flick outruns the ~2386px buffer slack once V*renderLatency > slack, i.e. ~V>2000 even before
+     * memory-pressure stall; 1500 comfortably catches the whole coast so the flick DEFERS to ONE settle
+     * render instead of a grind. Deliberate reading-scroll stays well under this, so it still pans live. */
+    static int s_settleVel = -1;
+    if (s_settleVel < 0) { const char* e = getenv("BPWPE_SETTLE_VEL"); s_settleVel = e ? atoi(e) : 1500; if (s_settleVel <= 0) s_settleVel = 1500; }
+    if (s_settle && !force && absVel > s_settleVel) {
         /* Max-defer safeguard: only defer if we re-rendered recently. During CONTINUOUS fast motion (e.g.
          * finger oscillating up/down) every event would otherwise re-arm the 160ms timer so it NEVER fires
          * -> the buffer freezes and the content jumps to a stale position. If it's been >450ms since the
