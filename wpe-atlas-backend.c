@@ -1134,7 +1134,18 @@ static void target_frame_rendered(void* d)
         static int s_noVrect = -1;
         if (s_noVrect < 0) s_noVrect = (access("/tmp/atlas_no_vrect", F_OK) == 0 || getenv("BPWPE_NO_VRECT")) ? 1 : 0;
         if (!wantScale && !s_noVrect) {
-            if (!t->master) t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height));   /* strip path is bgra-gated & may never alloc it; seeded by the full/lock readback on doFull frames */
+            /* master (a full 12.5MB @3072 BGRA copy) is ONLY consumed by the video sub-rect path below.
+             * Allocating it eagerly AND memcpy-seeding it (slot->master) on every full frame — see the
+             * lock_readback() success branch — was pure waste during plain scrolling with no video: 12.5MB
+             * resident + ~12MB/frame of memory bandwidth, both feeding the memory-pressure GC thrash that
+             * balloons the readback (311->761ms) and stalls WebKit's render (renderPending STALE 1.8-4s =
+             * the "snap"). So allocate master ONLY while a video rect is actually active, and reclaim it the
+             * instant video stops (which also makes the per-frame seed memcpy a no-op via its `if(t->master)`
+             * guard). force_full=1 on a fresh alloc so the first video frame re-seeds it via a full read. */
+            struct atlas_vrect* vr0 = shm_vrect(t->shm, t->width, t->height);
+            int vactive = (vr0 && vr0->active);
+            if (vactive) { if (!t->master) { t->master = (uint8_t*)malloc(slot_bytes(t->width, t->height)); t->force_full = 1; } }
+            else if (t->master) { free(t->master); t->master = NULL; }
         }
         if (!wantScale && !s_noVrect && t->master && !t->force_full) {   /* force_full after a resize: re-seed master first */
             /* Periodic FULL readback to refresh non-video page content. During video the non-video area is
