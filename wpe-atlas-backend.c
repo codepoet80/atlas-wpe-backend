@@ -405,6 +405,7 @@ struct atlas_target {
     uint8_t* vscratch;      /* video sub-rect readback scratch (RGBA/BGRA, up to one video rect) */
     size_t   vscratch_sz;
     uint32_t vframe;        /* video sub-rect frames since the last full readback (periodic full refresh) */
+    uint32_t dframe;        /* Phase 1: WebKit-damage sub-rect frames since the last full readback */
     int      slots_to_seed; /* video path: after a full/strip readback, this many upcoming vrect frames must
                              * full-copy master->slot to seed each slot's static (non-video) content; once
                              * both SLOTS are seeded we copy ONLY the changed video rows (~0.9MB vs 12.5MB). */
@@ -966,6 +967,19 @@ static bool lock_readback_rect(struct atlas_target* t, uint8_t* dst, uint32_t rw
  * so we can see if frequent full readbacks come from doFull, an inactive/torn vrect, or a lock failure. */
 static struct { unsigned vrect, dofull, gotfail, ina_active, ina_seq; } s_vstat;
 
+/* Phase 1: WebKit hands us renderTargetDamage()'s bounding box in-process right before it triggers our
+ * readback (AcceleratedSurface::RenderTargetWPEBackend::didRenderFrame -> here). We stash it and read
+ * back ONLY that sub-rect. One target renders at a time in a WebProcess, so a single global is fine; the
+ * value is fresh (set on the same call path). Exported (default visibility) so WebKit resolves it by
+ * name from the loaded backend .so. w<=0 or h<=0 => "unknown, do a full readback". */
+static volatile struct { int valid, x, y, w, h; } g_dmg;
+__attribute__((visibility("default")))
+void atlas_backend_set_frame_damage(int x, int y, int w, int h)
+{
+    g_dmg.x = x; g_dmg.y = y; g_dmg.w = w; g_dmg.h = h; g_dmg.valid = (w > 0 && h > 0);
+    { static int _sn = 0; if (_sn++ % 20 == 0) ATLAS_LOG("SETDMG %d,%d %dx%d valid=%d", x, y, w, h, g_dmg.valid); }
+}
+
 static void target_frame_rendered(void* d)
 {
     struct atlas_target* t = (struct atlas_target*)d;
@@ -1045,6 +1059,62 @@ static void target_frame_rendered(void* d)
                     gettimeofday(&_b, NULL);
                     { static int _sn = 0; if (_sn++ % 8 == 0) ATLAS_LOG("STRIP y0=%d h=%d delta=%d %ldus (%ux%u bgra=%d)",
                         y0, sh, delta, (_b.tv_sec-_a.tv_sec)*1000000L+(_b.tv_usec-_a.tv_usec), rw, rh, s_bgra_readback); }
+                    goto sent;
+                }
+            }
+        }
+
+        /* Phase 1: WebKit damage-rect readback — renderTargetDamage() (delivered in-process via
+         * atlas_backend_set_frame_damage) gives the exact region that changed this frame, so read back
+         * ONLY that sub-rect and splice into master. Covers the general continuously-rendering case
+         * (SPA/WebRTC rAF meters) that the scroll-strip (above) and video-rect (below) paths don't.
+         * Periodic full resync every DFULL frames bounds any drift (e.g. a double-buffered surface).
+         * Runs only when no scroll strip fired this frame and a valid, non-full damage rect is present.
+         * Gate /tmp/atlas_no_damage (or BPWPE_NO_DAMAGE). */
+        static int s_noDmg = -1;
+        if (s_noDmg < 0) s_noDmg = (access("/tmp/atlas_no_damage", F_OK) == 0 || getenv("BPWPE_NO_DAMAGE")) ? 1 : 0;
+        if (!wantScale && !s_noDmg && g_dmg.valid && t->master && !t->force_full) {
+            int dx = g_dmg.x, dy = g_dmg.y, dw = g_dmg.w, dh = g_dmg.h;
+            g_dmg.valid = 0;                                 /* consume */
+            if (dx < 0) { dw += dx; dx = 0; }                /* clamp to buffer */
+            if (dy < 0) { dh += dy; dy = 0; }
+            if (dx + dw > (int)rw) dw = (int)rw - dx;
+            if (dy + dh > (int)rh) dh = (int)rh - dy;
+            static uint32_t DFULL = 0;
+            if (!DFULL) { const char* e = getenv("BPWPE_DFULL"); DFULL = e ? (uint32_t)atoi(e) : 120; if (!DFULL) DFULL = 120; }
+            int fullish = (dw <= 0 || dh <= 0) || ((uint32_t)dw >= rw && (uint32_t)dh >= rh);
+            int doFull  = (t->dframe == 0) || (t->dframe % DFULL == 0) || fullish;   /* seed / resync / whole-view */
+            t->dframe++;
+            if (!doFull) {
+                size_t stride = (size_t)rw * 4;
+                struct timeval _da, _db; gettimeofday(&_da, NULL);
+                long dus = 0; int got = 0, used_lock = 0;
+                static int s_noDLock = -1;
+                if (s_noDLock < 0) s_noDLock = (access("/tmp/atlas_no_vlock", F_OK) == 0 || getenv("BPWPE_NO_VLOCK")) ? 1 : 0;
+                if (!s_noDLock && lock_readback_rect(t, t->master, rw, rh, dx, dy, dw, dh, &dus)) { got = 1; used_lock = 1; }
+                if (!got) {
+                    size_t need = (size_t)dw * dh * 4;
+                    if (t->vscratch_sz < need) { free(t->vscratch); t->vscratch = (uint8_t*)malloc(need); t->vscratch_sz = t->vscratch ? need : 0; }
+                    if (t->vscratch) {
+                        if (s_bgra_readback == 1) {
+                            glReadPixels(dx, dy, (GLsizei)dw, (GLsizei)dh, 0x80E1 /*GL_BGRA_EXT*/, GL_UNSIGNED_BYTE, t->vscratch);
+                            for (int ry = 0; ry < dh; ry++)
+                                memcpy(t->master + (size_t)(dy+ry)*stride + (size_t)dx*4, t->vscratch + (size_t)ry*dw*4, (size_t)dw*4);
+                        } else {
+                            glReadPixels(dx, dy, (GLsizei)dw, (GLsizei)dh, GL_RGBA, GL_UNSIGNED_BYTE, t->vscratch);
+                            for (int ry = 0; ry < dh; ry++)
+                                swizzle_flip(t->vscratch + (size_t)ry*dw*4, t->master + (size_t)(dy+ry)*stride + (size_t)dx*4, (uint32_t)dw, 1);
+                        }
+                        got = 1;
+                    }
+                }
+                if (got) {
+                    if (t->slots_to_seed > 0) { memcpy(slot, t->master, (size_t)rh * stride); t->slots_to_seed--; }
+                    else { for (int ry = 0; ry < dh; ry++)
+                        memcpy(slot + (size_t)(dy+ry)*stride + (size_t)dx*4, t->master + (size_t)(dy+ry)*stride + (size_t)dx*4, (size_t)dw*4); }
+                    gettimeofday(&_db, NULL);
+                    { static int _dn = 0; if (_dn++ % 30 == 0) ATLAS_LOG("DMG %d,%d %dx%d %ldus lock=%d (buf %ux%u)",
+                        dx, dy, dw, dh, (_db.tv_sec-_da.tv_sec)*1000000L+(_db.tv_usec-_da.tv_usec), used_lock, rw, rh); }
                     goto sent;
                 }
             }
