@@ -502,6 +502,56 @@ static void target_resize(void* d, uint32_t width, uint32_t height)
  * real offscreen FBO and bind it here. TextureMapperGL::beginPainting() captures GL_FRAMEBUFFER_BINDING
  * as its render target, so binding our FBO before the compositor paints makes it render the whole page
  * into it; frame_rendered then reads it back. (Bind also survives the surfaceless OR 1x1-pbuffer path.) */
+/* Phase 0 zero-copy probe (env BPWPE_GLPROBE=1): the make-or-break test for the EGLImage zero-copy
+ * display path — can THIS Adreno 220 driver create an EGLImage from a GL texture and import it into
+ * another texture via glEGLImageTargetTexture2DOES? (Documented to fail GL_INVALID_OPERATION on some
+ * Adreno 2xx driver builds.) Also logs GL_IMPLEMENTATION_COLOR_READ_FORMAT so Phase 1 can format-match
+ * the readback and drop the NEON RGBA->BGRA swizzle. Runs once, in the live WebProcess GL context. */
+#ifndef EGL_IMAGE_PRESERVED_KHR
+#define EGL_IMAGE_PRESERVED_KHR 0x30D2
+#endif
+#ifndef EGL_GL_TEXTURE_2D_KHR
+#define EGL_GL_TEXTURE_2D_KHR 0x30B1
+#endif
+static void atlas_gl_probe(EGLDisplay dpy)
+{
+    while (glGetError() != GL_NO_ERROR) { }
+    GLint rf = 0, rt = 0;
+    glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &rf);
+    glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &rt);
+    ATLAS_LOG("PROBE read_format=0x%x read_type=0x%x (BGRA_EXT=0x80E1 => swizzle-free; RGBA=0x1908, UBYTE=0x1401)", rf, rt);
+
+    PFNEGLCREATEIMAGEKHRPROC  c_img = (PFNEGLCREATEIMAGEKHRPROC)  eglGetProcAddress("eglCreateImageKHR");
+    PFNEGLDESTROYIMAGEKHRPROC d_img = (PFNEGLDESTROYIMAGEKHRPROC) eglGetProcAddress("eglDestroyImageKHR");
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC t_img =
+        (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    ATLAS_LOG("PROBE procs eglCreateImageKHR=%p glEGLImageTargetTexture2DOES=%p", (void*)c_img, (void*)t_img);
+    if (!c_img || !t_img) { ATLAS_LOG("PROBE VERDICT: EGLImage procs MISSING -> zero-copy (Phase 2a) NOT viable"); return; }
+
+    GLuint src = 0; glGenTextures(1, &src); glBindTexture(GL_TEXTURE_2D, src);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    while (glGetError() != GL_NO_ERROR) { }
+
+    EGLint attr[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
+    EGLImageKHR img = c_img(dpy, eglGetCurrentContext(), EGL_GL_TEXTURE_2D_KHR, (EGLClientBuffer)(uintptr_t)src, attr);
+    ATLAS_LOG("PROBE eglCreateImageKHR(GL_TEXTURE_2D) -> %p eglerr=0x%x", (void*)img, eglGetError());
+    if (img == EGL_NO_IMAGE_KHR) {
+        ATLAS_LOG("PROBE VERDICT: eglCreateImageKHR FAILED -> EGLImage-from-GL-texture NOT viable (try native-buffer/QUALCOMM path)");
+        glDeleteTextures(1, &src); return;
+    }
+    GLuint dst = 0; glGenTextures(1, &dst); glBindTexture(GL_TEXTURE_2D, dst);
+    while (glGetError() != GL_NO_ERROR) { }
+    t_img(GL_TEXTURE_2D, (GLeglImageOES)img);
+    GLenum e = glGetError();
+    ATLAS_LOG("PROBE glEGLImageTargetTexture2DOES -> glerr=0x%x  ==> %s", e,
+              e == GL_NO_ERROR ? "*** IMPORT OK - ZERO-COPY (Phase 2a) VIABLE ***"
+                               : "*** IMPORT FAILED (Adreno GL_INVALID_OPERATION 0x502?) - use Phase 2b MDP overlay ***");
+    if (d_img) d_img(dpy, img);
+    glDeleteTextures(1, &src); glDeleteTextures(1, &dst);
+}
+
 static void target_frame_will_render(void* d)
 {
     struct atlas_target* t = (struct atlas_target*)d;
@@ -528,6 +578,7 @@ static void target_frame_will_render(void* d)
                 if (ed != EGL_NO_DISPLAY) {
                     const char* ee = eglQueryString(ed, EGL_EXTENSIONS);
                     ATLAS_LOG("EGLEXT: %.1000s", ee ? ee : "(null)");
+                    if (getenv("BPWPE_GLPROBE")) atlas_gl_probe(ed);
                 }
             }
         }
