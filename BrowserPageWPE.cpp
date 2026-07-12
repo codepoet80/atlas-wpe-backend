@@ -1804,14 +1804,14 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
          * re-center visibly JUMP ~965px ahead, while moderate scroll (which keeps up fine) needs little lead.
          * Full lead only kicks in for genuine fast flicks (where the buffer would otherwise be outrun). */
         int Lmax = slack / 2 - screenH / 3; if (Lmax < 0) Lmax = 0;
-        /* Lead per (screenH) of velocity — smaller divisor = MORE lead = buffer biased further ahead so a
-         * sustained flick coasts through more pre-rendered content via smooth PAN and needs FEWER laggy
-         * recenters (the "catchup"). Measured: a hard flick coasts ~1100px/s but the old /4000 gave only
-         * ~190px lead -> ~1s runway -> 8 chained renders. /2000 ~doubles the lead (~380px @1100 -> ~1.5s
-         * runway -> ~5 renders). Env BPWPE_LEAD_DIV tunes it (lower=more lead; the "jump" it risks is
-         * masked during a fast flick but would show on moderate scroll, so keep the absVel>700 gate). */
+        /* Lead per (screenH) of velocity — smaller divisor = MORE lead = buffer biased further ahead.
+         * Default 4000 (conservative). NOTE (2026-07-12): tried /2000 (~2x lead) to reduce sustained-flick
+         * catchup — it BACKFIRED for real usage: biasing the buffer one way REDUCES the runway for the
+         * OPPOSITE direction, and real browsing flicks reverse constantly (down-to-read, up-to-go-back), so
+         * more lead made reversals hit a recenter SOONER = worse. Keep the lead small; env BPWPE_LEAD_DIV
+         * tunes it if ever needed (higher=less lead=more symmetric runway, better for reversal-heavy use). */
         static int s_leadDiv = -1;
-        if (s_leadDiv < 0) { const char* e = getenv("BPWPE_LEAD_DIV"); s_leadDiv = e ? atoi(e) : 2000; if (s_leadDiv < 400) s_leadDiv = 2000; }
+        if (s_leadDiv < 0) { const char* e = getenv("BPWPE_LEAD_DIV"); s_leadDiv = e ? atoi(e) : 4000; if (s_leadDiv < 400) s_leadDiv = 4000; }
         int L = (absVel * (screenH > 0 ? screenH : 686)) / s_leadDiv;
         if (L > Lmax) L = Lmax;
         lead = (m_scrollVel > 0) ? L : -L;
