@@ -1779,12 +1779,14 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
          * last issued re-render, DON'T defer — force a re-render now (force=true -> centered, no lead swing)
          * to keep tracking. A genuine single flick (motion then stop) still defers + settles via the timer. */
         long sinceRender = _wlog_ms() - m_lastRenderMs; if (sinceRender < 0) sinceRender += 10000000;
-        /* Threshold must exceed a typical render (~0.6-1.8s here) — at the old 450ms a fast flick, whose
-         * renders each take longer than 450ms, ALWAYS tripped the force path and thrashed intermediate
-         * (wrong) positions -> "jumps to unexpected places". At 1800ms a normal flick defers cleanly to the
-         * settle timer (blank briefly, then land ONCE at the final spot); only genuinely continuous motion
-         * (> ~1.8s non-stop) still force-renders to avoid a frozen buffer. */
-        if (sinceRender < 1800) {
+        /* This threshold MUST exceed the actual render time, or it defeats itself. Measured a fling-to-bottom
+         * on-device: each recenter render takes 2000-3000ms under memory pressure, but this was 1800ms — so
+         * sinceRender crossed 1800 before the render even finished, the force path fired on EVERY event, and
+         * the fling CHAINED ~11 overlapping renders (stale=3) instead of deferring. Raised to 3000 (env
+         * BPWPE_RENDER_MS) so a slow render completes first and the fling defers to the settle timer. */
+        static int s_renderMs = -1;
+        if (s_renderMs < 0) { const char* e = getenv("BPWPE_RENDER_MS"); s_renderMs = e ? atoi(e) : 3000; if (s_renderMs < 800) s_renderMs = 3000; }
+        if (sinceRender < s_renderMs) {
             if (m_settleTimer) g_source_remove(m_settleTimer);
             m_settleTimer = g_timeout_add(140, (GSourceFunc)&BrowserPageWPE::onSettleTimer, this);
             return false;                                  /* defer: settle timer renders when the flick stops */
@@ -1794,7 +1796,13 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
     if (m_settleTimer) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   /* re-rendering now -> drop the pending settle */
     if (m_renderPending) {
         long age = _wlog_ms() - m_renderPendingMs; if (age < 0) age += 10000000;
-        if (age < 1800) return false;                      /* a re-render is plausibly still in flight */
+        /* Same calibration as the settle threshold: a slow render (2-3s under memory pressure) must NOT be
+         * declared stale/lost prematurely, or we issue an OVERLAPPING re-render (the stale=3 in the log) and
+         * chain the fling. onFrame clears m_renderPending the instant the frame arrives, so this only gates
+         * genuinely-lost frames — safe to wait the full render budget. */
+        static int s_renderMs2 = -1;
+        if (s_renderMs2 < 0) { const char* e = getenv("BPWPE_RENDER_MS"); s_renderMs2 = e ? atoi(e) : 3000; if (s_renderMs2 < 800) s_renderMs2 = 3000; }
+        if (age < s_renderMs2) return false;               /* a re-render is plausibly still in flight */
         WLOG("renderPending STALE %ldms -> force re-render", age);   /* frame lost -> never deadlock */
     }
     int lead = 0;
