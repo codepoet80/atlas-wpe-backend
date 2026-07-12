@@ -276,7 +276,14 @@ int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decisio
         bool formish = (nt == WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED ||
                         nt == WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED ||
                         nt == WEBKIT_NAVIGATION_TYPE_OTHER);
-        if (act && formish) {
+        /* Escape hatch: `/tmp/atlas_nologincap` disables the save-login deferral entirely. The deferral holds
+         * a policy decision and runs capture JS against a document that may be mid-navigation; a page that does
+         * a JS-driven navigation (WebKitNavigationType OTHER, e.g. html5test.co during its test run) can crash
+         * the WebProcess on the held+resumed nav. This gate lets us load such pages undeferred (and is the
+         * clean toggle for measuring html5test). Only real form POSTs are affected by save-login anyway. */
+        if (act && formish && access("/tmp/atlas_nologincap", F_OK) == 0) {
+            WLOG("saveLogin: capture disabled via /tmp/atlas_nologincap — nav proceeds undeferred");
+        } else if (act && formish) {
             BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
             /* Save-login: snapshot the submitting form's username+password. evaluate_javascript is ASYNC,
              * but the form submit navigates immediately — if we let the nav proceed the old document (with
@@ -552,7 +559,14 @@ void BrowserPageWPE::ensureWebView()
          * the BS wrapper: `mount -o remount,size=131072k /dev`), NOT the tile memory — so the tall buffer is
          * viable again. Paired with lock_surface (~3x readback) for fast edge re-renders. mult=1 = the
          * low-memory screen-sized fallback. Tunable: echo N > /tmp/atlas_bufscreens (or BPWPE_BUF_SCREENS). */
-        int mult = 4;
+        /* DEFAULT = 1 (viewport-sized): the tall pan buffer is memory-intensive — it lives in
+         * BrowserServer and cost ~74MB (BS RSS 117MB->43MB when dropped), and compositing the full
+         * 1024x3072 surface every frame under a continuously-rendering page (WebRTC/SPA rAF loop)
+         * pinned the BS main thread and tripped the YapServer deadlock watchdog -> SIGABRT (the
+         * "browser crashed later" report, 2026-07-12). Viewport-sized rendering lets WebKit manage/
+         * discard tiles normally; smooth scrolling is to be solved another way (not the tall buffer).
+         * Opt back into the tall pan buffer with `echo 4 > /tmp/atlas_bufscreens` (or BPWPE_BUF_SCREENS). */
+        int mult = 1;
         FILE* bf = fopen("/tmp/atlas_bufscreens", "r");
         if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
         else { const char* be = getenv("BPWPE_BUF_SCREENS"); if (be) { int m = atoi(be); if (m >= 1 && m <= 6) mult = m; } }
@@ -2039,7 +2053,31 @@ void BrowserPageWPE::toggleRotationTest()
     else      setWindowSize(1024, 686);
     WLOG("rotatetest -> %s", wide ? "portrait 768x942" : "landscape 1024x686");
 }
+/* The scroll test must sweep the WHOLE page (past the buffer edge -> exercises the recenter/re-render
+ * path), not just within the buffer. m_pageHeight can be 0/stale at trigger time (the async content-
+ * height query may not have run for this load), which made the old test fall back to the buffer height
+ * (m_virtualWindowHeight) and pan only in-buffer — the trivially-easy case. Re-measure the real DOM
+ * height NOW, then begin the sweep in the callback so maxCy spans the full page. */
 void BrowserPageWPE::startScrollTest()
+{
+    if (!m_webView) { WLOG("scrolltest: no webview"); return; }
+    webkit_web_view_evaluate_javascript(m_webView,
+        "Math.max(document.documentElement.scrollHeight, document.body?document.body.scrollHeight:0)",
+        -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onScrollTestHeight, this);
+}
+void BrowserPageWPE::onScrollTestHeight(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (bpwpe_dead(self)) { if (v) g_object_unref(v); if (err) g_error_free(err); return; }
+    if (v) { int h = (int)jsc_value_to_double(v); if (h > 0) self->m_pageHeight = h; g_object_unref(v); }
+    if (err) g_error_free(err);
+    WLOG("scrolltest: measured real pageHeight=%d (virt %d, renderH %d) before sweep",
+         self->m_pageHeight, self->m_virtualWindowHeight, self->m_renderHeight);
+    self->beginScrollTest();
+}
+void BrowserPageWPE::beginScrollTest()
 {
     int pageH = m_pageHeight > 0 ? m_pageHeight : m_virtualWindowHeight;
     int maxCy = pageH - (m_screenHeight > 0 ? m_screenHeight : 768);
