@@ -1743,6 +1743,9 @@ void BrowserPageWPE::setScrollPosition(int cx, int cy, int /*cw*/, int /*ch*/)
  * ALSO called from onFrame: the scroll that SETTLED while a render was in flight was gated by
  * m_renderPending, so when that frame lands we must re-check the latest scroll and follow it —
  * otherwise the buffer freezes wherever the last render left it and everything else shows white. */
+/* Sticky-fling latch (BPWPE_STICKY). File-scope is fine: only one page scrolls at a time (same assumption as
+ * the scroll-test/g_st machinery). Set on a fast fling start, cleared when motion settles. */
+static bool g_flinging = false;
 bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
 {
     if (!m_webView || m_screenHeight <= 0) return false;
@@ -1756,7 +1759,7 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
     int guard   = screenH / 3;
     if (absVel > 1000) guard = (slack < screenH) ? slack / 2 : screenH;   /* fast: re-render earlier */
     bool inBuffer = (slack > 2 * guard) && (cy >= m_renderedY + guard) && (cy <= m_renderedY + slack - guard);
-    if (inBuffer) return false;                             /* adapter pans — no re-render, no readback */
+    if (inBuffer) { g_flinging = false; return false; }    /* adapter pans — no re-render, no readback (fling has settled inside the buffer -> drop the sticky latch) */
     /* SETTLE-RENDER (gated /tmp/atlas_settle): during a FAST flick, chasing the scroll just thrashes the
      * WebProcess (each re-render then stalls ~1-2.5s) and still can't keep up. Instead DEFER — let the
      * adapter pan the buffer it has (blank past the edge) — and (re)arm a one-shot timer that fires ONE
@@ -1772,7 +1775,19 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
      * render instead of a grind. Deliberate reading-scroll stays well under this, so it still pans live. */
     static int s_settleVel = -1;
     if (s_settleVel < 0) { const char* e = getenv("BPWPE_SETTLE_VEL"); s_settleVel = e ? atoi(e) : 1500; if (s_settleVel <= 0) s_settleVel = 1500; }
-    if (s_settle && !force && absVel > s_settleVel) {
+    /* STICKY SNAP-TO-DESTINATION (env BPWPE_STICKY, default OFF). A HARD fling — detected by its fast START
+     * (absVel > s_flingVel, default 2500; that's reliably a fling, never deliberate scroll) — LATCHES
+     * g_flinging and then DEFERS the ENTIRE coast regardless of the noisy/under-counted coast velocity, until
+     * motion stops. Result: the fling snaps to its landing in ONE settle render instead of the buffer chasing
+     * the coast in ~6 laggy steps; the coast shows blank/held past the buffer edge. The latch is cleared when
+     * motion settles (onSettleTimer, or the inBuffer early-return). Only a clear fling START latches it, so
+     * normal/deliberate scroll (which never starts >2500px/s) is completely unaffected. */
+    static int s_sticky = -1;
+    if (s_sticky < 0) s_sticky = getenv("BPWPE_STICKY") ? 1 : 0;
+    static int s_flingVel = -1;
+    if (s_flingVel < 0) { const char* e = getenv("BPWPE_FLING_VEL"); s_flingVel = e ? atoi(e) : 2500; if (s_flingVel < 800) s_flingVel = 2500; }
+    if (s_sticky && !force && absVel > s_flingVel) g_flinging = true;
+    if (s_settle && !force && (absVel > s_settleVel || (s_sticky && g_flinging))) {
         /* Max-defer safeguard: only defer if we re-rendered recently. During CONTINUOUS fast motion (e.g.
          * finger oscillating up/down) every event would otherwise re-arm the 160ms timer so it NEVER fires
          * -> the buffer freezes and the content jumps to a stale position. If it's been >450ms since the
@@ -1791,9 +1806,16 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
             m_settleTimer = g_timeout_add(140, (GSourceFunc)&BrowserPageWPE::onSettleTimer, this);
             return false;                                  /* defer: settle timer renders when the flick stops */
         }
+        /* max-defer: a very long continuous coast force-renders here to avoid a frozen buffer. If we're in a
+         * sticky fling, KEEP the latch and re-arm the settle timer so we still snap to the landing when motion
+         * finally stops (the cancel below is guarded by !g_flinging so it won't drop it). */
+        if (s_sticky && g_flinging) {
+            if (m_settleTimer) g_source_remove(m_settleTimer);
+            m_settleTimer = g_timeout_add(140, (GSourceFunc)&BrowserPageWPE::onSettleTimer, this);
+        }
         force = true;   /* deferred too long during continuous motion -> render now, CENTERED, keep tracking */
     }
-    if (m_settleTimer) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   /* re-rendering now -> drop the pending settle */
+    if (m_settleTimer && !g_flinging) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   /* re-rendering now -> drop the pending settle (but keep it alive through a sticky fling) */
     if (m_renderPending) {
         long age = _wlog_ms() - m_renderPendingMs; if (age < 0) age += 10000000;
         /* Same calibration as the settle threshold: a slow render (2-3s under memory pressure) must NOT be
@@ -1867,6 +1889,7 @@ int BrowserPageWPE::onSettleTimer(void* ud)
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     if (g_livePages.find(self) == g_livePages.end()) return 0;
     self->m_settleTimer = 0;
+    g_flinging = false;   /* motion stopped -> release the sticky-fling latch; the forced render below lands it */
     WLOG("settle: flick stopped -> render settled cy=%d", self->m_scrollY);
     self->recenterForScroll(self->m_scrollX, self->m_scrollY, /*force=*/true);
     return 0;   /* G_SOURCE_REMOVE — one-shot */
