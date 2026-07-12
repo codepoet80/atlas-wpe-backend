@@ -1804,7 +1804,15 @@ bool BrowserPageWPE::recenterForScroll(int cx, int cy, bool force)
          * re-center visibly JUMP ~965px ahead, while moderate scroll (which keeps up fine) needs little lead.
          * Full lead only kicks in for genuine fast flicks (where the buffer would otherwise be outrun). */
         int Lmax = slack / 2 - screenH / 3; if (Lmax < 0) Lmax = 0;
-        int L = (absVel * (screenH > 0 ? screenH : 686)) / 4000;   /* ~screenH of lead per 4000 px/s */
+        /* Lead per (screenH) of velocity — smaller divisor = MORE lead = buffer biased further ahead so a
+         * sustained flick coasts through more pre-rendered content via smooth PAN and needs FEWER laggy
+         * recenters (the "catchup"). Measured: a hard flick coasts ~1100px/s but the old /4000 gave only
+         * ~190px lead -> ~1s runway -> 8 chained renders. /2000 ~doubles the lead (~380px @1100 -> ~1.5s
+         * runway -> ~5 renders). Env BPWPE_LEAD_DIV tunes it (lower=more lead; the "jump" it risks is
+         * masked during a fast flick but would show on moderate scroll, so keep the absVel>700 gate). */
+        static int s_leadDiv = -1;
+        if (s_leadDiv < 0) { const char* e = getenv("BPWPE_LEAD_DIV"); s_leadDiv = e ? atoi(e) : 2000; if (s_leadDiv < 400) s_leadDiv = 2000; }
+        int L = (absVel * (screenH > 0 ? screenH : 686)) / s_leadDiv;
         if (L > Lmax) L = Lmax;
         lead = (m_scrollVel > 0) ? L : -L;
     }
