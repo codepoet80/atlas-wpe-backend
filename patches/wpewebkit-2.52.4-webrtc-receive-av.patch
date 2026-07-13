@@ -1,0 +1,218 @@
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+@@ -1531,6 +1531,14 @@
+         GUniqueOutPtr<char> mid;
+         g_object_get(backend.rtcTransceiver(), "mid", &mid.outPtr(), nullptr);
+         GST_DEBUG_OBJECT(m_pipeline.get(), "Checking if transceiver with mid %s matches the track mid", mid.get());
++        // Atlas/TouchPad: when the remote offer omits the MID RTP header extension, data.mid is
++        // empty and matching it against a real mid ("0", ...) always fails. That makes us create a
++        // duplicate transceiver whose source receives the media, while the transceiver exposed to
++        // JS via ontrack gets none (observerCount stays 0 -> no audio). Fall back to matching the
++        // webrtcbin transceiver object directly in that case, so the media binds to the same source
++        // the page plays.
++        if (data.mid.isEmpty())
++            return backend.rtcTransceiver() == data.transceiver.get();
+         return data.mid == StringView::fromLatin1(mid.get());
+     });
+     if (!transceiver) {
+@@ -1616,6 +1624,20 @@
+     }
+ 
+     auto trackProcessor = m_trackProcessors.get(*ssrc);
++    if (!trackProcessor) [[unlikely]] {
++        // webrtcbin can add the receive src pad for an SSRC that never triggered the
++        // "new-jitterbuffer" signal (e.g. when the negotiated SDP carries no a=ssrc line —
++        // observed as "sdp_media_from_transceiver: Caps ... are missing ssrc" warnings on
++        // this port), or it can add the pad before that signal fires. In both cases the map
++        // has no processor for *ssrc and the original code dereferenced a null pointer here,
++        // crashing the WebProcess (SIGSEGV) the instant incoming media started — the "Local
++        // Preview only" symptom. Create the processor on demand instead; ensure() is a no-op
++        // if new-jitterbuffer later fires for the same SSRC, so this stays coherent.
++        GST_WARNING_OBJECT(m_pipeline.get(), "No incoming track processor for SSRC %u; creating on demand", *ssrc);
++        trackProcessor = m_trackProcessors.ensure(*ssrc, [] {
++            return GStreamerIncomingTrackProcessor::create();
++        }).iterator->value.get();
++    }
+     trackProcessor->configure(ThreadSafeWeakPtr { *this }, GRefPtr<GstPad>(pad));
+ 
+     auto bin = trackProcessor->bin();
+@@ -1760,9 +1782,24 @@
+     int payloadType = pickAvailablePayloadType();
+     auto msid = msidBuilder.toString();
+     bool msidSet = false;
+-    auto caps = capsFromRtpCapabilities(m_rtpHeaderExtensions, { .codecs = codecs, .headerExtensions = rtpExtensions }, [&payloadType, &msid, &msidSet](GstStructure* structure) {
++    // Stamp the sender's stable SSRC on the codec caps so webrtcbin emits a=ssrc in the OFFER (the
++    // packetizer isn't created until the answer arrives, so its SSRC isn't available here; the source
++    // generated a stable one at construction that the packetizer reuses). gst-webrtcbin 1.20 warns
++    // "Caps ... are missing ssrc" and the RTP media plane never establishes (packetsSent=0) otherwise.
++    uint32_t senderSsrc = 0;
++    switchOn(source, [&](Ref<RealtimeOutgoingAudioSourceGStreamer>& s) { senderSsrc = s->ssrc(); },
++                     [&](Ref<RealtimeOutgoingVideoSourceGStreamer>& s) { senderSsrc = s->ssrc(); },
++                     [](std::nullptr_t&) { });
++    auto caps = capsFromRtpCapabilities(m_rtpHeaderExtensions, { .codecs = codecs, .headerExtensions = rtpExtensions }, [&payloadType, &msid, &msidSet, senderSsrc](GstStructure* structure) {
+         if (!gst_structure_has_field(structure, "payload"))
+             gst_structure_set(structure, "payload", G_TYPE_INT, payloadType++, nullptr);
++        if (senderSsrc)
++            gst_structure_set(structure, "ssrc", G_TYPE_UINT, senderSsrc, nullptr);
++        // Atlas: signal mono Opus on the SEND path (the mic is a single mono capsule; see
++        // GStreamerAudioRTPPacketizer). sprop-stereo=0 tells the peer we transmit mono, matching the
++        // mono encoder input, and avoids the stereo channel-count mismatch on the outgoing stream.
++        if (auto encodingName = gstStructureGetString(structure, "encoding-name"_s); encodingName == "OPUS"_s)
++            gst_structure_set(structure, "sprop-stereo", G_TYPE_STRING, "0", nullptr);
+         if (msidSet)
+             return;
+         if (msid.isEmpty())
+@@ -2589,7 +2626,7 @@
+     if (!hasInboundVideoStats) {
+         GUniquePtr<GstStructure> emptyInboundStats(gst_structure_new_empty("rtp-inbound-video-stream-stats"));
+         gst_structure_set(emptyInboundStats.get(), "type", GST_TYPE_WEBRTC_STATS_TYPE, GST_WEBRTC_STATS_INBOUND_RTP, "timestamp",
+-            G_TYPE_DOUBLE, convertedTimestamp.microseconds(), "id", G_TYPE_STRING, "rtp-inbound-video-stream-stats", "kind", G_TYPE_STRING, "video", "frames-decoded", G_TYPE_UINT64, 0, nullptr);
++            G_TYPE_DOUBLE, convertedTimestamp.microseconds(), "id", G_TYPE_STRING, "rtp-inbound-video-stream-stats", "kind", G_TYPE_STRING, "video", "frames-decoded", G_TYPE_UINT64, static_cast<guint64>(0), nullptr);
+         gst_structure_set(result.get(), "rtp-inbound-video-stream-stats", GST_TYPE_STRUCTURE, emptyInboundStats.get(), nullptr);
+     }
+ 
+@@ -2603,7 +2640,7 @@
+     if (!hasOutboundVideoStats) {
+         GUniquePtr<GstStructure> emptyOutboundStats(gst_structure_new_empty("rtp-outbound-video-stream-stats"));
+         gst_structure_set(emptyOutboundStats.get(), "type", GST_TYPE_WEBRTC_STATS_TYPE, GST_WEBRTC_STATS_OUTBOUND_RTP, "timestamp",
+-            G_TYPE_DOUBLE, convertedTimestamp.microseconds(), "id", G_TYPE_STRING, "rtp-outbound-video-stream-stats", "kind", G_TYPE_STRING, "video", "frames-encoded", G_TYPE_UINT64, 0, nullptr);
++            G_TYPE_DOUBLE, convertedTimestamp.microseconds(), "id", G_TYPE_STRING, "rtp-outbound-video-stream-stats", "kind", G_TYPE_STRING, "video", "frames-encoded", G_TYPE_UINT64, static_cast<guint64>(0), nullptr);
+         gst_structure_set(result.get(), "rtp-outbound-video-stream-stats", GST_TYPE_STRUCTURE, emptyOutboundStats.get(), nullptr);
+     }
+ 
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -102,7 +102,16 @@
+         m_data.trackId = m_sdpMsIdAndTrackId.second;
+ 
+     m_sink = gst_element_factory_make("fakesink", "sink");
+-    g_object_set(m_sink.get(), "sync", TRUE, "enable-last-sample", FALSE, "qos", TRUE, nullptr);
++    // Atlas/TouchPad: incoming webrtc audio buffers are stamped with the absolute system-clock
++    // time (~device uptime, thousands of seconds), not a running-time starting at 0. With sync=TRUE
++    // the fakesink waits on the pipeline clock for that far-future PTS and never renders, so the
++    // handoff signal that drives dispatchSample->pushSample->appsrc never fires and the playback
++    // pipeline starves in ASYNC preroll (no audio). The fakesink here is only a sample extractor;
++    // pacing is handled by the upstream jitterbuffer and the downstream playback pipeline, so for
++    // audio we render every buffer immediately (sync=FALSE, qos=FALSE). Video keeps sync for the
++    // decode path.
++    gboolean audioSink = m_data.type == RealtimeMediaSource::Type::Audio ? FALSE : TRUE;
++    g_object_set(m_sink.get(), "sync", audioSink, "enable-last-sample", FALSE, "qos", audioSink, nullptr);
+     auto queue = gst_element_factory_make("queue", "queue");
+ 
+     auto trackProcessor = incomingTrackProcessor();
+@@ -185,7 +194,7 @@
+ GRefPtr<GstElement> GStreamerIncomingTrackProcessor::incomingTrackProcessor()
+ {
+     if (m_data.type == RealtimeMediaSource::Type::Audio)
+-        return createParser();
++        return createAudioDecoder();
+ 
+     if (m_data.type == RealtimeMediaSource::Type::Video) {
+         GST_DEBUG_OBJECT(m_bin.get(), "Requesting a key-frame");
+@@ -277,6 +286,35 @@
+     }), this);
+ 
+     g_signal_connect_swapped(decodebin.get(), "pad-added", G_CALLBACK(+[](GStreamerIncomingTrackProcessor* self, GstPad* pad) {
++        auto queue = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(self->m_bin.get()), "queue"));
++        auto sinkPad = adoptGRef(gst_element_get_static_pad(queue.get(), "sink"));
++        gst_pad_link(pad, sinkPad.get());
++        self->trackReady();
++    }), this);
++    return decodebin;
++}
++
++GRefPtr<GstElement> GStreamerIncomingTrackProcessor::createAudioDecoder()
++{
++    // Atlas/TouchPad: decode the incoming audio (Opus) here so the source client receives raw PCM.
++    // The default path pushes *encoded* Opus to the playback pipeline, whose decodebin3 then plugs
++    // opusdec dynamically into an already-PLAYING live pipeline. On this device that opusdec gets
++    // stuck at READY and never prerolls, so the audio sink never starts and the speaker is silent.
++    // Decoding inside this incoming bin (which ramps NULL->PLAYING as a unit) sidesteps the dynamic
++    // decoder insertion entirely; the playback decodebin3 then sees audio/x-raw and needs no decoder.
++    GRefPtr<GstElement> decodebin = makeGStreamerElement("decodebin3"_s);
++    g_signal_connect(decodebin.get(), "element-added", G_CALLBACK(+[](GstBin*, GstElement* element, gpointer userData) {
++        String elementClass = unsafeSpan(gst_element_get_metadata(element, GST_ELEMENT_METADATA_KLASS));
++        auto classifiers = elementClass.split('/');
++        if (!classifiers.contains("Depayloader"_s))
++            return;
++
++        auto self = reinterpret_cast<GStreamerIncomingTrackProcessor*>(userData);
++        auto pad = adoptGRef(gst_element_get_static_pad(element, "sink"));
++        self->installRtpBufferPadProbe(pad);
++    }), this);
++
++    g_signal_connect_swapped(decodebin.get(), "pad-added", G_CALLBACK(+[](GStreamerIncomingTrackProcessor* self, GstPad* pad) {
+         auto queue = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(self->m_bin.get()), "queue"));
+         auto sinkPad = adoptGRef(gst_element_get_static_pad(queue.get(), "sink"));
+         gst_pad_link(pad, sinkPad.get());
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.h
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.h
+@@ -57,6 +57,7 @@
+ 
+     GRefPtr<GstElement> incomingTrackProcessor();
+     GRefPtr<GstElement> createParser();
++    GRefPtr<GstElement> createAudioDecoder();
+ 
+     void installRtpBufferPadProbe(const GRefPtr<GstPad>&);
+ 
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+@@ -364,7 +364,12 @@
+ 
+         GST_TRACE_OBJECT(m_src.get(), "%s", logMessage.characters());
+ 
+-        bool drop = m_enoughData;
++        // Atlas/TouchPad: only VIDEO drops when the appsrc queue is full (drop delta frames to
++        // stay live). For AUDIO we must never drop — dropping incoming samples punches audible
++        // holes in the stream (beep/silence stutter). The audio appsrc is leaky-downstream with a
++        // bounded queue (see element setup), so it self-trims oldest data smoothly if it ever
++        // overflows from clock drift, instead of us discarding freshly-arrived samples here.
++        bool drop = m_isVideoTrack && m_enoughData;
+         auto buffer = gst_sample_get_buffer(sample.get());
+ 
+         if (!m_hasPushedInitialTags) {
+@@ -373,14 +378,14 @@
+             m_hasPushedInitialTags = true;
+         }
+ 
+-        if (m_isVideoTrack && drop) {
++        if (drop) {
+             auto* caps = gst_sample_get_caps(sample.get());
+             drop = doCapsHaveType(caps, "video"_s) || GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+         }
+ 
+         if (drop) {
+             m_needsDiscont = true;
+-            GST_TRACE_OBJECT(m_src.get(), "%s queue full already... not pushing", m_isVideoTrack ? "Video" : "Audio");
++            GST_TRACE_OBJECT(m_src.get(), "Video queue full already... not pushing");
+             return;
+         }
+ 
+@@ -601,10 +606,26 @@
+         bool isCaptureTrack = track.isCaptureTrack();
+         m_src = makeGStreamerElement("appsrc"_s, elementName);
+ 
++        // Atlas/TouchPad: incoming (remote) webrtc audio samples carry an absolute-system-clock PTS
++        // (~device uptime), which would make the playback audio sink wait far into the future and
++        // hang. Re-timestamp audio here (do-timestamp) so the playback pipeline sees a sane
++        // running-time. Capture tracks already re-timestamp; incoming video keeps its own PTS.
++        gboolean doTimestamp = (isCaptureTrack || !track.isVideo()) ? TRUE : FALSE;
+         g_object_set(m_src.get(), "is-live", TRUE, "format", GST_FORMAT_TIME, "min-percent", 100,
+-            "do-timestamp", isCaptureTrack, "handle-segment-change", TRUE, nullptr);
++            "do-timestamp", doTimestamp, "handle-segment-change", TRUE, nullptr);
+         if (track.isVideo())
+             g_object_set(m_src.get(), "max-bytes", static_cast<guint64>(2 * MB), nullptr);
++        else if (!isCaptureTrack) {
++            // Atlas/TouchPad: incoming (remote) webrtc audio. qspkd plays via pa_simple with a large
++            // default PulseAudio buffer, so pa_simple_write blocks for a long stretch (~1s) while that
++            // buffer drains. The ONLY way to keep the speaker smooth is to feed qspkd continuously so
++            // the pulse buffer never underruns (exactly how the standalone tone client stays smooth).
++            // Therefore this appsrc must NEVER drop or leak audio: give it a generous non-leaky queue
++            // so it simply buffers during a pa_simple_write block and drains the backlog when pulse
++            // frees up. Dropping/leaking here punches holes -> pulse underruns -> beep/silence stutter.
++            g_object_set(m_src.get(), "max-bytes", static_cast<guint64>(4 * MB),
++                "leaky-type", 0 /* GST_APP_LEAKY_TYPE_NONE */, nullptr);
++        }
+         gst_base_src_set_automatic_eos(GST_BASE_SRC_CAST(m_src.get()), FALSE);
+ 
+         static GstAppSrcCallbacks callbacks = {
