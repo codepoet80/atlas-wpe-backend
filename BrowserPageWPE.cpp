@@ -3077,6 +3077,29 @@ void BrowserPageWPE::onWebProcessTerminated(WebKitWebView* v, WebKitWebProcessTe
                   : "UNKNOWN";
     const char* uri = webkit_web_view_get_uri(v);
     WLOG("*** WEBPROCESS TERMINATED reason=%s uri=%s ***", r, uri ? uri : "?");
+    /* RECOVER — the "empty card that never loads" bug. In single-web-process mode a WebProcess death
+     * (crash, or the memory-pressure kill_threshold firing — note the malfunctioning "Failed to get the
+     * memory usage" monitor on this kernel) leaves the WebKitWebView object alive but dead. Every later
+     * load calls ensureWebView(), whose `if (m_webView) return;` guard hands back the dead view, so ALL
+     * browsing renders blank until BS-atlas is restarted. Fix: reload the view here — WebKit spawns a
+     * FRESH WebProcess for it. A static throttle breaks a tight crash-loop (a page that re-dies on load)
+     * so we don't spin; between crashes the card recovers on its own instead of staying blank forever. */
+    if (v) {
+        static gint64 s_lastReloadMs = 0;
+        gint64 nowms = g_get_monotonic_time() / 1000;
+        if (nowms - s_lastReloadMs > 3000) {
+            s_lastReloadMs = nowms;
+            if (uri && *uri && strcmp(uri, "about:blank") != 0) {
+                WLOG("webprocess recovery: reloading %s (spawns fresh WebProcess)", uri);
+                webkit_web_view_load_uri(v, uri);
+            } else {
+                WLOG("webprocess recovery: reload() (spawns fresh WebProcess)");
+                webkit_web_view_reload(v);
+            }
+        } else {
+            WLOG("webprocess re-terminated within 3s -> crash-loop guard, not auto-reloading");
+        }
+    }
     (void)self;
 }
 void BrowserPageWPE::onTitleChanged(GObject*, GParamSpec*, gpointer ud)
