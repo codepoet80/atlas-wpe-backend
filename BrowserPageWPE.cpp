@@ -273,6 +273,19 @@ int BrowserPageWPE::onDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decisio
             const char* nurl = rq ? webkit_uri_request_get_uri(rq) : nullptr;
             if (self && self->m_webView && nurl)
                 self->applyUserAgentQuirk(nurl);
+            /* OAuth native-scheme redirect capture. Personal/MSA Teams (v2.0 auth) registers only the
+             * native redirect_uri msauth.com.microsoft.teams://auth — MS rejects every web redirect for
+             * that client. WPE can't load a custom scheme, so without this the post-login redirect to
+             * msauth...://auth?code=... dead-ends on a blank page and the app never sees the code. Catch
+             * the navigation here (the URL is visible pre-load), hand the full URL to the app via
+             * msgActionData("oauthRedirect") — the app matches it against the launch oauthRedirectPrefix
+             * and completes the capture — and ignore the decision so WPE doesn't attempt the dead load. */
+            if (self && self->m_server && nurl && g_str_has_prefix(nurl, "msauth")) {
+                WLOG("oauth: intercept native-scheme redirect -> %.90s", nurl);
+                self->m_server->msgActionData(self->m_proxy, "oauthRedirect", nurl);
+                webkit_policy_decision_ignore(decision);
+                return TRUE;
+            }
         }
         /* Save-login trigger: real form POSTs report FORM_SUBMITTED/FORM_RESUBMITTED, but a page that
          * calls form.submit() from JS reports OTHER — cover all three. The snapshot JS runs on the main
