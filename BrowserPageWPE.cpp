@@ -459,6 +459,34 @@ static void applyContentBlocker(WebKitUserContentManager* ucm)
     webkit_user_content_manager_add_style_sheet(ucm, ss);
     webkit_user_style_sheet_unref(ss);
 
+    /* Microsoft passkey/FIDO enrollment shim. After a password login MS interjects a
+     * .../consumers/fido/create "Create a passkey" upsell. Our WPE build has ENABLE_WEB_AUTHN=OFF
+     * (and the HW has no authenticator anyway: no USB-host for a FIDO key, no platform secure
+     * element), so window.PublicKeyCredential is UNDEFINED -> MS's page JS throws on it -> the card
+     * renders blank with no "Skip for now" -> the OAuth redirect dead-ends (never reaches ?code=).
+     * Fix: present WebAuthn as PRESENT-BUT-UNAVAILABLE (isUVPAA -> false, create/get -> reject) so
+     * MS detects "this device can't do passkeys" and shows Skip / auto-continues, same as a laptop
+     * with no security key. Document-start, scoped to Microsoft login hosts so real WebAuthn (none
+     * here) is untouched elsewhere. */
+    WebKitUserScript* msPasskeyShim = webkit_user_script_new(
+        "(function(){try{"
+        "var h=location.hostname||'';"
+        "if(h.indexOf('microsoft')<0&&h.indexOf('live.com')<0)return;"
+        "if(window.PublicKeyCredential)return;"
+        "function PublicKeyCredential(){}"
+        "PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable=function(){return Promise.resolve(false);};"
+        "PublicKeyCredential.isConditionalMediationAvailable=function(){return Promise.resolve(false);};"
+        "try{Object.defineProperty(window,'PublicKeyCredential',{value:PublicKeyCredential,configurable:true,writable:true});}catch(e){window.PublicKeyCredential=PublicKeyCredential;}"
+        "try{if(!navigator.credentials){Object.defineProperty(navigator,'credentials',{value:{},configurable:true});}"
+        "navigator.credentials.create=function(){return Promise.reject(new DOMException('No authenticator','NotAllowedError'));};"
+        "navigator.credentials.get=function(){return Promise.reject(new DOMException('No authenticator','NotAllowedError'));};"
+        "}catch(e){}"
+        "}catch(e){}})();",
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(ucm, msPasskeyShim);
+    webkit_user_script_unref(msPasskeyShim);
+
     if (!s_cbStore) s_cbStore = webkit_user_content_filter_store_new(CB_STORE_DIR);
     webkit_user_content_filter_store_load(s_cbStore, CB_ID, nullptr, cb_on_loaded, g_object_ref(ucm));
 }
