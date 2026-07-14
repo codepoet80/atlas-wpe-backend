@@ -110,6 +110,7 @@ public:
     void keyUp(int32_t key, int32_t modifiers, int32_t chr);
     void setFocus(bool enable);
     void onEditorFocus(bool focused, int purpose);   // IM-context focus → msgEditorFocused (raises webOS VKB)
+    void checkEditorFocus();                          // tap / IM focus-in: probe document.activeElement → raise/hide the VKB (public: called from the IM-context focus-in callback)
     bool m_userInteracted = false;                    // gate IME autofocus: only raise the VKB after a user tap (reset per navigation)
 
     // ---- proxy / identity ----
@@ -273,7 +274,6 @@ private:
     static void onScrollTestHeight(GObject*, GAsyncResult*, gpointer);  // scroll-test: real height -> beginScrollTest
     void extractReaderContent();                                   // extract current DOM's article, push to app via msgActionData (on-demand from reader-open)
     static void onReaderProbe(GObject*, GAsyncResult*, gpointer);  // extraction result -> msgActionData("readerContent")
-    void checkEditorFocus();                 // after a tap: poll document.activeElement → raise/hide the VKB
     static void onEditorCheckResult(GObject*, GAsyncResult*, gpointer);
     static void onSmartZoomResult(GObject*, GAsyncResult*, gpointer);   // double-tap zoom: block rect → response
     int m_smartZoomX = 0, m_smartZoomY = 0;          // echoed back in the smart-zoom response

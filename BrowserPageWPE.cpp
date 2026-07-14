@@ -87,7 +87,11 @@ static void atlas_im_focus_in(WebKitInputMethodContext* c) {
      * on load (search/login sites) would otherwise grab the keyboard before any tap — which then blocks the
      * app's own address bar from getting focus/VKB ("no focus after a site loads"). m_userInteracted resets
      * on each navigation and is set on the first pointer event, so tap-to-focus stays instant. */
-    if (s->page && s->page->m_userInteracted) s->page->onEditorFocus(true, (int)webkit_input_method_context_get_input_purpose(c));
+    /* Route through the JS activeElement probe (checkEditorFocus) rather than raising the VKB directly from the
+     * IM purpose: the probe is authoritative about editability (so we never pop the keyboard on a non-editable
+     * element) AND returns the field rect so revealEditor can scroll it above the keyboard. Still event-driven
+     * off the native focus-in signal (one quick eval), so it stays immediate — no polling. */
+    if (s->page && s->page->m_userInteracted) s->page->checkEditorFocus();
 }
 static void atlas_im_focus_out(WebKitInputMethodContext* c) {
     AtlasIMContext* s = reinterpret_cast<AtlasIMContext*>(c);
@@ -2246,11 +2250,17 @@ void BrowserPageWPE::onEditorFocus(bool focused, int purpose)
 void BrowserPageWPE::checkEditorFocus()
 {
     if (!m_webView) return;
+    /* Only genuinely text-editable controls return an editability code (0=text … 6=password); everything else
+     * returns -1 so the VKB is NOT raised. The whitelist is explicit: a <button> / <input type=submit|button|
+     * reset|checkbox|radio|file|image|range|color|date…> is NOT editable (the old code's `:0` fallthrough
+     * treated every non-mapped input type as a text field, which popped the keyboard on the Teams auth page's
+     * Continue submit button). */
     webkit_web_view_evaluate_javascript(m_webView,
         "(function(){var e=document.activeElement;if(!e)return -1;var g=e.tagName;"
         "if(g==='TEXTAREA'||e.isContentEditable)return 0;if(g!=='INPUT')return -1;"
         "var t=(e.type||'text').toLowerCase();"
-        "var m={password:6,email:5,number:2,range:2,tel:3,url:4};return (t in m)?m[t]:0;})()",
+        "var m={text:0,search:0,password:6,email:5,number:2,tel:3,url:4};"
+        "return (t in m)?m[t]:-1;})()",
         -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onEditorCheckResult, this);
 }
 void BrowserPageWPE::onEditorCheckResult(GObject* obj, GAsyncResult* res, gpointer ud)
