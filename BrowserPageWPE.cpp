@@ -3084,7 +3084,14 @@ void BrowserPageWPE::onWebProcessTerminated(WebKitWebView* v, WebKitWebProcessTe
      * browsing renders blank until BS-atlas is restarted. Fix: reload the view here — WebKit spawns a
      * FRESH WebProcess for it. A static throttle breaks a tight crash-loop (a page that re-dies on load)
      * so we don't spin; between crashes the card recovers on its own instead of staying blank forever. */
-    if (v) {
+    /* TERMINATED_BY_API is OUR OWN intentional kill from ~BrowserPageWPE (the only terminate_web_process
+     * call site) during page teardown on card close/disconnect. Do NOT auto-reload it: reloading here
+     * re-spawns a fresh WebProcess for a page that is being destroyed, which (a) UNDOES the memory reclaim
+     * the teardown exists to do and (b) leaks the respawned WebProcess (observed: closing a card killed
+     * WP N but immediately spawned WP N+1 that outlived its card). Only recover from genuine deaths. */
+    if (reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API) {
+        WLOG("webprocess terminated by API (page teardown) -> not auto-reloading");
+    } else if (v) {
         static gint64 s_lastReloadMs = 0;
         gint64 nowms = g_get_monotonic_time() / 1000;
         if (nowms - s_lastReloadMs > 3000) {
