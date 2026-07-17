@@ -628,11 +628,20 @@ void BrowserPageWPE::ensureWebView()
          * The strip only wins for viewport-sized rendering (small deltas). */
         int mult = 4;
         if (m_simpleMode) {
-            /* MODE 2: viewport-only render. No tall pan buffer -> no memory-pressure, no readback-per-scroll,
-             * no pan/recenter/settle machinery in play. For non-scrolling cards (OAuth, app-style SPAs). The
-             * explicit mode wins over the global bufscreens tuning knob. */
-            mult = 1;
-            WLOG("ensureWebView: SIMPLE mode -> viewport buffer (mult=1)");
+            /* MODE 2: low-memory render with a SMALL pan buffer (default 2 screens) — half of MODE 1's 4,
+             * so still light, but with enough slack to SCROLL. mult=1 (exact viewport) had two problems for
+             * tall OAuth/login pages (e.g. account.box.com, a ~2000px 100vh layout): (a) zero pan slack, and
+             * (b) a screen-sized viewport collapses the page's 100vh to one screen so its button below the
+             * fold is unreachable AND content-height reads back == viewport (768), which the scroll path
+             * treats as "fits, don't scroll". A 2-screen buffer gives the page a taller viewport to lay out
+             * in and pan slack to reach it. SPAs that want an exact-screen viewport can force mult=1.
+             * Tunable via /tmp/atlas_simplescreens or BPWPE_SIMPLE_SCREENS (1-4); explicit mode still wins
+             * over the global bufscreens knob. */
+            mult = 2;
+            { FILE* sf = fopen("/tmp/atlas_simplescreens", "r");
+              if (sf) { int m = 0; if (fscanf(sf, "%d", &m) == 1 && m >= 1 && m <= 4) mult = m; fclose(sf); }
+              else { const char* se = getenv("BPWPE_SIMPLE_SCREENS"); if (se) { int m = atoi(se); if (m >= 1 && m <= 4) mult = m; } } }
+            WLOG("ensureWebView: SIMPLE mode -> %d-screen pan buffer (mult=%d)", mult, mult);
         } else {
             FILE* bf = fopen("/tmp/atlas_bufscreens", "r");
             if (bf) { int m = 0; if (fscanf(bf, "%d", &m) == 1 && m >= 1 && m <= 6) mult = m; fclose(bf); }
@@ -1433,13 +1442,22 @@ void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
          * onFrame's exact size-check DROPPED every frame -> white embedded webview. Keep it screen-sized and
          * (critically) keep virt in sync. The visible viewport height is the window height passed in. */
         if (m_simpleMode) {
-            int newLayoutH = ((int)h > 256) ? (int)h : (m_screenHeight > 256 ? m_screenHeight : 768);
+            /* Keep the SIMPLE pan buffer across a rotation/width change (same N-screen buffer ensureWebView
+             * chose) so scroll survives the rotate. m_screenHeight (set above from h) stays the real screen
+             * height for the pan slack math; render==virt stay in sync (the desync is what caused white). */
+            int scrH = ((int)h > 256) ? (int)h : (m_screenHeight > 256 ? m_screenHeight : 768);
+            int sMult = 2;
+            { FILE* sf = fopen("/tmp/atlas_simplescreens", "r");
+              if (sf) { int m = 0; if (fscanf(sf, "%d", &m) == 1 && m >= 1 && m <= 4) sMult = m; fclose(sf); }
+              else { const char* se = getenv("BPWPE_SIMPLE_SCREENS"); if (se) { int m = atoi(se); if (m >= 1 && m <= 4) sMult = m; } } }
+            int newLayoutH = scrH * sMult;
+            if (newLayoutH > 4096) newLayoutH = 4096;
             m_virtualWindowWidth  = newLayoutW;
             m_virtualWindowHeight = newLayoutH;
             m_renderWidth  = newLayoutW;
             m_renderHeight = newLayoutH;
             m_screenWidth  = newLayoutW;
-            WLOG("simple resize -> viewport %dx%d (was render %dx%d)", newLayoutW, newLayoutH, m_renderWidth, m_renderHeight);
+            WLOG("simple resize -> %d-screen buffer %dx%d (screenH=%d)", sMult, newLayoutW, newLayoutH, m_screenHeight);
             wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)newLayoutW, (uint32_t)newLayoutH);
             m_renderPending = false;
             m_renderedY = m_scrollY;
