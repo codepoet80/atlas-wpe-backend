@@ -1,0 +1,98 @@
+Atlas: fix WebKit UIProcess MemoryPressureMonitor on old kernels (HP TouchPad, Linux 2.6.35)
+
+Symptom: BrowserServer log spams "Failed to get the memory usage" forever, so the
+system-wide memory-pressure monitor never fires and heavy pages (web.whatsapp.com)
+grow unmanaged until webOS reboots the device on critical memory.
+
+Root cause (NOT cgroups): systemMemoryUsedAsPercentage() reads /proc/meminfo. On
+2.6.35 there is no MemAvailable (added in kernel 3.14), so it falls back to
+calculateMemoryAvailable() using /proc/zoneinfo watermarks. That function multiplies
+the low watermark by (pageSize()/KB == 4) TWICE -> ~16x inflation -> on a 1GB device
+the inflated watermark exceeds memoryFree, so the unsigned (memoryFree - lowWatermark)
+UNDERFLOWS -> memoryAvailable > memoryTotal -> returns -1 permanently.
+
+Fix: (1) multiply the watermark by pageSize()/KB exactly ONCE and clamp the
+subtraction against underflow; (2) also parse Buffers:/Cached: from /proc/meminfo and,
+as a last-resort for pre-MemAvailable kernels, approximate available = MemFree +
+Buffers + Cached. Modern kernels (>=3.14) use MemAvailable directly and are unchanged.
+Verified on-device: "Failed to get the memory usage" count 286 -> 0, the pressure
+valve now caps runaway pages, and the WhatsApp reboot-loop stops.
+
+--- a/Source/WebKit/UIProcess/linux/MemoryPressureMonitor.cpp
++++ b/Source/WebKit/UIProcess/linux/MemoryPressureMonitor.cpp
+@@ -149,12 +149,17 @@
+     if (lowWatermark == notSet)
+         return notSet;
+ 
+-    lowWatermark *= pageSize() / KB;
+-
+     // Estimate the amount of memory available for userspace allocations, without causing swapping.
+     // Free memory cannot be taken below the low watermark, before the system starts swapping.
++    //
++    // NOTE: convert the watermark from pages to kB exactly once. The upstream code multiplied
++    // by (pageSize() / KB) twice, which inflates the watermark ~16x on a 4kB-page system. On a
++    // 1GB device (e.g. the HP TouchPad, Linux 2.6.35, which lacks MemAvailable and so always takes
++    // this fallback path) that inflated watermark exceeds memoryFree, so the unsigned subtraction
++    // below underflows, memoryAvailable ends up > memoryTotal, and the caller bails with
++    // "Failed to get the memory usage". Multiplying once keeps the estimate sane.
+     lowWatermark *= pageSize() / KB;
+-    size_t memoryAvailable = memoryFree - lowWatermark;
++    size_t memoryAvailable = (memoryFree > lowWatermark) ? (memoryFree - lowWatermark) : 0;
+ 
+     // Not all the page cache can be freed, otherwise the system will start swapping. Assume at least
+     // half of the page cache, or the low watermark worth of cache, needs to stay.
+@@ -247,8 +252,8 @@
+     if (!memInfoFile || fseek(memInfoFile, 0, SEEK_SET))
+         return -1;
+ 
+-    size_t memoryAvailable, memoryTotal, memoryFree, activeFile, inactiveFile, slabReclaimable;
+-    memoryAvailable = memoryTotal = memoryFree = activeFile = inactiveFile = slabReclaimable = notSet;
++    size_t memoryAvailable, memoryTotal, memoryFree, activeFile, inactiveFile, slabReclaimable, buffers, cached;
++    memoryAvailable = memoryTotal = memoryFree = activeFile = inactiveFile = slabReclaimable = buffers = cached = notSet;
+ 
+     while (!feof(memInfoFile)) {
+         char token[MEMINFO_TOKEN_BUFFER_SIZE + 1] = { 0 };
+@@ -267,8 +272,15 @@
+             inactiveFile = amount;
+         else if (!strcmp(token, "SReclaimable:"))
+             slabReclaimable = amount;
++        // Buffers and Cached are read only for the coarse fallback below (used on kernels so old
++        // they expose neither MemAvailable nor usable zoneinfo watermarks, e.g. Linux 2.6.35).
++        else if (!strcmp(token, "Buffers:"))
++            buffers = amount;
++        else if (!strcmp(token, "Cached:"))
++            cached = amount;
+ 
+-        if (memoryTotal != notSet && memoryFree != notSet && activeFile != notSet && inactiveFile != notSet && slabReclaimable != notSet)
++        if (memoryTotal != notSet && memoryFree != notSet && activeFile != notSet && inactiveFile != notSet && slabReclaimable != notSet
++            && buffers != notSet && cached != notSet)
+             break;
+     }
+ 
+@@ -276,7 +288,26 @@
+         return -1;
+ 
+     if (memoryAvailable == notSet) {
++        // Preferred fallback for kernels without MemAvailable (< 3.14): reconstruct the same
++        // estimate the kernel would compute, using the per-zone low watermarks from /proc/zoneinfo.
+         memoryAvailable = calculateMemoryAvailable(memoryFree, activeFile, inactiveFile, slabReclaimable, zoneInfoFile);
++
++        // Last-resort fallback for very old kernels (e.g. the HP TouchPad's Linux 2.6.35) where the
++        // watermark-based estimate is unavailable or unusable: approximate available memory as
++        // MemFree + Buffers + Cached. This is the classic pre-MemAvailable heuristic. It is coarser
++        // (it does not subtract the low watermark or the unreclaimable slab), but it always yields a
++        // sane, non-zero figure, so the monitor produces a real percentage instead of returning -1
++        // and logging "Failed to get the memory usage" forever. This machine has no cgroup memory
++        // controller either, so the cgroup path below never contributes; without this fallback the
++        // system monitor is permanently blind and WebKit's pressure events never fire.
++        if (memoryAvailable == notSet && memoryFree != notSet) {
++            memoryAvailable = memoryFree;
++            if (buffers != notSet)
++                memoryAvailable += buffers;
++            if (cached != notSet)
++                memoryAvailable += cached;
++        }
++
+         if (memoryAvailable == notSet)
+             return -1;
+     }
