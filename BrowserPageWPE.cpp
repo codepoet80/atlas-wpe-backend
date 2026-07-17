@@ -545,10 +545,17 @@ void BrowserPageWPE::ensureWebView()
         session = webkit_network_session_new_ephemeral();
         WLOG("PRIVATE browsing (id=%s) -> ephemeral session, no persistence", m_identifier ? m_identifier : "(env)");
     } else {
-        session = webkit_network_session_new("/media/internal/wpe-252/netdata",
-                                             "/media/internal/wpe-252/netcache");
+        /* Network session data (IndexedDB / localStorage / ServiceWorkers) + disk cache + cookies must NOT
+         * live on /media/internal: it is VFAT (no hard links, no real file locking). That breaks WebKit's
+         * NetworkCache (endless "Failed to create hard link ...") AND, critically, the SQLite-backed website
+         * storage that heavy apps need — web.whatsapp.com stores its crypto keys in IndexedDB to generate
+         * the QR, and on VFAT those writes fail so the QR never renders (and it 30s-spins). Put them on
+         * cryptofs (create/rename/lock work; PROVEN: WhatsApp writes mediakeys/storage + the QR renders),
+         * via the stable /var/atlas252 bridge (-> app deviceroot/wpe-252, ext-backed cryptofs). */
+        session = webkit_network_session_new("/var/atlas252/webkit-data/netdata",
+                                             "/var/atlas252/webkit-data/netcache");
         WebKitCookieManager* cm = webkit_network_session_get_cookie_manager(session);
-        webkit_cookie_manager_set_persistent_storage(cm, "/media/internal/wpe-252/cookies.db",
+        webkit_cookie_manager_set_persistent_storage(cm, "/var/atlas252/webkit-data/cookies.db",
                                                      WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
         webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
     }
@@ -1420,6 +1427,27 @@ void BrowserPageWPE::setWindowSize(uint32_t w, uint32_t h)
      * COLLAPSED the scroll buffer (300x3072 area / 1024 = layout 1024x900, slack ~214 -> ~95% uncovered). */
     if (m_webView && m_viewBackend && oldW > 0 && (int)w != oldW && m_renderHeight > 0 && (int)w >= 600) {
         int newLayoutW = (int)w;
+        /* MODE-2 (viewport-only / atlas-simple): do NOT area-preserve to the tall pan buffer on a width
+         * change. Simple mode has a screen-sized buffer (no scrolling pan buffer); area-preserving it to
+         * 1024x3072 while leaving m_virtualWindowHeight at the viewport height desynced render vs virt, so
+         * onFrame's exact size-check DROPPED every frame -> white embedded webview. Keep it screen-sized and
+         * (critically) keep virt in sync. The visible viewport height is the window height passed in. */
+        if (m_simpleMode) {
+            int newLayoutH = ((int)h > 256) ? (int)h : (m_screenHeight > 256 ? m_screenHeight : 768);
+            m_virtualWindowWidth  = newLayoutW;
+            m_virtualWindowHeight = newLayoutH;
+            m_renderWidth  = newLayoutW;
+            m_renderHeight = newLayoutH;
+            m_screenWidth  = newLayoutW;
+            WLOG("simple resize -> viewport %dx%d (was render %dx%d)", newLayoutW, newLayoutH, m_renderWidth, m_renderHeight);
+            wpe_atlas_view_backend_resize(m_viewBackend, (uint32_t)newLayoutW, (uint32_t)newLayoutH);
+            m_renderPending = false;
+            m_renderedY = m_scrollY;
+            { char js[96]; snprintf(js, sizeof(js), "window.scrollTo(%d,%d)", m_scrollX, m_scrollY);
+              webkit_web_view_evaluate_javascript(m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr); }
+            updateContentsSize();
+            return;
+        }
         /* Rotation preserves the rendered pixel AREA (= the shm slot allocated for the launch orientation):
          * the render height scales inversely with the new width. Guard the area: if the current one is
          * implausibly small (a placeholder slipped through earlier), use the TouchPad tall-buffer slot
