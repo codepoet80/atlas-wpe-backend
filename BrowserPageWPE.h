@@ -250,6 +250,7 @@ private:
     // WPE WebKit signal handlers
     static void onLoadChanged(WebKitWebView*, WebKitLoadEvent, gpointer);
     static gboolean perfTimingTimeout(gpointer);                     // 1.2s after finish -> dump Navigation Timing
+    static gboolean contentSizePollTimeout(gpointer);                // post-load: re-measure page height for a bounded window so JS-grown pages (html5test) get their scroll range extended
     static void onPerfTiming(GObject*, GAsyncResult*, gpointer);     // timing result -> WLOG("PERF ...")
     static void onLoadFailed(WebKitWebView*, WebKitLoadEvent, const char* uri, GError*, gpointer);
     static void onTitleChanged(GObject*, GParamSpec*, gpointer);
@@ -334,6 +335,8 @@ private:
     int                 m_dirStreak;    // consecutive same-direction scroll moves (signed); predictive lead only applies when SUSTAINED (not oscillation)
     int                 m_pendingOldY;  // renderedY before the in-flight re-center — for the confirmed strip delta (confirm mode)
     int                 m_pageHeight;           // P1: scaled document height; if <= m_renderHeight the whole page fits -> never re-render
+    int                 m_lastReportedH;        // last height pushed to the adapter (msgContentsSizeChanged) — only push on change
+    int                 m_contentPollTicks;     // post-load height re-measure ticks (JS-grown pages e.g. html5test expand AFTER load-finished)
     bool                m_navByHistory; // pageBackward/Forward set this -> LOAD_COMMITTED skips the blank-flush (bf-cache restore is instant + needs the buffer)
     bool                m_focused;
     bool                m_frozen;

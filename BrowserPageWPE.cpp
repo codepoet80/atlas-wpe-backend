@@ -138,6 +138,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     , m_screenWidth(0), m_screenHeight(0), m_renderedY(0), m_deliveredY(0)
     , m_renderWidth(0), m_renderHeight(0)
     , m_scrollX(0), m_scrollY(0), m_lastScrollMs(0), m_lastScrollY(0), m_scrollVel(0), m_dirStreak(0), m_pendingOldY(0), m_pageHeight(0)
+    , m_lastReportedH(0), m_contentPollTicks(0)
     , m_navByHistory(false), m_focused(true), m_frozen(false), m_private(false), m_simpleMode(false), m_prewarmBlank(false), m_renderPending(false), m_renderPendingMs(0), m_settleTimer(0), m_lastRenderMs(0)
     , m_viewBackend(0), m_webView(0)
 {
@@ -2093,8 +2094,27 @@ void BrowserPageWPE::onContentHeight(GObject* obj, GAsyncResult* res, gpointer u
      * real page height and clamps the adapter's scroll to one buffer. Real heights are never exactly it. */
     if (h > 0 && h != self->m_virtualWindowHeight) {
         self->m_pageHeight = h;   /* P1: full-page-fits check in setScrollPosition */
-        self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, h);
+        /* Only push on CHANGE — the post-load poll re-queries every ~1s and would otherwise spam the adapter
+         * with identical sizes. The adapter grows its scroll clamp to h so JS-grown pages become scrollable. */
+        if (h != self->m_lastReportedH) {
+            self->m_lastReportedH = h;
+            self->m_server->msgContentsSizeChanged(self->m_proxy, self->m_virtualWindowWidth, h);
+            WLOG("contentsSize -> %d (adapter scroll range updated)", h);
+        }
     }
+}
+/* Post-load height re-measure. Pages like html5test.co run their tests via JS AFTER load-finished and grow the
+ * document (often OFF-SCREEN, so onFrame/paint may never fire) — the load-time height is stale and the adapter
+ * clamps scrolling to it (page "cut off" partway). Poll the real height for a bounded window after load so the
+ * scroll range catches up. Stops once the height has been stable for a few ticks or the window elapses. */
+gboolean BrowserPageWPE::contentSizePollTimeout(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (bpwpe_dead(self) || !self->m_webView) return FALSE;
+    self->updateContentsSize();                 /* async → onContentHeight pushes msgContentsSizeChanged on change */
+    /* ~30 ticks @ 1s = 30s ceiling; enough for a slow html5test test sweep. Cheap (one scrollHeight eval/s). */
+    if (++self->m_contentPollTicks >= 30) return FALSE;
+    return TRUE;
 }
 /* On-demand: extract the article from the CURRENT DOM (works mid-load — the article text is present
  * long before the page "finishes" loading ads/trackers). Compact (<16KB yap limit). */
@@ -2986,7 +3006,7 @@ void BrowserPageWPE::clearToWhite()
     if (buf < 0) return;                                   /* both held by adapter — can't flush now */
     BrowserOffscreenQt* off = (buf == 0) ? m_offscreen0 : m_offscreen1;
     if (!off || m_renderWidth <= 0 || m_renderHeight <= 0) return;
-    m_renderedY = 0; m_deliveredY = 0; m_pageHeight = 0;   /* new page starts at top; pan off until new height known */
+    m_renderedY = 0; m_deliveredY = 0; m_pageHeight = 0; m_lastReportedH = 0;   /* new page starts at top; pan off until new height known */
     /* A fresh page always starts scrolled to the top. If the PREVIOUS page was scrolled (e.g. the user
      * panned a login form up to see a field behind the VKB), the adapter still holds that scroll offset and
      * would blit the new (often short) page at that offset — reading past the buffer -> WHITE page. Reset
@@ -3059,7 +3079,7 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
                  * the PREVIOUS page's scroll and blits oy = local + oldScroll - renderedY(0) -> reads outside
                  * the buffer -> white/wrong. With mScrollPos=0 the blit is identity -> restored page shows from top. */
                 self->m_navByHistory = false;
-                self->m_renderedY = 0; self->m_deliveredY = 0; self->m_pageHeight = 0; self->m_renderPending = false;
+                self->m_renderedY = 0; self->m_deliveredY = 0; self->m_pageHeight = 0; self->m_lastReportedH = 0; self->m_renderPending = false;
                 self->m_scrollX = 0; self->m_scrollY = 0; self->m_lastScrollY = 0; self->m_dirStreak = 0; self->m_scrollVel = 0;
                 if (self->m_settleTimer) { g_source_remove(self->m_settleTimer); self->m_settleTimer = 0; }
                 self->m_server->msgScrolledTo(self->m_proxy, 0, 0);   /* reset adapter mScrollPos -> identity blit */
@@ -3097,6 +3117,8 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
             self->m_server->msgTitleAndUrlChanged(self->m_proxy, (t && *t) ? t : (cu ? cu : ""),
                                                   cu ? cu : "", self->canGoBackward(), self->canGoForward());
             self->updateContentsSize();   /* report the REAL page height for scrolling */
+            self->m_contentPollTicks = 0; /* + keep re-measuring for ~30s: JS-grown pages (html5test) expand AFTER load */
+            g_timeout_add(1000, &BrowserPageWPE::contentSizePollTimeout, self);
             self->m_server->msgDidFinishDocumentLoad(self->m_proxy);
             self->m_server->msgLoadStopped(self->m_proxy);
             g_timeout_add(1200, &BrowserPageWPE::perfTimingTimeout, self);   /* dump Navigation Timing -> "PERF ..." */
