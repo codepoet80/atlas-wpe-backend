@@ -438,9 +438,17 @@ static const char* kSensorShim =
     /* ---- push pump: called by BS with the latest sample ---- */
     "w.__atlasTick=function(ax,ay,az,gx,gy,gz,mx,my,mz,lx,ly,lz){var wt=w.__atlasWant;if(!wt)return;var D=180/Math.PI;"
     "if((wt&4)&&w.__atlasFeed)w.__atlasFeed(ax,ay,az,gx,gy,gz,mx,my,mz,lx,ly,lz);"
-    "if(wt&1){var beta=Math.atan2(ay,az)*D,gamma=Math.atan2(-ax,Math.sqrt(ay*ay+az*az))*D;"
+    "if(wt&1){var beta=Math.atan2(ay,az)*D,gamma=Math.atan2(-ax,Math.sqrt(ay*ay+az*az))*D,alpha=null;"
+    /* tilt-compensated eCompass heading (alpha) from magnetometer + gravity (Freescale AN4248). Absolute
+     * north reference depends on magnetometer axis alignment + declination, so it may be offset until
+     * calibrated, but it tracks rotation correctly. */
+    "if(mx||my||mz){var na=Math.sqrt(ax*ax+ay*ay+az*az)||1,nx=ax/na,ny=ay/na,nz=az/na;"
+    "var ph=Math.atan2(ny,nz),cph=Math.cos(ph),sph=Math.sin(ph);"
+    "var th=Math.atan2(-nx,ny*sph+nz*cph),cth=Math.cos(th),sth=Math.sin(th);"
+    "var Mx=mx*cth+my*sth*sph+mz*sth*cph,My=my*cph-mz*sph;"
+    "alpha=Math.atan2(-My,Mx)*D;if(alpha<0)alpha+=360;}"
     "var e=document.createEvent('DeviceOrientationEvent');"
-    "e.initDeviceOrientationEvent('deviceorientation',true,false,null,beta,gamma);w.dispatchEvent(e);}"
+    "e.initDeviceOrientationEvent('deviceorientation',true,false,alpha,beta,gamma);w.dispatchEvent(e);}"
     "if(wt&2){var G=9.80665;var m=document.createEvent('DeviceMotionEvent');"
     "m.initDeviceMotionEvent('devicemotion',true,false,null,{x:ax*G,y:ay*G,z:az*G},"
     "{alpha:gz*D,beta:gx*D,gamma:gy*D},40);w.dispatchEvent(m);}};})();";
