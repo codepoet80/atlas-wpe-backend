@@ -23,6 +23,10 @@
 #include <linux/fb.h>
 #include <sys/time.h>
 #include <glib-unix.h>   // g_unix_signal_add — SIGUSR1 kicks the autonomous scroll test
+#include <sys/socket.h>  // atlas-sensord Unix-socket client (DeviceOrientation/Motion)
+#include <sys/un.h>
+#include <cstring>
+#include <cerrno>
 
 /* Log to a file (webOS syslog goes to PmLog, hard to read on-device). Timestamped (ms) so we can
  * measure load phases. */
@@ -149,6 +153,7 @@ BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
 BrowserPageWPE::~BrowserPageWPE()
 {
     g_livePages.erase(this);   // stop onFrame touching this page the moment we start tearing down
+    stopSensors();             // sensor probe/push timers + cancel in-flight probe evaluate + close socket
     if (m_settleTimer) { g_source_remove(m_settleTimer); m_settleTimer = 0; }   // settle-render timer must not fire on a freed page
     if (m_videoPollTimer) { g_source_remove(m_videoPollTimer); m_videoPollTimer = 0; }   // video-rect poll must not fire on a freed page
     if (m_webView) {
@@ -389,6 +394,140 @@ void BrowserPageWPE::onScrapeResult(GObject* obj, GAsyncResult* res, gpointer ud
         fprintf(out, "JSERROR: %s", err ? err->message : "?");
     if (out) fclose(out);
     if (err) g_error_free(err);
+}
+
+/* ===================== DeviceOrientation / DeviceMotion sensor injection ======================
+ * atlas-sensord (a system-glibc HAL helper, built with the PalmPDK toolchain) reads the accelerometer +
+ * gyroscope — which live behind /usr/lib/libhal.so that the Atlas private glibc-2.25 can't load — and
+ * publishes "S ax ay az gx gy gz" (accel in g, gyro in rad/s) on ATLAS_SENSOR_SOCK. A document-start shim
+ * exposes window.__atlasWant (set when the page adds a deviceorientation/devicemotion listener) and
+ * window.__atlasTick() which builds+dispatches the events via createEvent+init* (no engine IPC). A low-rate
+ * PROBE reads __atlasWant with evaluate_javascript (the proven-safe path; script-message-received crashed BS)
+ * and, only while a page wants sensors, a 40ms PUSH forwards the latest socket sample into __atlasTick. */
+#define ATLAS_SENSOR_SOCK "/tmp/atlas_sensord.sock"
+
+static const char* kSensorShim =
+    "(function(){var w=window;if(w.__atlasSensorInit)return;w.__atlasSensorInit=1;w.__atlasWant=0;"
+    "var oadd=w.addEventListener;"
+    "w.addEventListener=function(t,f,o){var s=(''+t).toLowerCase();"
+    "if(s==='deviceorientation')w.__atlasWant|=1;else if(s==='devicemotion')w.__atlasWant|=2;"
+    "return oadd.apply(this,arguments);};"
+    "try{['ondeviceorientation','ondevicemotion'].forEach(function(p,i){"
+    "Object.defineProperty(w,p,{configurable:true,"
+    "set:function(fn){this['_'+p]=fn;if(fn){w.__atlasWant|=(i?2:1);oadd.call(w,p.slice(2),fn);}},"
+    "get:function(){return this['_'+p];}});});}catch(e){}"
+    "w.__atlasTick=function(ax,ay,az,gx,gy,gz){var wt=w.__atlasWant;if(!wt)return;var D=180/Math.PI;"
+    "if(wt&1){var beta=Math.atan2(ay,az)*D,gamma=Math.atan2(-ax,Math.sqrt(ay*ay+az*az))*D;"
+    "var e=document.createEvent('DeviceOrientationEvent');"
+    "e.initDeviceOrientationEvent('deviceorientation',true,false,null,beta,gamma);w.dispatchEvent(e);}"
+    "if(wt&2){var G=9.80665;var m=document.createEvent('DeviceMotionEvent');"
+    "m.initDeviceMotionEvent('devicemotion',true,false,null,{x:ax*G,y:ay*G,z:az*G},"
+    "{alpha:gz*D,beta:gx*D,gamma:gy*D},40);w.dispatchEvent(m);}};})();";
+
+void BrowserPageWPE::setupSensorInjection()
+{
+    WebKitUserContentManager* ucm = webkit_web_view_get_user_content_manager(m_webView);
+    if (!ucm) return;
+    WebKitUserScript* shim = webkit_user_script_new(kSensorShim,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(ucm, shim);
+    webkit_user_script_unref(shim);
+}
+
+void BrowserPageWPE::startSensorProbe()
+{
+    if (!m_sensorProbe)
+        m_sensorProbe = g_timeout_add(400, &BrowserPageWPE::sensorProbeTimer, this);
+}
+
+gboolean BrowserPageWPE::sensorProbeTimer(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (!self->m_webView) return G_SOURCE_CONTINUE;
+    if (!self->m_sensorCancel) self->m_sensorCancel = g_cancellable_new();
+    webkit_web_view_evaluate_javascript(self->m_webView, "window.__atlasWant|0", -1, nullptr, nullptr,
+                                        self->m_sensorCancel, &BrowserPageWPE::onSensorWant, self);
+    return G_SOURCE_CONTINUE;
+}
+
+void BrowserPageWPE::onSensorWant(GObject* obj, GAsyncResult* res, gpointer ud)
+{
+    GError* err = nullptr;
+    JSCValue* v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (err) { g_error_free(err); if (v) g_object_unref(v); return; }   // cancelled / torn down: never touch self
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    int want = (v && jsc_value_is_number(v)) ? jsc_value_to_int32(v) : 0;
+    if (v) g_object_unref(v);
+    self->m_sensorWant = want;
+    if (want > 0 && !self->m_sensorPush) self->startSensorPush();
+    else if (want == 0 && self->m_sensorPush) {
+        g_source_remove(self->m_sensorPush); self->m_sensorPush = 0;
+        if (self->m_sensorSock >= 0) { close(self->m_sensorSock); self->m_sensorSock = -1; }
+    }
+}
+
+bool BrowserPageWPE::connectSensord()
+{
+    if (m_sensorSock >= 0) return true;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_un sa; memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX; strncpy(sa.sun_path, ATLAS_SENSOR_SOCK, sizeof(sa.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&sa, sizeof sa) == 0) { fcntl(fd, F_SETFL, O_NONBLOCK); m_sensorSock = fd; return true; }
+    close(fd);   // atlas-sensord not running -> page simply gets no events (graceful)
+    return false;
+}
+
+void BrowserPageWPE::startSensorPush()
+{
+    if (m_sensorPush) return;
+    connectSensord();
+    WLOG("sensor: push start (want=%d sock=%d)", m_sensorWant, m_sensorSock);
+    m_sensorPush = g_timeout_add(40, &BrowserPageWPE::sensorPushTimer, this);
+}
+
+gboolean BrowserPageWPE::sensorPushTimer(gpointer ud)
+{
+    BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
+    if (!self->m_webView) return G_SOURCE_CONTINUE;
+    /* Self-heal: the BS->sensord socket can drop (e.g. sensord restart, or a stall during a rotation
+     * resize that back-pressures the stream). Reconnect while the page still wants sensors instead of
+     * freezing forever (the original bug: portrait rotation dropped the stream and it never recovered). */
+    if (self->m_sensorSock < 0) {
+        if (self->m_sensorWant > 0 && self->connectSensord())
+            WLOG("sensor: reconnected (sock=%d)", self->m_sensorSock);
+        if (self->m_sensorSock < 0) return G_SOURCE_CONTINUE;
+    }
+    char buf[512];
+    ssize_t n = recv(self->m_sensorSock, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+    if (n == 0) { WLOG("sensor: socket dropped (recv=0) — will reconnect"); close(self->m_sensorSock); self->m_sensorSock = -1; return G_SOURCE_CONTINUE; }
+    if (n < 0) return G_SOURCE_CONTINUE;                                                            // EAGAIN: no new sample
+    buf[n] = 0;
+    /* keep the LAST complete "S ax ay az gx gy gz" line; parse locale-independently (BS may run under nl_NL) */
+    double val[6]; bool got = false; char* save = nullptr;
+    for (char* ln = strtok_r(buf, "\n", &save); ln; ln = strtok_r(nullptr, "\n", &save)) {
+        if (ln[0] != 'S') continue;
+        char* p = ln + 1; bool ok = true;
+        for (int i = 0; i < 6; i++) { char* end = nullptr; val[i] = g_ascii_strtod(p, &end); if (end == p) { ok = false; break; } p = end; }
+        if (ok) got = true;
+    }
+    if (!got) return G_SOURCE_CONTINUE;
+    char b[6][G_ASCII_DTOSTR_BUF_SIZE];
+    for (int i = 0; i < 6; i++) g_ascii_formatd(b[i], sizeof b[i], "%.5f", val[i]);
+    char js[320];
+    g_snprintf(js, sizeof js, "window.__atlasTick&&window.__atlasTick(%s,%s,%s,%s,%s,%s)",
+               b[0], b[1], b[2], b[3], b[4], b[5]);
+    webkit_web_view_evaluate_javascript(self->m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    return G_SOURCE_CONTINUE;
+}
+
+void BrowserPageWPE::stopSensors()
+{
+    if (m_sensorProbe) { g_source_remove(m_sensorProbe); m_sensorProbe = 0; }
+    if (m_sensorPush)  { g_source_remove(m_sensorPush);  m_sensorPush  = 0; }
+    if (m_sensorCancel) { g_cancellable_cancel(m_sensorCancel); g_object_unref(m_sensorCancel); m_sensorCancel = nullptr; }
+    if (m_sensorSock >= 0) { close(m_sensorSock); m_sensorSock = -1; }
+    m_sensorWant = 0;
 }
 
 /* Failsafe: if the capture callback never fires (page torn down mid-eval), resume the deferred navigation
@@ -860,6 +999,7 @@ void BrowserPageWPE::ensureWebView()
             WLOG("leave-fullscreen (restore)"); return TRUE; }), this);
 
     applyContentBlocker(webkit_web_view_get_user_content_manager(m_webView));
+    setupSensorInjection();   // DeviceOrientation/Motion shim (document-start); probe starts on load-finished
 
     /* Editor-focus → VKB is driven by checkEditorFocus() after each tap (see clickAt/mouseEvent): it
      * polls document.activeElement via evaluate_javascript — the same proven-safe path as the page-
@@ -3068,6 +3208,7 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
     switch (ev) {
         case WEBKIT_LOAD_STARTED:
             self->m_userInteracted = false;   // new page: ignore autofocus VKB grabs until the user taps
+            self->stopSensors();              // drop the old page's sensor timers/socket; new page re-requests
             self->m_server->msgLoadStarted(self->m_proxy);
             break;
         case WEBKIT_LOAD_COMMITTED:
@@ -3119,6 +3260,7 @@ void BrowserPageWPE::onLoadChanged(WebKitWebView* v, WebKitLoadEvent ev, gpointe
             self->updateContentsSize();   /* report the REAL page height for scrolling */
             self->m_contentPollTicks = 0; /* + keep re-measuring for ~30s: JS-grown pages (html5test) expand AFTER load */
             g_timeout_add(1000, &BrowserPageWPE::contentSizePollTimeout, self);
+            self->startSensorProbe();     /* watch for deviceorientation/devicemotion listeners on this page */
             self->m_server->msgDidFinishDocumentLoad(self->m_proxy);
             self->m_server->msgLoadStopped(self->m_proxy);
             g_timeout_add(1200, &BrowserPageWPE::perfTimingTimeout, self);   /* dump Navigation Timing -> "PERF ..." */

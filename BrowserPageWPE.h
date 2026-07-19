@@ -345,6 +345,25 @@ private:
                                        // cards (OAuth popups, app-style SPAs like web.whatsapp.com). Set by the
                                        // "atlas-simple:" openUrl marker (app JS adds it from an optional launch param).
     bool                m_prewarmBlank; // BPWPE_PRESPAWN: WebView pre-warmed with about:blank (non-private)
+
+    // --- DeviceOrientation / DeviceMotion injection (fed by the atlas-sensord HAL helper) ---
+    // A document-start shim exposes window.__atlasWant (bitmask 1=orientation 2=motion, set when the page
+    // adds a listener) + window.__atlasTick(ax,ay,az,gx,gy,gz) which builds+dispatches the events. A low-rate
+    // PROBE reads __atlasWant via evaluate_javascript (the proven-safe path — NOT script-message-received,
+    // which crashed the BS); when a page wants sensors we open /tmp/atlas_sensord.sock and PUSH samples.
+    int                 m_sensorSock  = -1;   // Unix socket to atlas-sensord, -1 = disconnected
+    guint               m_sensorProbe = 0;    // ~400ms timer: reads window.__atlasWant
+    guint               m_sensorPush  = 0;    // ~40ms timer: pushes samples while a page wants them
+    int                 m_sensorWant  = 0;    // last __atlasWant read (1=orientation, 2=motion)
+    GCancellable*       m_sensorCancel = nullptr; // cancels in-flight probe evaluates on teardown
+    void                setupSensorInjection();
+    void                startSensorProbe();
+    void                startSensorPush();
+    bool                connectSensord();   // (re)connect m_sensorSock to atlas-sensord; true if connected
+    void                stopSensors();
+    static gboolean     sensorProbeTimer(gpointer self);
+    static void         onSensorWant(GObject* obj, GAsyncResult* res, gpointer self);
+    static gboolean     sensorPushTimer(gpointer self);
     bool                m_renderPending; // pan re-render in flight; don't queue another (m_renderedY would race ahead of the delivered buffer)
     long                m_renderPendingMs; // _wlog_ms() when m_renderPending was set — staleness timeout so a lost frame can't deadlock the pan
     unsigned int        m_settleTimer;   // settle-render: g_timeout id armed while a fast flick defers re-render; fires the settled re-render
