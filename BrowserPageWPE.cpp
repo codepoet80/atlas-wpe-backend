@@ -406,16 +406,38 @@ void BrowserPageWPE::onScrapeResult(GObject* obj, GAsyncResult* res, gpointer ud
  * and, only while a page wants sensors, a 40ms PUSH forwards the latest socket sample into __atlasTick. */
 #define ATLAS_SENSOR_SOCK "/tmp/atlas_sensord.sock"
 
+// Injected at document-start. Two things: (1) DeviceOrientation/DeviceMotion events via createEvent+init*,
+// (2) a FUNCTIONAL W3C Generic Sensor API polyfill (Accelerometer/Gyroscope/Magnetometer/LinearAccelerationSensor)
+// backed by the same atlas-sensord data. __atlasWant bits: 1=orientation 2=motion 4=a Generic Sensor is active.
+// NOTE: do NOT override window.ondeviceorientation/ondevicemotion — WebKit exposes them natively (null when
+// unset); shadowing them broke feature-detection (read back undefined). The probe reads them instead.
 static const char* kSensorShim =
     "(function(){var w=window;if(w.__atlasSensorInit)return;w.__atlasSensorInit=1;w.__atlasWant=0;"
     "var oadd=w.addEventListener;"
     "w.addEventListener=function(t,f,o){var s=(''+t).toLowerCase();"
     "if(s==='deviceorientation')w.__atlasWant|=1;else if(s==='devicemotion')w.__atlasWant|=2;"
     "return oadd.apply(this,arguments);};"
-    // NOTE: do NOT override window.ondeviceorientation/ondevicemotion — WebKit exposes them natively (returning
-    // null when unset), and shadowing them broke feature-detection (window.ondeviceorientation read as undefined,
-    // not null). The probe reads the NATIVE attribute to catch `window.ondeviceorientation = fn` assignments.
-    "w.__atlasTick=function(ax,ay,az,gx,gy,gz){var wt=w.__atlasWant;if(!wt)return;var D=180/Math.PI;"
+    /* ---- W3C Generic Sensor API polyfill (real data from atlas-sensord) ---- */
+    "if(!('Sensor' in w)){var reg=[];"
+    "function Sensor(o){this.activated=false;this.hasReading=false;this.timestamp=null;this.x=null;this.y=null;this.z=null;"
+    "this.onreading=null;this.onactivated=null;this.onerror=null;this.frequency=(o&&o.frequency)||60;this._h={reading:[],activated:[]};}"
+    "Sensor.prototype.addEventListener=function(t,f){if(this._h[t])this._h[t].push(f);};"
+    "Sensor.prototype.removeEventListener=function(t,f){if(this._h[t]){var i=this._h[t].indexOf(f);if(i>=0)this._h[t].splice(i,1);}};"
+    "Sensor.prototype._fire=function(t){var e={type:t,target:this};if(t==='reading'&&this.onreading)this.onreading(e);"
+    "if(t==='activated'&&this.onactivated)this.onactivated(e);var a=this._h[t]||[];for(var i=0;i<a.length;i++)a[i](e);};"
+    "Sensor.prototype.start=function(){if(this.activated)return;this.activated=true;reg.push(this);w.__atlasWant|=4;"
+    "var s=this;setTimeout(function(){s._fire('activated');},0);};"
+    "Sensor.prototype.stop=function(){this.activated=false;var i=reg.indexOf(this);if(i>=0)reg.splice(i,1);};"
+    "function sub(k){function S(o){Sensor.call(this,o);this._k=k;}S.prototype=Object.create(Sensor.prototype);S.prototype.constructor=S;return S;}"
+    "var Ac=sub('a'),Li=sub('l'),Gy=sub('g'),Ma=sub('m');"
+    "w.__atlasFeed=function(ax,ay,az,gx,gy,gz,mx,my,mz,lx,ly,lz){var G=9.80665;for(var i=0;i<reg.length;i++){var s=reg[i];"
+    "if(s._k==='a'){s.x=ax*G;s.y=ay*G;s.z=az*G;}else if(s._k==='l'){s.x=lx;s.y=ly;s.z=lz;}"
+    "else if(s._k==='g'){s.x=gx;s.y=gy;s.z=gz;}else if(s._k==='m'){s.x=mx;s.y=my;s.z=mz;}"
+    "s.hasReading=true;s.timestamp=(w.performance&&performance.now)?performance.now():Date.now();s._fire('reading');}};"
+    "w.Sensor=Sensor;w.Accelerometer=Ac;w.LinearAccelerationSensor=Li;w.Gyroscope=Gy;w.Magnetometer=Ma;}"
+    /* ---- push pump: called by BS with the latest sample ---- */
+    "w.__atlasTick=function(ax,ay,az,gx,gy,gz,mx,my,mz,lx,ly,lz){var wt=w.__atlasWant;if(!wt)return;var D=180/Math.PI;"
+    "if((wt&4)&&w.__atlasFeed)w.__atlasFeed(ax,ay,az,gx,gy,gz,mx,my,mz,lx,ly,lz);"
     "if(wt&1){var beta=Math.atan2(ay,az)*D,gamma=Math.atan2(-ax,Math.sqrt(ay*ay+az*az))*D;"
     "var e=document.createEvent('DeviceOrientationEvent');"
     "e.initDeviceOrientationEvent('deviceorientation',true,false,null,beta,gamma);w.dispatchEvent(e);}"
@@ -506,12 +528,12 @@ gboolean BrowserPageWPE::sensorPushTimer(gpointer ud)
     if (n < 0) return G_SOURCE_CONTINUE;                                                            // EAGAIN: no new sample
     buf[n] = 0;
     /* keep the LAST complete "S ax ay az gx gy gz" line; parse locale-independently (BS may run under nl_NL) */
-    double val[6]; bool got = false; char* save = nullptr;
+    double val[12] = {}; bool got = false; char* save = nullptr;   // ax ay az gx gy gz mx my mz lx ly lz
     for (char* ln = strtok_r(buf, "\n", &save); ln; ln = strtok_r(nullptr, "\n", &save)) {
         if (ln[0] != 'S') continue;
-        char* p = ln + 1; bool ok = true;
-        for (int i = 0; i < 6; i++) { char* end = nullptr; val[i] = g_ascii_strtod(p, &end); if (end == p) { ok = false; break; } p = end; }
-        if (ok) got = true;
+        char* p = ln + 1; int cnt = 0;
+        for (int i = 0; i < 12; i++) { char* end = nullptr; double d = g_ascii_strtod(p, &end); if (end == p) break; val[i] = d; p = end; cnt++; }
+        if (cnt >= 6) got = true;   // accel+gyro minimum; mag/linear (6-11) stay 0 if an older daemon is running
     }
     if (!got) return G_SOURCE_CONTINUE;
     /* Only dispatch when the reading meaningfully CHANGED (or a ~500ms heartbeat). A still device otherwise
@@ -524,11 +546,11 @@ gboolean BrowserPageWPE::sensorPushTimer(gpointer ud)
     if (maxd < 0.02 && (nowUs - self->m_sensLastPushUs) < 500000) return G_SOURCE_CONTINUE;
     for (int i = 0; i < 6; i++) self->m_sensLast[i] = val[i];
     self->m_sensLastPushUs = nowUs;
-    char b[6][G_ASCII_DTOSTR_BUF_SIZE];
-    for (int i = 0; i < 6; i++) g_ascii_formatd(b[i], sizeof b[i], "%.5f", val[i]);
-    char js[320];
-    g_snprintf(js, sizeof js, "window.__atlasTick&&window.__atlasTick(%s,%s,%s,%s,%s,%s)",
-               b[0], b[1], b[2], b[3], b[4], b[5]);
+    char b[12][G_ASCII_DTOSTR_BUF_SIZE];
+    for (int i = 0; i < 12; i++) g_ascii_formatd(b[i], sizeof b[i], "%.5f", val[i]);
+    char js[640];
+    g_snprintf(js, sizeof js, "window.__atlasTick&&window.__atlasTick(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+               b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]);
     webkit_web_view_evaluate_javascript(self->m_webView, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
     return G_SOURCE_CONTINUE;
 }
