@@ -356,6 +356,8 @@ private:
     guint               m_sensorPush  = 0;    // ~40ms timer: pushes samples while a page wants them
     int                 m_sensorWant  = 0;    // last __atlasWant read (1=orientation, 2=motion)
     GCancellable*       m_sensorCancel = nullptr; // cancels in-flight probe evaluates on teardown
+    double              m_sensLast[6] = {};   // last-pushed ax,ay,az,gx,gy,gz — skip near-identical samples
+    gint64              m_sensLastPushUs = 0; // monotonic us of last push (for the idle heartbeat)
     void                setupSensorInjection();
     void                startSensorProbe();
     void                startSensorPush();

@@ -512,6 +512,16 @@ gboolean BrowserPageWPE::sensorPushTimer(gpointer ud)
         if (ok) got = true;
     }
     if (!got) return G_SOURCE_CONTINUE;
+    /* Only dispatch when the reading meaningfully CHANGED (or a ~500ms heartbeat). A still device otherwise
+     * streams ~25Hz of events; any page that repaints on them (e.g. shows the values) then drives a continuous
+     * full-page 1024x3072 readback (~243ms each) that pegs the single shared WebProcess and starves other page
+     * loads. Idle -> ~2Hz heartbeat; real motion -> full rate. */
+    double maxd = 0;
+    for (int i = 0; i < 6; i++) { double d = val[i] - self->m_sensLast[i]; if (d < 0) d = -d; if (d > maxd) maxd = d; }
+    gint64 nowUs = g_get_monotonic_time();
+    if (maxd < 0.02 && (nowUs - self->m_sensLastPushUs) < 500000) return G_SOURCE_CONTINUE;
+    for (int i = 0; i < 6; i++) self->m_sensLast[i] = val[i];
+    self->m_sensLastPushUs = nowUs;
     char b[6][G_ASCII_DTOSTR_BUF_SIZE];
     for (int i = 0; i < 6; i++) g_ascii_formatd(b[i], sizeof b[i], "%.5f", val[i]);
     char js[320];
