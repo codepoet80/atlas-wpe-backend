@@ -412,10 +412,9 @@ static const char* kSensorShim =
     "w.addEventListener=function(t,f,o){var s=(''+t).toLowerCase();"
     "if(s==='deviceorientation')w.__atlasWant|=1;else if(s==='devicemotion')w.__atlasWant|=2;"
     "return oadd.apply(this,arguments);};"
-    "try{['ondeviceorientation','ondevicemotion'].forEach(function(p,i){"
-    "Object.defineProperty(w,p,{configurable:true,"
-    "set:function(fn){this['_'+p]=fn;if(fn){w.__atlasWant|=(i?2:1);oadd.call(w,p.slice(2),fn);}},"
-    "get:function(){return this['_'+p];}});});}catch(e){}"
+    // NOTE: do NOT override window.ondeviceorientation/ondevicemotion — WebKit exposes them natively (returning
+    // null when unset), and shadowing them broke feature-detection (window.ondeviceorientation read as undefined,
+    // not null). The probe reads the NATIVE attribute to catch `window.ondeviceorientation = fn` assignments.
     "w.__atlasTick=function(ax,ay,az,gx,gy,gz){var wt=w.__atlasWant;if(!wt)return;var D=180/Math.PI;"
     "if(wt&1){var beta=Math.atan2(ay,az)*D,gamma=Math.atan2(-ax,Math.sqrt(ay*ay+az*az))*D;"
     "var e=document.createEvent('DeviceOrientationEvent');"
@@ -437,7 +436,7 @@ void BrowserPageWPE::setupSensorInjection()
 void BrowserPageWPE::startSensorProbe()
 {
     if (!m_sensorProbe)
-        m_sensorProbe = g_timeout_add(400, &BrowserPageWPE::sensorProbeTimer, this);
+        m_sensorProbe = g_timeout_add(150, &BrowserPageWPE::sensorProbeTimer, this);   // low latency so event-based detection (html5test) catches an event fast
 }
 
 gboolean BrowserPageWPE::sensorProbeTimer(gpointer ud)
@@ -445,8 +444,11 @@ gboolean BrowserPageWPE::sensorProbeTimer(gpointer ud)
     BrowserPageWPE* self = static_cast<BrowserPageWPE*>(ud);
     if (!self->m_webView) return G_SOURCE_CONTINUE;
     if (!self->m_sensorCancel) self->m_sensorCancel = g_cancellable_new();
-    webkit_web_view_evaluate_javascript(self->m_webView, "window.__atlasWant|0", -1, nullptr, nullptr,
-                                        self->m_sensorCancel, &BrowserPageWPE::onSensorWant, self);
+    /* Detect via addEventListener (window.__atlasWant, set by the shim) OR a native ondeviceorientation/
+     * ondevicemotion assignment (read the native attribute — not shadowed anymore). */
+    webkit_web_view_evaluate_javascript(self->m_webView,
+        "((window.__atlasWant|0)|(window.ondeviceorientation?1:0)|(window.ondevicemotion?2:0))", -1,
+        nullptr, nullptr, self->m_sensorCancel, &BrowserPageWPE::onSensorWant, self);
     return G_SOURCE_CONTINUE;
 }
 
