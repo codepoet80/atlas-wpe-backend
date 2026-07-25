@@ -158,6 +158,11 @@ public:
      * the image asynchronously and answer via m_server->msgHitTestResponse / msgSaveImageAtPointResponse. */
     void hitTestAsync(int32_t queryNum, int32_t cx, int32_t cy);
     void saveImageAtPointAsync(int32_t queryNum, int32_t x, int32_t y, const char* dir);
+    /* BrowserServer::clearCache() used QWebSettings::clearMemoryCaches(), a QtWebKit call with no
+     * library behind it in the WPE port - it linked to address 0 and SIGSEGV'd the engine. Reached
+     * from Preferences > Clear Cache, the asyncCmdClearCache IPC, AND automatically on a device
+     * locale change. Clears every live page's caches through the WPE 2.0 website-data manager. */
+    static void clearAllCaches();
     void respondSaveImage(int32_t query, bool ok, const char* path);   // Feature 9: called from the image-download callback
     /* A payload starting with \x02 is an AUTOFILL request ("\x02" user "\x02" pass), routed through this
      * existing command to avoid new IPC. Otherwise it's a plain InsertText into the focused field. */

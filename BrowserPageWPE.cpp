@@ -2730,6 +2730,24 @@ static gboolean atlas_img_decide_dest(WebKitDownload* dl, gchar*, gpointer ud) {
     webkit_download_set_destination(dl, static_cast<AtlasImgDl*>(ud)->dest.c_str()); return TRUE;
 }
 
+/* Clear the resource caches of every live page. Replaces QWebSettings::clearMemoryCaches(), which
+ * does not exist in this port (QtWebKit is headers-only here, so the call linked to address 0 and
+ * crashed). WPE 2.0 routes cache clearing through the network session's website-data manager. */
+void BrowserPageWPE::clearAllCaches()
+{
+    for (BrowserPageWPE* p : g_livePages) {
+        if (!p || !p->m_webView) continue;
+        WebKitNetworkSession* session = webkit_web_view_get_network_session(p->m_webView);
+        if (!session) continue;
+        WebKitWebsiteDataManager* mgr = webkit_network_session_get_website_data_manager(session);
+        if (!mgr) continue;
+        webkit_website_data_manager_clear(mgr,
+            static_cast<WebKitWebsiteDataTypes>(WEBKIT_WEBSITE_DATA_MEMORY_CACHE | WEBKIT_WEBSITE_DATA_DISK_CACHE),
+            0, nullptr, nullptr, nullptr);
+    }
+    WLOG("clearAllCaches: cleared memory+disk cache for %zu live page(s)", g_livePages.size());
+}
+
 void BrowserPageWPE::saveImageAtPointAsync(int32_t queryNum, int32_t x, int32_t y, const char* dir)
 {
     m_saveImgQuery = queryNum;
