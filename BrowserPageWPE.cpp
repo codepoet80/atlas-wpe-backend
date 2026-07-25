@@ -865,6 +865,27 @@ void BrowserPageWPE::ensureWebView()
     WLOG("ensureWebView layout %dx%d -> render %dx%d (screen=%d contentZoom=%.3f)",
          renderW, renderH, m_renderWidth, m_renderHeight, screenW, (double)m_renderWidth/renderW);
 
+    /* VIEWPORT vs PAN BUFFER. renderH above is a PAINT extent (~4 screens) that the adapter pans
+     * within — it is not what the user can see. WebKit, left alone, uses the view height as the initial
+     * containing block, so a quirks-mode `height: 100%` layout (the classic centring table, e.g.
+     * home.jonandnic.com) resolves 100% to ~3072px and puts its "centred" content about a screen and a
+     * half below the fold. That is the "pages load halfway down" bug.
+     *
+     * Tell the WebProcess the real screen height so it can cap the ICB to one screen while still
+     * painting the whole buffer (WebCore/rendering/RenderView.cpp, atlasICBHeightCap()). Only meaningful
+     * when the buffer is actually taller than the screen; mult=1 needs no cap.
+     *
+     * setenv, not IPC: the WebProcess inherits our environment at spawn, and the engine runs
+     * WEBKIT_USE_SINGLE_WEB_PROCESS=1, so this is read once by the one process that matters. screenH
+     * comes from luna.conf DisplayHeight, which does not change on rotate (only the width does), so the
+     * value stays correct for the life of the process. */
+    if (screenH > 0 && renderH > screenH) {
+        char icb[16];
+        snprintf(icb, sizeof(icb), "%d", screenH);
+        setenv("ATLAS_ICB_HEIGHT", icb, 1);
+        WLOG("ICB height capped to screen: ATLAS_ICB_HEIGHT=%d (buffer %d)", screenH, renderH);
+    }
+
     m_viewBackend = wpe_atlas_view_backend_create(renderW, renderH, scaledW, scaledH,
                                                  &BrowserPageWPE::onFrame, this);
     WebKitWebViewBackend* vb = webkit_web_view_backend_new(m_viewBackend, nullptr, nullptr);
