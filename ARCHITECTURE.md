@@ -78,6 +78,26 @@ fully offscreen (`EGL_KHR_surfaceless_context` + FBO, or a pbuffer). This decide
 surfaceless/FBO is strongly preferred; if WebKit insists on a window surface we provide a 1x1
 pbuffer-config window or the device fbdev native window and still read back via an FBO.
 
+## The GPU wedge is NOT in this readback path
+
+Worth knowing before you go hunting here: the hang tracked as
+[atlas-wpe-env#3](https://github.com/Herrie82/atlas-wpe-env/issues/3) — GPU-heavy work (site pop-up
+menus, rotation) after which no page ever loads again — looks like it belongs to this file's
+`glFinish` / `eglLockSurfaceKHR` readback, and the issue originally said so. Measured on-device
+2026-08-03, it does not:
+
+- **BrowserServer's** main thread is parked in `futex_wait_queue_me`. Yap keeps accepting; `openURL`
+  arrives and is never serviced.
+- The **WPEWebProcess is idle** in `poll_schedule_timeout` — not stuck in a GPU call. `kill -9` on it
+  does **not** free BrowserServer, and WebKit happily spawns replacements while BS stays stuck.
+- The last readback before the freeze **completed normally** (`LOCKSURF readback 188495us`), so it
+  wedges *after* a good frame.
+- No OOM, `dmesg` clean, 339–450 MB available, no orphaned WebProcesses.
+
+That points at a lost wakeup on the BrowserServer side rather than a stuck GPU call. It is recovered
+(not fixed) as of 0.9.8: BrowserServer's deadlock watchdog aborts it in ~60s and the app's cards
+reload themselves.
+
 ## Build
 
 `libWPEBackend-atlas.so`, linked against `libwpe-1.0`, `libEGL`/`libGLESv2` (stubs at build,
