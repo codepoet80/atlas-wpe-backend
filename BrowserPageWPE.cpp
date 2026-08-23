@@ -227,17 +227,40 @@ void BrowserPageWPE::applyUserAgentQuirk(const char* url)
         "teams.microsoft.com", "teams.live.com",
         "login.microsoftonline.com", "login.microsoft.com", "login.live.com",
     };
-    bool wantMac = false;
-    if (url) {
+    /* Spotify's accounts/login SPA sniffs the UA and shows "Something went wrong, try again later"
+     * for the webOS/Linux UA (same class of block as Teams). We ARE WebKit 620/Safari 18, so present
+     * the macOS Safari UA for the Spotify domains and the login flow renders. */
+    static const char* kSpotifyHosts[] = {
+        "accounts.spotify.com", "open.spotify.com", "www.spotify.com", "spotify.com",
+    };
+    /* A spoofed UA must persist for the whole SITE SESSION, not just one navigation. Spotify's login
+     * SPA fires client-side (type=OTHER) navigations to other hosts mid-flow; if we keyed the UA only
+     * on the immediate target we'd reset to the webOS UA and the SPA's API calls would then be rejected
+     * ("Something went wrong"). So check BOTH the navigation target AND the current main-frame page:
+     * while the top document is a quirk host, keep the macOS Safari UA regardless of sub-navigations. */
+    /* Spotify's login ONLY accepts Chromium browsers — a Safari UA still gets "Something went wrong"
+     * (confirmed: Chrome/Edge complete login, other engines don't). Present a desktop Chrome UA for the
+     * Spotify domains. Teams keeps the macOS Safari UA (it explicitly allow-lists Safari-on-Mac). */
+    static const char* const kChromeUA =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    const char* mainUri = m_webView ? webkit_web_view_get_uri(m_webView) : nullptr;
+    const char* cands[2] = { url, mainUri };
+    const char* want = kAtlasDefaultUA;
+    const char* why = "default";
+    for (int ci = 0; ci < 2 && want == kAtlasDefaultUA; ++ci) {
+        const char* u = cands[ci];
+        if (!u) { continue; }
         for (size_t i = 0; i < G_N_ELEMENTS(kMsTeamsHosts); ++i)
-            if (strstr(url, kMsTeamsHosts[i])) { wantMac = true; break; }
+            if (strstr(u, kMsTeamsHosts[i])) { want = kAtlasMacSafariUA; why = "MS-Teams"; break; }
+        if (want == kAtlasDefaultUA)
+            for (size_t i = 0; i < G_N_ELEMENTS(kSpotifyHosts); ++i)
+                if (strstr(u, kSpotifyHosts[i])) { want = kChromeUA; why = "Spotify"; break; }
     }
-    const char* want = wantMac ? kAtlasMacSafariUA : kAtlasDefaultUA;
     WebKitSettings* s = webkit_web_view_get_settings(m_webView);
     const char* cur = s ? webkit_settings_get_user_agent(s) : nullptr;
     if (s && (!cur || strcmp(cur, want) != 0)) {
         webkit_settings_set_user_agent(s, want);
-        WLOG("UA quirk: %s -> %s", wantMac ? "MS-Teams" : "default", want);
+        WLOG("UA quirk: %s -> %s", why, want);
     }
 }
 
@@ -732,8 +755,15 @@ void BrowserPageWPE::ensureWebView()
          * the QR, and on VFAT those writes fail so the QR never renders (and it 30s-spins). Put them on
          * cryptofs (create/rename/lock work; PROVEN: WhatsApp writes mediakeys/storage + the QR renders),
          * via the stable /var/atlas252 bridge (-> app deviceroot/wpe-252, ext-backed cryptofs). */
+        /* NetworkCache (2nd arg) needs HARD LINKS (Blobs/ -> Records/): cryptofs is FUSE and returns
+         * EPERM for link(), so the cache endlessly logs "Failed to create hard link" and TRUNCATES
+         * cached scripts -> "SyntaxError: Unexpected end of script". That corrupts heavy JS like
+         * Spotify's reCAPTCHA (gstatic recaptcha__*.js) -> "reCAPTCHA Timeout" -> login spins forever.
+         * Put ONLY the cache on tmpfs (/media/ram: hard links work, 459M, volatile-OK for a cache).
+         * netdata + cookies STAY on cryptofs — they are SQLite (create/rename/lock), not hard links,
+         * and must persist (WhatsApp IndexedDB QR proven). */
         session = webkit_network_session_new("/var/atlas252/webkit-data/netdata",
-                                             "/var/atlas252/webkit-data/netcache");
+                                             "/media/ram/atlas-netcache");
         WebKitCookieManager* cm = webkit_network_session_get_cookie_manager(session);
         webkit_cookie_manager_set_persistent_storage(cm, "/var/atlas252/webkit-data/cookies.db",
                                                      WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
@@ -996,6 +1026,9 @@ void BrowserPageWPE::ensureWebView()
      * "Update your browser". webOS/6.0 reads as a modern webOS engine. */
     webkit_settings_set_user_agent(s, kAtlasDefaultUA);
     WLOG("UA set to: %s", webkit_settings_get_user_agent(s) ? webkit_settings_get_user_agent(s) : "?");
+    /* TEMP DIAGNOSTIC: route page console.log/warn/error to stdout (-> bs.log) so we can read why
+     * Spotify's login SPA bails ("Something went wrong"). Safe one-liner (no signal handler). */
+    webkit_settings_set_enable_write_console_messages_to_stdout(s, TRUE);
 
     g_signal_connect(m_webView, "load-changed",  G_CALLBACK(onLoadChanged), this);
     g_signal_connect(m_webView, "load-failed",   G_CALLBACK(onLoadFailed), this);
@@ -1598,10 +1631,15 @@ void BrowserPageWPE::openUrl(const char* url)
         }
     }
     /* A pre-warmed (about:blank, non-private) WebView can't serve a private card — tear it down so
-     * ensureWebView() rebuilds it ephemeral. Non-private navigations reuse the warm WebProcess. */
+     * ensureWebView() rebuilds it ephemeral. Non-private navigations reuse the warm WebProcess.
+     * SAME for a SIMPLE card: the warm WebView was created with the default tall (mult=4) pan buffer
+     * because m_simpleMode was still false at prewarm time; reusing it would keep the tall buffer and
+     * defeat viewport mode. Tear it down so ensureWebView() rebuilds it at the simple (mult=1) size.
+     * This keeps prespawn's fast opens for NORMAL cards (they reuse the warm WebProcess) while simple
+     * cards pay one rebuild. */
     if (m_prewarmBlank) {
         m_prewarmBlank = false;
-        if (m_private && m_webView) { g_object_unref(m_webView); m_webView = nullptr; }
+        if ((m_private || m_simpleMode) && m_webView) { g_object_unref(m_webView); m_webView = nullptr; }
     }
     ensureWebView();
     /* WebKit needs a scheme or it returns WebKitPolicyError 101 "URL can't be shown".
