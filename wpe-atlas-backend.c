@@ -104,7 +104,7 @@ static struct atlas_view* g_atlas_views = NULL;   /* P2 wpe->view registry (few 
  * (which stalled loads with "bad SETUP" after a cross-site jump). Lives until its process exits. */
 struct atlas_conn {
     struct atlas_view* v;
-    int   sock_ui, sock_web;
+    int   sock_ui;      /* our end. The peer end is handed to WebKit in view_get_renderer_host_fd and is not ours */
     guint io_source;
 };
 
@@ -192,45 +192,48 @@ static int view_get_renderer_host_fd(void* data)
     }
     struct atlas_conn* c = (struct atlas_conn*)calloc(1, sizeof(*c));
     if (!c) { close(sv[0]); close(sv[1]); return -1; }
-    c->v = v; c->sock_ui = sv[0]; c->sock_web = sv[1];
+    c->v = v; c->sock_ui = sv[0];
 
     /* tell THIS WebProcess where the shared frame buffer is (+ the fit-to-screen output size) */
     struct atlas_msg m = { .type = MSG_SETUP, .shmid = (uint32_t)v->shmid,
                           .width = v->width, .height = v->height, .slot = 0,
                           .swidth = v->swidth, .sheight = v->sheight };
-    if (send(c->sock_ui, &m, sizeof(m), 0) != (ssize_t)sizeof(m))
+    if (send(c->sock_ui, &m, sizeof(m), MSG_NOSIGNAL) != (ssize_t)sizeof(m))
         ATLAS_LOG("send(SETUP) failed: %s", strerror(errno));
 
     /* receive THIS process's MSG_FRAME_READY on the UIProcess main loop */
-    c->io_source = g_unix_fd_add(c->sock_ui, G_IO_IN | G_IO_HUP | G_IO_ERR, atlas_view_on_readable, c);
+    c->io_source = g_unix_fd_add(c->sock_ui, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, atlas_view_on_readable, c);
 
-    /* Keep OUR sock_web open for now — WebKit dup()s the returned fd for the WebProcess
-     * (asynchronously), so closing it here would hand the process a dead fd (kills even the 1st
-     * load). It's dropped in atlas_view_on_readable on the process's FIRST message (which proves the
-     * dup already happened), so the socketpair can then HUP on process exit and reap the conn. */
-    return c->sock_web;
+    /* sv[1] now belongs to WebKit: PageClientImpl::hostFileDescriptor() ADOPTS it, sends it to the
+     * WebProcess and closes it (another thread, within ms). Closing it here later — as the old
+     * "close sock_web on first frame" did — closed whatever had since reused the number (another
+     * channel's sock_ui, a WebKit IPC socket): the main loop then parked in recv()/a lost IPC reply.
+     * That was the GPU "wedge" (atlas-wpe-env#3). The pair still HUPs when the WebProcess exits. */
+    return sv[1];
 }
 
 static gboolean atlas_view_on_readable(gint fd, GIOCondition cond, gpointer data)
 {
     struct atlas_conn* c = (struct atlas_conn*)data;
     struct atlas_view* v = c->v;
-    if (cond & (G_IO_HUP | G_IO_ERR)) {     /* this WebProcess exited — drop its channel */
-        if (c->sock_ui  >= 0) close(c->sock_ui);
-        if (c->sock_web >= 0) close(c->sock_web);
+    if (cond & G_IO_NVAL) { free(c); return G_SOURCE_REMOVE; }   /* fd already closed — not ours to close again */
+
+    /* Drain what is readable first (a HUP can arrive together with the last frame), never blocking
+     * the UI main loop; drop the channel on EOF/error, or on HUP/ERR once nothing is left to read. */
+    struct atlas_msg m;
+    ssize_t n = recv(fd, &m, sizeof(m), MSG_DONTWAIT);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        if (!(cond & (G_IO_HUP | G_IO_ERR))) return G_SOURCE_CONTINUE;
+        n = 0;                                          /* HUP with the queue drained: treat as EOF */
+    }
+    if (n <= 0) {                                       /* this WebProcess exited (or the fd is bad) */
+        int e = n < 0 ? errno : 0;
+        if (e) ATLAS_LOG("frame channel fd %d: %s — dropping channel", fd, strerror(e));
+        if (e != EBADF) close(c->sock_ui);
         free(c);
         return G_SOURCE_REMOVE;
     }
-
-    struct atlas_msg m;
-    ssize_t n = recv(fd, &m, sizeof(m), 0);
     if (n != (ssize_t)sizeof(m)) return G_SOURCE_CONTINUE;
-
-    /* First real message proves WebKit already dup'd sock_web into the WebProcess, so drop OUR ref
-     * to it now (race-free: the process has its own copy). Without this the kept-open sock_web pins
-     * the socketpair so it never HUPs -> the conn (FD + io_source) leaks on every cross-site PSON
-     * spawn; this lets the pair HUP when the process exits, reaping the channel. */
-    if (c->sock_web >= 0) { close(c->sock_web); c->sock_web = -1; }
 
     if (m.type == MSG_FRAME_READY && v->shm && v->handler) {
         uint32_t slot = m.slot % SLOTS;
@@ -244,7 +247,7 @@ static gboolean atlas_view_on_readable(gint fd, GIOCondition cond, gpointer data
         wpe_view_backend_dispatch_frame_displayed(v->wpe);
 
         struct atlas_msg ack = { .type = MSG_FRAME_ACK, 0, 0, 0, slot };
-        send(fd, &ack, sizeof(ack), 0);
+        send(fd, &ack, sizeof(ack), MSG_DONTWAIT | MSG_NOSIGNAL);
     }
     return G_SOURCE_CONTINUE;
 }
@@ -459,6 +462,7 @@ static void target_destroy(void* d)
 {
     struct atlas_target* t = (struct atlas_target*)d;
     if (t->shm && t->shm != (void*)-1) shmdt(t->shm);
+    if (t->host_fd >= 0) close(t->host_fd);   /* ours: WebKit passed hostFD.release() */
     free(t->scratch);
     free(t->ds_scratch);
     free(t);
@@ -1283,12 +1287,15 @@ static void target_frame_rendered(void* d)
                      rw, rh, _rb, _iv, _iv ? 1000000.0 / _iv : 0.0, s_bgra_readback);
           } _pn++; }
         _plast = _pt1;
+        /* Drain the UIProcess's FRAME_ACKs. Nobody waits on them, but unread datagrams stay charged
+         * to the SENDER's buffer, so left alone they fill it after a few hundred frames and the
+         * BrowserServer's ack send() would block its main loop forever (the "wedge after a good frame"). */
+        { struct atlas_msg a; while (recv(t->host_fd, &a, sizeof(a), MSG_DONTWAIT) > 0) {} }
         struct atlas_msg m = { .type = MSG_FRAME_READY, .width = rw, .height = rh, .slot = t->cur_slot };
-        send(t->host_fd, &m, sizeof(m), 0);
+        send(t->host_fd, &m, sizeof(m), MSG_NOSIGNAL);
         t->cur_slot = (t->cur_slot + 1) % SLOTS;
     }
-    /* let WebKit proceed to the next frame (into the other slot). With double-buffering we don't
-     * wait for the UIProcess ack here; drain acks opportunistically for flow control if needed. */
+    /* let WebKit proceed to the next frame (into the other slot); we don't wait for the ack. */
     wpe_renderer_backend_egl_target_dispatch_frame_complete(t->wpe);
 }
 static void target_deinitialize(void* d) { (void)d; }

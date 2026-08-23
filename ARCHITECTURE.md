@@ -78,25 +78,44 @@ fully offscreen (`EGL_KHR_surfaceless_context` + FBO, or a pbuffer). This decide
 surfaceless/FBO is strongly preferred; if WebKit insists on a window surface we provide a 1x1
 pbuffer-config window or the device fbdev native window and still read back via an FBO.
 
-## The GPU wedge is NOT in this readback path
+## The "GPU wedge" (atlas-wpe-env#3) — root cause, fixed 2026-08-23
 
-Worth knowing before you go hunting here: the hang tracked as
-[atlas-wpe-env#3](https://github.com/Herrie82/atlas-wpe-env/issues/3) — GPU-heavy work (site pop-up
-menus, rotation) after which no page ever loads again — looks like it belongs to this file's
-`glFinish` / `eglLockSurfaceKHR` readback, and the issue originally said so. Measured on-device
-2026-08-03, it does not:
+The hang tracked as [atlas-wpe-env#3](https://github.com/Herrie82/atlas-wpe-env/issues/3) — after
+GPU-heavy work (site menus, rotation, a few minutes of navigation) no page ever loads again, the
+BrowserServer main thread sits in `futex_wait_queue_me` / `__skb_recv_datagram`, the WPEWebProcess is
+idle — was never a GPU hang. It was three bugs on the UIProcess (BrowserServer) side — two in this file's
+**frame channel**, one in BrowserPageWPE.cpp:
 
-- **BrowserServer's** main thread is parked in `futex_wait_queue_me`. Yap keeps accepting; `openURL`
-  arrives and is never serviced.
-- The **WPEWebProcess is idle** in `poll_schedule_timeout` — not stuck in a GPU call. `kill -9` on it
-  does **not** free BrowserServer, and WebKit happily spawns replacements while BS stays stuck.
-- The last readback before the freeze **completed normally** (`LOCKSURF readback 188495us`), so it
-  wedges *after* a good frame.
-- No OOM, `dmesg` clean, 339–450 MB available, no orphaned WebProcesses.
+1. **Stale close of the fd handed to WebKit.** `view_get_renderer_host_fd()` returns one end of a
+   `socketpair`. WebKit wraps the return value `UnixFileDescriptor::Adopt` (`PageClientImpl::
+   hostFileDescriptor()`), ships it to the WebProcess and **closes it** — on another thread, within
+   milliseconds. The backend kept the number and closed it again when the first frame arrived. By then
+   the number had been reused (strace on-device: the very next `socketpair` got it back 80 ms later),
+   so that close hit a live fd — another channel's `sock_ui`, or a WebKit IPC socket. The channel's
+   `g_unix_fd_add` source then polled a foreign socket: a blocking `recv()` racing the IPC thread parks
+   the main loop in `__skb_recv_datagram`; a stolen IPC datagram leaves a sync reply that never comes
+   (`futex_wait_queue_me`); a closed IPC socket looks to WebKit like a crashed WebProcess, so it spawns
+   replacements while BS stays stuck. Fix: the returned end is WebKit's — never touched again; the
+   channel is reaped on HUP/EOF; `recv()` is `MSG_DONTWAIT`.
+2. **Unread FRAME_ACK backlog.** The UIProcess answered every frame with an ack that the WebProcess
+   never read. Unread datagrams stay charged to the *sender's* socket buffer, so after a few hundred
+   frames on one page (an animated menu, a video, a long scroll session) the blocking `send(ack)`
+   parked the main loop forever — right after a perfectly good frame, which is exactly how the wedge
+   presented. Fix: the WebProcess drains acks before each FRAME_READY and the ack send is
+   `MSG_DONTWAIT`.
 
-That points at a lost wakeup on the BrowserServer side rather than a stuck GPU call. It is recovered
-(not fixed) as of 0.9.8: BrowserServer's deadlock watchdog aborts it in ~60s and the app's cards
-reload themselves.
+3. **SIGUSR1 stolen from JavaScriptCore** (`BrowserPageWPE.cpp`, not this file). A debug trigger for
+   the autonomous scroll test did `g_unix_signal_add(SIGUSR1, …)` once a page was live. WTF/JSC uses
+   SIGUSR1 (`sigThreadSuspendResume`) to suspend threads for conservative GC stack scanning, and glib's
+   `sigaction` replaced WTF's handler. The next concurrent GC of the UIProcess JSC VM (the one behind
+   `webkit_web_view_evaluate_javascript`'s JSCValues) then hung the collector in `Thread::suspend →
+   sem_wait(globalSemaphoreForSuspendResume)` waiting for a handler that no longer ran, and the main
+   thread's next heap entry parked in `JSC::Heap::acquireAccessSlow` — the `futex_wait_queue_me` wedge
+   caught on-device 2026-08-23 *after* fixes 1+2 were in. Fix: the SIGUSR1 hook is gone (the
+   `/tmp/atlas_scrolltest` file trigger remains). Nothing else in the engine may take SIGUSR1; if it ever
+   must, set `JSC_SIGNAL_FOR_GC=<signo>` in the boot wrapper instead.
+
+None of this needs the watchdog that used to abort+respawn the engine; that watchdog is off (0.9.10).
 
 ## Build
 

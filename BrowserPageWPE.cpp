@@ -22,7 +22,6 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 #include <sys/time.h>
-#include <glib-unix.h>   // g_unix_signal_add — SIGUSR1 kicks the autonomous scroll test
 #include <sys/socket.h>  // atlas-sensord Unix-socket client (DeviceOrientation/Motion)
 #include <sys/un.h>
 #include <cstring>
@@ -131,8 +130,7 @@ static inline bool bpwpe_dead(BrowserPageWPE* p) { return g_livePages.find(p) ==
 struct ScrollTestState { bool active; int cy, dir, step, maxCy, steps, renders, uncovered; long maxStallMs; guint tick; };
 static ScrollTestState g_st = {false,0,1,120,0,0,0,0,0,0};
 static BrowserPageWPE* g_testablePage = nullptr;   // last page to attach buffers = the scroll-test target
-static gboolean on_sigusr1(gpointer);              // fwd
-static gboolean scrolltest_poll(gpointer);         // fwd — file trigger (app-spawned BS masks SIGUSR1)
+static gboolean scrolltest_poll(gpointer);         // fwd — file trigger for the autonomous tests
 
 BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     : m_server(server), m_proxy(proxy), m_identifier(0)
@@ -909,12 +907,15 @@ void BrowserPageWPE::ensureWebView()
     }
 
     /* This page has a live WebView -> it's the scroll-test target (NOT a startPage/tab that only
-     * attached buffers with screenH=0). Install the trigger once (poll works despite masked SIGUSR1). */
+     * attached buffers with screenH=0). Install the file-trigger poll once. NO SIGUSR1 hook here:
+     * WTF/JSC uses SIGUSR1 to suspend threads for conservative GC scanning, and g_unix_signal_add()
+     * replaced that handler — the collector then waited forever for the main thread to answer and the
+     * main thread deadlocked on the heap (JSC::Heap::acquireAccessSlow). That was one of the two
+     * "GPU wedge" (#3) mechanisms. */
     g_testablePage = this;
     static bool s_testInstalled = false;
     if (!s_testInstalled) {
         s_testInstalled = true;
-        g_unix_signal_add(SIGUSR1, on_sigusr1, nullptr);
         g_timeout_add(700, scrolltest_poll, nullptr);
     }
 
@@ -2363,22 +2364,14 @@ void BrowserPageWPE::updateContentsSize()
         -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onContentHeight, this);
 }
 
-/* ===================== autonomous scroll test (SIGUSR1) ===================== */
+/* ===================== autonomous scroll test (file trigger) ===================== */
 static gboolean scrolltest_tick(gpointer)
 {
     if (!g_testablePage || g_livePages.find(g_testablePage) == g_livePages.end()) { g_st.active = false; return G_SOURCE_REMOVE; }
     return g_testablePage->scrollTestStep() ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
 }
-static gboolean on_sigusr1(gpointer)
-{
-    if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end() && !g_st.active)
-        g_testablePage->startScrollTest();
-    else
-        WLOG("SIGUSR1: no testable page (or a test is already running)");
-    return G_SOURCE_CONTINUE;   /* keep the handler for repeated runs */
-}
-/* File trigger: the host `touch`es /tmp/atlas_scrolltest; polled on the glib loop (which is clearly
- * dispatching — frames render), so it works even though the app-spawned BS has SIGUSR1 masked. */
+/* File trigger: the host `touch`es /tmp/atlas_scrolltest; polled on the glib loop. (There used to be a
+ * SIGUSR1 trigger too — removed: SIGUSR1 belongs to JSC's GC thread-suspend, see ensureWebView.) */
 static gboolean scrolltest_poll(gpointer)
 {
     if (access("/tmp/atlas_scrolltest", F_OK) == 0) {
