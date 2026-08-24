@@ -1,9 +1,6 @@
 --- a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
 +++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
-@@ ogg block closing brace, before "if (matroskaSupported)" @@
-         if (auto result = factories.hasElementForMediaType(ElementFactories::Type::VideoDecoder, "video/x-theora"_s)) {
-             m_decoderMimeTypeSet.add("video/ogg"_s);
-             m_decoderCodecMap.add("theora"_s, result);
+@@ -687,6 +687,24 @@
          }
      }
  
@@ -26,3 +23,5 @@
 +    }
 +
      if (matroskaSupported) {
+         m_decoderMimeTypeSet.add("video/x-matroska"_s);
+ 

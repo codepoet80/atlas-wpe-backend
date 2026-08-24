@@ -22,7 +22,6 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 #include <sys/time.h>
-#include <glib-unix.h>   // g_unix_signal_add — SIGUSR1 kicks the autonomous scroll test
 #include <sys/socket.h>  // atlas-sensord Unix-socket client (DeviceOrientation/Motion)
 #include <sys/un.h>
 #include <cstring>
@@ -131,8 +130,7 @@ static inline bool bpwpe_dead(BrowserPageWPE* p) { return g_livePages.find(p) ==
 struct ScrollTestState { bool active; int cy, dir, step, maxCy, steps, renders, uncovered; long maxStallMs; guint tick; };
 static ScrollTestState g_st = {false,0,1,120,0,0,0,0,0,0};
 static BrowserPageWPE* g_testablePage = nullptr;   // last page to attach buffers = the scroll-test target
-static gboolean on_sigusr1(gpointer);              // fwd
-static gboolean scrolltest_poll(gpointer);         // fwd — file trigger (app-spawned BS masks SIGUSR1)
+static gboolean scrolltest_poll(gpointer);         // fwd — file trigger for the autonomous tests
 
 BrowserPageWPE::BrowserPageWPE(BrowserServer* server, YapProxy* proxy)
     : m_server(server), m_proxy(proxy), m_identifier(0)
@@ -895,6 +893,27 @@ void BrowserPageWPE::ensureWebView()
     WLOG("ensureWebView layout %dx%d -> render %dx%d (screen=%d contentZoom=%.3f)",
          renderW, renderH, m_renderWidth, m_renderHeight, screenW, (double)m_renderWidth/renderW);
 
+    /* VIEWPORT vs PAN BUFFER. renderH above is a PAINT extent (~4 screens) that the adapter pans
+     * within — it is not what the user can see. WebKit, left alone, uses the view height as the initial
+     * containing block, so a quirks-mode `height: 100%` layout (the classic centring table, e.g.
+     * home.jonandnic.com) resolves 100% to ~3072px and puts its "centred" content about a screen and a
+     * half below the fold. That is the "pages load halfway down" bug.
+     *
+     * Tell the WebProcess the real screen height so it can cap the ICB to one screen while still
+     * painting the whole buffer (WebCore/rendering/RenderView.cpp, atlasICBHeightCap()). Only meaningful
+     * when the buffer is actually taller than the screen; mult=1 needs no cap.
+     *
+     * setenv, not IPC: the WebProcess inherits our environment at spawn, and the engine runs
+     * WEBKIT_USE_SINGLE_WEB_PROCESS=1, so this is read once by the one process that matters. screenH
+     * comes from luna.conf DisplayHeight, which does not change on rotate (only the width does), so the
+     * value stays correct for the life of the process. */
+    if (screenH > 0 && renderH > screenH) {
+        char icb[16];
+        snprintf(icb, sizeof(icb), "%d", screenH);
+        setenv("ATLAS_ICB_HEIGHT", icb, 1);
+        WLOG("ICB height capped to screen: ATLAS_ICB_HEIGHT=%d (buffer %d)", screenH, renderH);
+    }
+
     m_viewBackend = wpe_atlas_view_backend_create(renderW, renderH, scaledW, scaledH,
                                                  &BrowserPageWPE::onFrame, this);
     WebKitWebViewBackend* vb = webkit_web_view_backend_new(m_viewBackend, nullptr, nullptr);
@@ -918,12 +937,15 @@ void BrowserPageWPE::ensureWebView()
     }
 
     /* This page has a live WebView -> it's the scroll-test target (NOT a startPage/tab that only
-     * attached buffers with screenH=0). Install the trigger once (poll works despite masked SIGUSR1). */
+     * attached buffers with screenH=0). Install the file-trigger poll once. NO SIGUSR1 hook here:
+     * WTF/JSC uses SIGUSR1 to suspend threads for conservative GC scanning, and g_unix_signal_add()
+     * replaced that handler — the collector then waited forever for the main thread to answer and the
+     * main thread deadlocked on the heap (JSC::Heap::acquireAccessSlow). That was one of the two
+     * "GPU wedge" (#3) mechanisms. */
     g_testablePage = this;
     static bool s_testInstalled = false;
     if (!s_testInstalled) {
         s_testInstalled = true;
-        g_unix_signal_add(SIGUSR1, on_sigusr1, nullptr);
         g_timeout_add(700, scrolltest_poll, nullptr);
     }
 
@@ -2380,22 +2402,14 @@ void BrowserPageWPE::updateContentsSize()
         -1, nullptr, nullptr, nullptr, &BrowserPageWPE::onContentHeight, this);
 }
 
-/* ===================== autonomous scroll test (SIGUSR1) ===================== */
+/* ===================== autonomous scroll test (file trigger) ===================== */
 static gboolean scrolltest_tick(gpointer)
 {
     if (!g_testablePage || g_livePages.find(g_testablePage) == g_livePages.end()) { g_st.active = false; return G_SOURCE_REMOVE; }
     return g_testablePage->scrollTestStep() ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
 }
-static gboolean on_sigusr1(gpointer)
-{
-    if (g_testablePage && g_livePages.find(g_testablePage) != g_livePages.end() && !g_st.active)
-        g_testablePage->startScrollTest();
-    else
-        WLOG("SIGUSR1: no testable page (or a test is already running)");
-    return G_SOURCE_CONTINUE;   /* keep the handler for repeated runs */
-}
-/* File trigger: the host `touch`es /tmp/atlas_scrolltest; polled on the glib loop (which is clearly
- * dispatching — frames render), so it works even though the app-spawned BS has SIGUSR1 masked. */
+/* File trigger: the host `touch`es /tmp/atlas_scrolltest; polled on the glib loop. (There used to be a
+ * SIGUSR1 trigger too — removed: SIGUSR1 belongs to JSC's GC thread-suspend, see ensureWebView.) */
 static gboolean scrolltest_poll(gpointer)
 {
     if (access("/tmp/atlas_scrolltest", F_OK) == 0) {
@@ -2745,6 +2759,24 @@ static void atlas_img_dl_failed(WebKitDownload* dl, GError* e, gpointer ud) {
 }
 static gboolean atlas_img_decide_dest(WebKitDownload* dl, gchar*, gpointer ud) {
     webkit_download_set_destination(dl, static_cast<AtlasImgDl*>(ud)->dest.c_str()); return TRUE;
+}
+
+/* Clear the resource caches of every live page. Replaces QWebSettings::clearMemoryCaches(), which
+ * does not exist in this port (QtWebKit is headers-only here, so the call linked to address 0 and
+ * crashed). WPE 2.0 routes cache clearing through the network session's website-data manager. */
+void BrowserPageWPE::clearAllCaches()
+{
+    for (BrowserPageWPE* p : g_livePages) {
+        if (!p || !p->m_webView) continue;
+        WebKitNetworkSession* session = webkit_web_view_get_network_session(p->m_webView);
+        if (!session) continue;
+        WebKitWebsiteDataManager* mgr = webkit_network_session_get_website_data_manager(session);
+        if (!mgr) continue;
+        webkit_website_data_manager_clear(mgr,
+            static_cast<WebKitWebsiteDataTypes>(WEBKIT_WEBSITE_DATA_MEMORY_CACHE | WEBKIT_WEBSITE_DATA_DISK_CACHE),
+            0, nullptr, nullptr, nullptr);
+    }
+    WLOG("clearAllCaches: cleared memory+disk cache for %zu live page(s)", g_livePages.size());
 }
 
 void BrowserPageWPE::saveImageAtPointAsync(int32_t queryNum, int32_t x, int32_t y, const char* dir)
